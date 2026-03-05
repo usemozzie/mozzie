@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.turbo/
+target/
+.mozzie/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Tauri
+apps/desktop/src-tauri/target/
+
+# Build outputs
+apps/desktop/dist/
+packages/*/dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db

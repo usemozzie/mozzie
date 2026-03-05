@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: #0F172A;
+  color: #F1F5F9;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+}
+
+/* ---- Custom scrollbars ---- */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.12);
+  border-radius: 100px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.22);
+}
+
+/* ---- Text selection ---- */
+::selection {
+  background: rgba(59, 130, 246, 0.25);
+}
+
+/* ---- Animated status dot for "running" state ---- */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.5; transform: scale(0.85); }
+}
+
+.dot-pulse {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+/* ---- Cursor blink (agent output) ---- */
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+.cursor-blink {
+  animation: cursor-blink 1s step-end infinite;
+}
+
+/* ---- Activity bar shimmer for running state ---- */
+@keyframes activity-shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.activity-shimmer {
+  background: linear-gradient(90deg, transparent 0%, rgba(59,130,246,0.3) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: activity-shimmer 2s ease-in-out infinite;
+}
+
+/* ---- Floating command bar backdrop ---- */
+@keyframes command-bar-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.command-bar-enter {
+  animation: command-bar-in 0.15s ease-out;
+}
+
+/* ---- Panel focus transition ---- */
+.panel-tile {
+  transition: all 0.2s ease-out;
+}
+
+.panel-tile-focused {
+  z-index: 10;
+}
+
+/* ---- Sidebar collapse transition ---- */
+.sidebar-collapsible {
+  transition: width 0.2s ease-out, min-width 0.2s ease-out, opacity 0.15s ease-out;
+  overflow: hidden;
+}

@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "paths": {
+      "@mozzie/db": ["./packages/db/src/index.ts"],
+      "@mozzie/agent-sdk": ["./packages/agent-sdk/src/index.ts"],
+      "@mozzie/ui": ["./packages/ui/src/index.ts"]
+    }
+  }
+}
