@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
 import type { Repo, Ticket } from '@mozzie/db';
@@ -7,7 +8,7 @@ export type OrchestratorProvider = 'openai' | 'anthropic' | 'gemini';
 export const ALL_PROVIDERS: OrchestratorProvider[] = ['openai', 'anthropic', 'gemini'];
 
 export const PROVIDER_META: Record<OrchestratorProvider, { label: string; defaultModel: string; placeholder: string }> = {
-  openai: { label: 'ChatGPT', defaultModel: 'gpt-4.1-mini', placeholder: 'sk-...' },
+  openai: { label: 'ChatGPT', defaultModel: 'gpt-5-nano', placeholder: 'sk-...' },
   anthropic: { label: 'Claude', defaultModel: 'claude-3-5-sonnet-latest', placeholder: 'sk-ant-...' },
   gemini: { label: 'Gemini', defaultModel: 'gemini-2.0-flash', placeholder: 'AI...' },
 };
@@ -34,7 +35,7 @@ export interface OrchestratorTicketSpec {
 }
 
 export interface OrchestratorAction {
-  kind: 'summary' | 'create_tickets' | 'start_ticket' | 'run_all_ready' | 'delete_tickets';
+  kind: 'summary' | 'create_tickets' | 'start_ticket' | 'run_all_ready' | 'delete_tickets' | 'close_tickets';
   ticket_id?: string | null;
   ticket_ids?: string[] | null;
   tickets?: OrchestratorTicketSpec[] | null;
@@ -46,6 +47,7 @@ export interface OrchestratorPlan {
 }
 
 const STORAGE_KEY = 'mozzie.orchestratorConfig';
+const STORE_EVENT = 'mozzie:orchestrator-config-changed';
 
 function canUseStorage() {
   return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
@@ -107,6 +109,7 @@ export function getKeyStore(): OrchestratorKeyStore {
 export function saveKeyStore(store: OrchestratorKeyStore) {
   if (!canUseStorage()) return;
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  window.dispatchEvent(new CustomEvent(STORE_EVENT, { detail: store }));
 }
 
 /** Returns true if the given provider has an API key configured */
@@ -135,6 +138,35 @@ export function saveOrchestratorConfig(config: OrchestratorConfig) {
 
 export function getDefaultModel(provider: OrchestratorProvider) {
   return PROVIDER_META[provider].defaultModel;
+}
+
+export function useOrchestratorKeyStore() {
+  const [store, setStore] = useState<OrchestratorKeyStore>(() => getKeyStore());
+
+  useEffect(() => {
+    function syncFromStorage() {
+      setStore(getKeyStore());
+    }
+
+    function syncFromEvent(event: Event) {
+      const customEvent = event as CustomEvent<OrchestratorKeyStore>;
+      if (customEvent.detail) {
+        setStore(customEvent.detail);
+        return;
+      }
+      syncFromStorage();
+    }
+
+    window.addEventListener('storage', syncFromStorage);
+    window.addEventListener(STORE_EVENT, syncFromEvent as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', syncFromStorage);
+      window.removeEventListener(STORE_EVENT, syncFromEvent as EventListener);
+    };
+  }, []);
+
+  return store;
 }
 
 export function usePlanOrchestratorActions() {

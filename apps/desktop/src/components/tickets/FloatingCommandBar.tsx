@@ -1,10 +1,11 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { Plus, ArrowUp, Loader2, ChevronDown } from 'lucide-react';
 import type { Repo, Ticket } from '@mozzie/db';
 import { useTickets } from '../../hooks/useTickets';
 import { useRepos } from '../../hooks/useRepos';
 import {
   useCreateTicket,
+  useCloseTicket,
   useDeleteTicket,
   useTransitionTicket,
   useUpdateTicket,
@@ -13,15 +14,14 @@ import { useStartAgent } from '../../hooks/useStartAgent';
 import { useLicense } from '../../hooks/useLicense';
 import {
   getOrchestratorConfig,
-  saveOrchestratorConfig,
+  getDefaultModel,
   getKeyStore,
   saveKeyStore,
   hasApiKey,
-  PROVIDER_META,
   usePlanOrchestratorActions,
+  useOrchestratorKeyStore,
   type OrchestratorAction,
   type OrchestratorProvider,
-  type OrchestratorTicketSpec,
 } from '../../hooks/useOrchestrator';
 import { getRecentRepos } from '../../lib/recentRepos';
 import { Button } from '../ui/button';
@@ -58,6 +58,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   const createTicket = useCreateTicket();
   const updateTicket = useUpdateTicket();
   const transitionTicket = useTransitionTicket();
+  const closeTicket = useCloseTicket();
   const deleteTicket = useDeleteTicket();
   const { startAgent } = useStartAgent();
   const planActions = usePlanOrchestratorActions();
@@ -69,6 +70,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   const [isActing, setIsActing] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const keyStore = useOrchestratorKeyStore();
 
   // Auto-focus input on mount
   useEffect(() => {
@@ -162,6 +164,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
           createTicket: createTicket.mutateAsync,
           updateTicket: updateTicket.mutateAsync,
           transitionTicket: transitionTicket.mutateAsync,
+          closeTicket: closeTicket.mutateAsync,
           deleteTicket: deleteTicket.mutateAsync,
           startAgent,
           setPendingDelete,
@@ -188,15 +191,18 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   const config = getOrchestratorConfig();
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
 
-  const MODEL_OPTIONS: { provider: OrchestratorProvider; label: string; suffix: string }[] = [
-    { provider: 'anthropic', label: 'Sonnet 3.5', suffix: 'Latest' },
-    { provider: 'openai', label: 'GPT-4.1', suffix: 'Mini' },
-    { provider: 'gemini', label: 'Gemini 2.0', suffix: 'Flash' },
-  ];
+  const modelOptions = useMemo(
+    () =>
+      (['anthropic', 'openai', 'gemini'] as OrchestratorProvider[]).map((provider) => ({
+        provider,
+        model: keyStore.models[provider]?.trim() || getDefaultModel(provider),
+      })),
+    [keyStore.models]
+  );
 
-  const activeModel = MODEL_OPTIONS.find((m) => m.provider === config.provider) ?? MODEL_OPTIONS[0];
+  const activeModel = modelOptions.find((option) => option.provider === config.provider) ?? modelOptions[0];
 
-  function selectModel(opt: typeof MODEL_OPTIONS[number]) {
+  function selectModel(opt: { provider: OrchestratorProvider; model: string }) {
     const store = getKeyStore();
     store.activeProvider = opt.provider;
     saveKeyStore(store);
@@ -326,16 +332,17 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
                 onClick={() => setModelMenuOpen((v) => !v)}
                 className="flex items-center gap-1 px-2 py-1 rounded-lg text-text-dim hover:text-text hover:bg-white/[0.06] transition-all"
               >
-                <span className="text-[12px] font-medium text-text">{activeModel.label}</span>
-                <span className="text-[12px] text-text-dim">{activeModel.suffix}</span>
+                <span className="max-w-[180px] truncate text-[12px] font-medium text-text">
+                  {activeModel?.model ?? config.model}
+                </span>
                 <ChevronDown className="w-3 h-3 text-text-dim" />
               </button>
 
               {modelMenuOpen && (
                 <div className="absolute top-full right-0 mt-1 w-52 bg-surface border border-border rounded-lg shadow-xl shadow-black/40 py-1 z-10">
-                  {MODEL_OPTIONS.map((opt) => {
+                  {modelOptions.map((opt) => {
                     const available = hasApiKey(opt.provider);
-                    const isActive = opt.provider === activeModel.provider;
+                    const isActive = !!activeModel && opt.provider === activeModel.provider;
                     return (
                       <button
                         key={opt.provider}
@@ -350,8 +357,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
                           }`}
                       >
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isActive ? 'bg-accent' : available ? 'bg-text-dim/30' : 'bg-text-dim/10'}`} />
-                        <span className="font-medium">{opt.label}</span>
-                        <span className="text-text-dim">{opt.suffix}</span>
+                        <span className="truncate font-medium">{opt.model}</span>
                         {!available && (
                           <span className="ml-auto text-[10px] text-text-dim">No key</span>
                         )}
@@ -392,6 +398,7 @@ async function executeAction({
   createTicket,
   updateTicket,
   transitionTicket,
+  closeTicket,
   deleteTicket,
   startAgent,
   setPendingDelete,
@@ -405,6 +412,7 @@ async function executeAction({
   createTicket: (params: { title: string; context?: string; repo_path?: string; assigned_agent?: string }) => Promise<Ticket>;
   updateTicket: (params: { id: string; fields: Record<string, unknown> }) => Promise<Ticket>;
   transitionTicket: (params: { id: string; toStatus: Ticket['status'] }) => Promise<Ticket>;
+  closeTicket: (id: string) => Promise<Ticket>;
   deleteTicket: (id: string) => Promise<void>;
   startAgent: (ticket: Ticket) => Promise<{ ok: boolean; error?: string }>;
   setPendingDelete: (value: PendingDelete | null) => void;
@@ -424,6 +432,23 @@ async function executeAction({
         return 'The LLM did not specify a ticket ID to start.';
       }
       return handleStartOne(action.ticket_id, tickets, startAgent);
+
+    case 'close_tickets': {
+      const ids = (action.ticket_ids ?? []).filter(Boolean);
+      if (ids.length === 0) {
+        return 'The LLM requested close, but no ticket IDs were provided.';
+      }
+      const matches = tickets.filter((ticket) => ids.includes(ticket.id));
+      if (matches.length === 0) {
+        return 'No matching tickets were found to close.';
+      }
+      for (const ticket of matches) {
+        await closeTicket(ticket.id);
+      }
+      return matches.length === 1
+        ? `Closed "${matches[0].title}".`
+        : `Closed ${matches.length} tickets: ${matches.map((ticket) => ticket.title).join(', ')}.`;
+    }
 
     case 'delete_tickets': {
       const ids = (action.ticket_ids ?? []).filter(Boolean);

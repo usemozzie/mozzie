@@ -557,6 +557,44 @@ pub async fn archive_ticket(
 }
 
 #[tauri::command]
+pub async fn close_ticket(
+    app: AppHandle,
+    db: State<'_, SqlitePool>,
+    id: String,
+) -> Result<Ticket, String> {
+    let ticket = fetch_ticket(db.inner(), &id).await?;
+
+    if ticket.status == "archived" {
+        return Ok(ticket);
+    }
+
+    let now = now_iso();
+    sqlx::query(
+        "UPDATE tickets SET status = 'done', terminal_slot = NULL, completed_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&id)
+    .execute(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if ticket.status != "done" {
+        app.emit(
+            "ticket:state-change",
+            serde_json::json!({
+                "ticketId": id,
+                "from": ticket.status,
+                "to": "done",
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    fetch_ticket(db.inner(), &id).await
+}
+
+#[tauri::command]
 pub async fn delete_ticket(
     app: AppHandle,
     db: State<'_, SqlitePool>,

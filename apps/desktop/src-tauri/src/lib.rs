@@ -197,6 +197,7 @@ pub fn run() {
             commands::tickets::get_ticket,
             commands::tickets::transition_ticket,
             commands::tickets::archive_ticket,
+            commands::tickets::close_ticket,
             commands::tickets::delete_ticket,
             commands::tickets::search_repo_files,
             commands::tickets::add_ticket_dependency,

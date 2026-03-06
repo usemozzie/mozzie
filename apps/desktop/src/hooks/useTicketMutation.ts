@@ -70,3 +70,14 @@ export function useDeleteTicket() {
     },
   });
 }
+
+export function useCloseTicket() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => invoke<Ticket>('close_ticket', { id }),
+    onSuccess: (ticket) => {
+      queryClient.invalidateQueries({ queryKey: [TICKETS_KEY] });
+      queryClient.invalidateQueries({ queryKey: [TICKET_KEY, ticket.id] });
+    },
+  });
+}

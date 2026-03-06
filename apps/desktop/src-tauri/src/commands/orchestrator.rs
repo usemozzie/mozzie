@@ -9,6 +9,7 @@ pub enum OrchestratorActionKind {
     CreateTickets,
     StartTicket,
     RunAllReady,
+    CloseTickets,
     DeleteTickets,
 }
 
@@ -93,6 +94,7 @@ fn build_prompt(
         r#"You are the Mozzie orchestrator.
 
 You control tickets, not code. You decide actions, then the app executes them.
+You must choose actions based on the workflow semantics below, not just the words in the user's prompt.
 
 Return ONLY valid JSON. Do not wrap in markdown fences.
 
@@ -101,9 +103,9 @@ Schema:
   "assistant_message": "short explanation for the user",
   "actions": [
     {{
-      "kind": "summary" | "create_tickets" | "start_ticket" | "run_all_ready" | "delete_tickets",
+      "kind": "summary" | "create_tickets" | "start_ticket" | "run_all_ready" | "close_tickets" | "delete_tickets",
       "ticket_id": "required only for start_ticket",
-      "ticket_ids": ["required only for delete_tickets"],
+      "ticket_ids": ["required only for close_tickets or delete_tickets"],
       "tickets": [
         {{
           "title": "required for create_tickets",
@@ -119,6 +121,22 @@ Schema:
 
 Rules:
 - Use ticket IDs exactly as provided in the ticket snapshot.
+- Ticket statuses mean:
+  - `draft`: not ready to run yet
+  - `ready`: ready to be started
+  - `queued`: about to run
+  - `running`: currently running on an agent
+  - `blocked`: waiting on dependencies
+  - `done`: finished or administratively closed
+  - `archived`: historical, normally not acted on
+- Action semantics:
+  - `start_ticket` means actually start execution on an agent. Only use it when the user clearly wants work to run now.
+  - `run_all_ready` means start every ticket currently in `ready`.
+  - `close_tickets` means mark matching tickets as `done` without running them. Use this for requests like close, finish, mark done, not needed, no longer relevant, cancel this work, or administrative completion.
+  - `delete_tickets` means permanently remove tickets. Only use it when the user clearly wants deletion, not closure.
+  - `summary` means explain the state without mutating anything.
+- Never use `start_ticket` when the user asks to close, finish, mark done, cancel, skip, abandon, or otherwise stop tracking a ticket.
+- A close request can apply to tickets in any state. Prefer `close_tickets` over `start_ticket` for those requests.
 - For delete requests, do not assume immediate execution is safe. Return a delete_tickets action and a clear assistant_message; the UI will ask for confirmation.
 - Prefer create_tickets when the user wants work split into independent runnable tickets.
 - If the user is only asking for status or summary, return a summary action or no actions.
@@ -128,6 +146,8 @@ Rules:
 - Prefer repo_path values from the repository snapshot or recent repos when creating tickets.
 - If the user clearly refers to an existing repo by name, map it to the matching absolute repo_path from the repository snapshot.
 - If no repo is specified by the user, prefer the first recent repo when it looks relevant.
+- If the repo is ambiguous for ticket creation and multiple repositories are plausible, leave `repo_path` null so the UI can ask the user inline.
+- When matching an existing ticket, use the title and status context to choose the intended ticket conservatively. If unclear, prefer a summary over a destructive action.
 
 Current ticket snapshot:
 {tickets}
@@ -153,17 +173,23 @@ User message:
 
 async fn call_openai(api_key: &str, model: &str, prompt: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            { "role": "user", "content": prompt }
+        ]
+    });
+
+    // Some newer OpenAI models only accept the default temperature.
+    if !model.starts_with("gpt-5") {
+        body["temperature"] = json!(0.2);
+    }
+
     let response = client
         .post("https://api.openai.com/v1/chat/completions")
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
         .header(CONTENT_TYPE, "application/json")
-        .json(&json!({
-            "model": model,
-            "temperature": 0.2,
-            "messages": [
-                { "role": "user", "content": prompt }
-            ]
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|err| format!("OpenAI request failed: {err}"))?;
