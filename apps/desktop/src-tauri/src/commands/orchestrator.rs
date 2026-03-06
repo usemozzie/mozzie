@@ -43,6 +43,8 @@ pub async fn plan_orchestrator_actions(
     message: String,
     tickets_json: String,
     history_json: String,
+    repos_json: String,
+    recent_repos_json: String,
 ) -> Result<OrchestratorPlan, String> {
     if api_key.trim().is_empty() {
         return Err("API key is required".to_string());
@@ -52,7 +54,13 @@ pub async fn plan_orchestrator_actions(
         return Err("Model is required".to_string());
     }
 
-    let prompt = build_prompt(&message, &tickets_json, &history_json)?;
+    let prompt = build_prompt(
+        &message,
+        &tickets_json,
+        &history_json,
+        &repos_json,
+        &recent_repos_json,
+    )?;
     let raw = match provider.as_str() {
         "openai" => call_openai(&api_key, &model, &prompt).await?,
         "anthropic" => call_anthropic(&api_key, &model, &prompt).await?,
@@ -65,11 +73,21 @@ pub async fn plan_orchestrator_actions(
         .map_err(|err| format!("Failed to parse orchestrator response: {err}. Raw: {cleaned}"))
 }
 
-fn build_prompt(message: &str, tickets_json: &str, history_json: &str) -> Result<String, String> {
+fn build_prompt(
+    message: &str,
+    tickets_json: &str,
+    history_json: &str,
+    repos_json: &str,
+    recent_repos_json: &str,
+) -> Result<String, String> {
     let tickets: Value = serde_json::from_str(tickets_json)
         .map_err(|err| format!("Invalid ticket snapshot payload: {err}"))?;
     let history: Value = serde_json::from_str(history_json)
         .map_err(|err| format!("Invalid orchestrator history payload: {err}"))?;
+    let repos: Value = serde_json::from_str(repos_json)
+        .map_err(|err| format!("Invalid repository snapshot payload: {err}"))?;
+    let recent_repos: Value = serde_json::from_str(recent_repos_json)
+        .map_err(|err| format!("Invalid recent repository payload: {err}"))?;
 
     Ok(format!(
         r#"You are the Mozzie orchestrator.
@@ -107,9 +125,18 @@ Rules:
 - Do not invent ticket IDs.
 - Keep assistant_message concise.
 - When creating multiple tickets where some depend on others, use depends_on_titles to reference prerequisite tickets by their exact title in the same batch. Dependencies are only set for Pro users.
+- Prefer repo_path values from the repository snapshot or recent repos when creating tickets.
+- If the user clearly refers to an existing repo by name, map it to the matching absolute repo_path from the repository snapshot.
+- If no repo is specified by the user, prefer the first recent repo when it looks relevant.
 
 Current ticket snapshot:
 {tickets}
+
+Available repositories:
+{repos}
+
+Recent repositories:
+{recent_repos}
 
 Recent orchestrator chat history:
 {history}
@@ -117,6 +144,8 @@ Recent orchestrator chat history:
 User message:
 {message}"#,
         tickets = serde_json::to_string_pretty(&tickets).unwrap_or_else(|_| "[]".to_string()),
+        repos = serde_json::to_string_pretty(&repos).unwrap_or_else(|_| "[]".to_string()),
+        recent_repos = serde_json::to_string_pretty(&recent_repos).unwrap_or_else(|_| "[]".to_string()),
         history = serde_json::to_string_pretty(&history).unwrap_or_else(|_| "[]".to_string()),
         message = message.trim(),
     ))

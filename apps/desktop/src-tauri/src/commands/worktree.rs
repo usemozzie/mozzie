@@ -266,8 +266,9 @@ fn compute_review_state(ticket: &TicketGitInfo) -> TicketReviewState {
     };
 
     let legacy_review = ticket.status == "review";
-    let can_review = matches!(review_status, "changes" | "merged") || legacy_review;
-    let can_continue = worktree_present && branch_present && !is_merged;
+    let is_closed = matches!(ticket.status.as_str(), "done" | "archived");
+    let can_review = !is_closed && (matches!(review_status, "changes" | "merged") || legacy_review);
+    let can_continue = !is_closed && worktree_present && branch_present && !is_merged;
 
     TicketReviewState {
         ticket_id: ticket.id.clone(),
@@ -482,6 +483,42 @@ pub async fn reject_ticket_review(
             "ticketId": ticket_id,
             "from": from_status,
             "to": "ready",
+        }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn close_ticket_review(
+    app: AppHandle,
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+) -> Result<(), String> {
+    let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
+    let from_status = ticket.status.clone();
+    let now = now_iso();
+
+    sqlx::query(
+        r#"UPDATE tickets SET
+            status = 'done', terminal_slot = NULL,
+            completed_at = ?, updated_at = ?
+          WHERE id = ?"#,
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&ticket_id)
+    .execute(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    app.emit(
+        "ticket:state-change",
+        serde_json::json!({
+            "ticketId": ticket_id,
+            "from": from_status,
+            "to": "done",
         }),
     )
     .map_err(|e| e.to_string())?;

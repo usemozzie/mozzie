@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import type { Ticket, TicketStatus } from '@mozzie/db';
 import { useTicket, useTickets } from '../../hooks/useTickets';
 import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutation';
-import { useCreateWorktree, useApproveTicketReview, useRejectTicketReview, useRepoBranch, useRepoBranches } from '../../hooks/useWorktree';
+import { useCreateWorktree, useApproveTicketReview, useRejectTicketReview, useCloseTicketReview, useRepoBranch, useRepoBranches } from '../../hooks/useWorktree';
 import { useLaunchAgent } from '../../hooks/useAgents';
 import { useTicketDependencies, useTicketDependents, useAddDependency, useRemoveDependency } from '../../hooks/useDependencies';
 import { useLicense } from '../../hooks/useLicense';
@@ -64,6 +64,7 @@ export function TicketDetail() {
   const createWorktree = useCreateWorktree();
   const approveReview = useApproveTicketReview();
   const rejectReview = useRejectTicketReview();
+  const closeReview = useCloseTicketReview();
   const launchAgent = useLaunchAgent();
   const getNextAvailableSlot = useTerminalStore((s) => s.getNextAvailableSlot);
   const releaseSlot = useTerminalStore((s) => s.releaseSlot);
@@ -118,7 +119,8 @@ export function TicketDetail() {
         latestLog={reviewState.latestLog}
         onApprove={handleApproveReview}
         onReject={handleRejectReview}
-        isMutating={approveReview.isPending || rejectReview.isPending}
+        onClose={handleCloseReview}
+        isMutating={approveReview.isPending || rejectReview.isPending || closeReview.isPending}
         showBackButton
         actionError={saveError}
       />
@@ -169,6 +171,16 @@ export function TicketDetail() {
     setSaveError(null);
     try {
       await rejectReview.mutateAsync(ticket.id);
+    } catch (e) {
+      setSaveError(String(e));
+    }
+  }
+
+  async function handleCloseReview() {
+    if (!ticket) return;
+    setSaveError(null);
+    try {
+      await closeReview.mutateAsync(ticket.id);
     } catch (e) {
       setSaveError(String(e));
     }
@@ -250,6 +262,7 @@ export function TicketDetail() {
     createWorktree.isPending ||
     approveReview.isPending ||
     rejectReview.isPending ||
+    closeReview.isPending ||
     launchAgent.isPending ||
     updateTicket.isPending;
 

@@ -212,6 +212,7 @@ pub fn run() {
             commands::worktree::get_ticket_review_state,
             commands::worktree::approve_ticket_review,
             commands::worktree::reject_ticket_review,
+            commands::worktree::close_ticket_review,
             commands::worktree::get_repo_branch,
             commands::worktree::list_repo_branches,
             // Orchestrator LLM

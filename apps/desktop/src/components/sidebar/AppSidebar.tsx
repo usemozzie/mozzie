@@ -11,6 +11,9 @@ import {
   FolderOpen,
   GitBranch,
   MoreHorizontal,
+  Clock3,
+  ListFilter,
+  Layers3,
 } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useSidebarStore, type SidebarView } from '../../stores/sidebarStore';
@@ -21,6 +24,7 @@ import { useRepos, useAddRepo, useRemoveRepo } from '../../hooks/useRepos';
 import { useStartAgent } from '../../hooks/useStartAgent';
 import { formatDistanceToNow } from '../../lib/time';
 import { getTicketColor } from '../../lib/ticketColors';
+import { saveRecentRepo } from '../../lib/recentRepos';
 import type { Ticket, Repo, TicketStatus } from '@mozzie/db';
 
 const statusDot: Record<TicketStatus, string> = {
@@ -90,7 +94,7 @@ export function AppSidebar({ collapsed, onSettingsClick, onCommandBarOpen }: App
 
   /* ---- Expanded: full sidebar ---- */
   return (
-    <div className="flex flex-col h-full bg-bg border-r border-border select-none" style={{ minWidth: 240, maxWidth: 500 }}>
+    <div className="flex h-full w-[280px] min-w-[280px] max-w-[280px] flex-col bg-bg border-r border-border select-none">
       {/* Workspace switcher (Pro only) */}
       <div className="px-2 pt-2">
         <WorkspaceSwitcher />
@@ -139,13 +143,6 @@ export function AppSidebar({ collapsed, onSettingsClick, onCommandBarOpen }: App
       </div>
 
       <div className="mx-3 my-1.5 h-px bg-border" />
-
-      {/* Section label */}
-      <div className="px-4 py-1.5">
-        <span className="text-[11px] font-medium text-text-dim uppercase tracking-wider">
-          {activeView === 'tickets' ? 'Recents' : 'Repositories'}
-        </span>
-      </div>
 
       {/* Scrollable list */}
       <div className="flex-1 min-h-0 overflow-y-auto">
@@ -236,15 +233,38 @@ function NavItem({
   );
 }
 
-/* ---- Ticket list (Recents) ---- */
+type TicketScope = 'active' | 'recent' | 'all';
+
+const TICKET_SCOPE_OPTIONS: Array<{
+  id: TicketScope;
+  label: string;
+  icon: typeof ListFilter;
+}> = [
+  { id: 'active', label: 'Active', icon: ListFilter },
+  { id: 'recent', label: 'Recent', icon: Clock3 },
+  { id: 'all', label: 'All', icon: Layers3 },
+];
 
 function TicketListSection() {
+  const [scope, setScope] = useState<TicketScope>('active');
   const { data: tickets, isLoading } = useTickets();
   const { selectedTicketIds, toggleTicketSelection } = useTicketStore();
 
   if (isLoading) {
     return <ListPlaceholder text="Loading..." />;
   }
+
+  const now = Date.now();
+  const recentCutoffMs = 1000 * 60 * 60 * 24 * 7;
+  const filteredTickets = (tickets ?? []).filter((ticket) => {
+    if (scope === 'active') {
+      return ticket.status !== 'done' && ticket.status !== 'archived';
+    }
+    if (scope === 'recent') {
+      return now - new Date(ticket.updated_at).getTime() <= recentCutoffMs;
+    }
+    return true;
+  });
 
   if (!tickets || tickets.length === 0) {
     return (
@@ -256,16 +276,69 @@ function TicketListSection() {
   }
 
   return (
-    <div className="px-1">
-      {tickets.map((ticket) => (
-        <SidebarTicketRow
-          key={ticket.id}
-          ticket={ticket}
-          isSelected={selectedTicketIds.includes(ticket.id)}
-          selectedIndex={selectedTicketIds.indexOf(ticket.id)}
-          onClick={() => toggleTicketSelection(ticket.id)}
-        />
-      ))}
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="shrink-0 border-b border-border px-2 py-2">
+        <div className="mb-2 flex items-center justify-between px-1">
+          <span className="text-[11px] font-medium uppercase tracking-wider text-text-dim">
+            Tickets
+          </span>
+          <span className="text-[10px] text-text-dim">
+            {filteredTickets.length}/{tickets.length}
+          </span>
+        </div>
+        <div className="grid grid-cols-3 gap-1 rounded-lg bg-white/[0.03] p-1">
+          {TICKET_SCOPE_OPTIONS.map(({ id, label, icon: Icon }) => {
+            const active = scope === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setScope(id)}
+                className={`flex min-w-0 w-full items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[11px] transition-colors ${
+                  active
+                    ? 'bg-white/[0.10] text-text'
+                    : 'text-text-dim hover:bg-white/[0.05] hover:text-text'
+                }`}
+                title={
+                  id === 'active'
+                    ? 'Focus on tickets that are not done'
+                    : id === 'recent'
+                      ? 'Show tickets updated in the last 7 days'
+                      : 'Show every ticket'
+                }
+              >
+                <Icon className="h-3 w-3 shrink-0" />
+                <span className="truncate">{label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-1 py-1">
+        {filteredTickets.length === 0 ? (
+          <div className="flex h-full flex-col items-center justify-center gap-1.5 px-4 text-center">
+            <p className="text-[13px] text-text-muted">
+              {scope === 'active' ? 'No active tickets' : scope === 'recent' ? 'No recent tickets' : 'No tickets'}
+            </p>
+            <p className="text-[11px] text-text-dim">
+              {scope === 'recent'
+                ? 'Nothing has been updated in the last 7 days.'
+                : 'Try another filter or create a new ticket.'}
+            </p>
+          </div>
+        ) : (
+          filteredTickets.map((ticket) => (
+            <SidebarTicketRow
+              key={ticket.id}
+              ticket={ticket}
+              isSelected={selectedTicketIds.includes(ticket.id)}
+              selectedIndex={selectedTicketIds.indexOf(ticket.id)}
+              onClick={() => toggleTicketSelection(ticket.id)}
+            />
+          ))
+        )}
+      </div>
     </div>
   );
 }
@@ -363,6 +436,7 @@ function RepoListSection() {
     const name = path.split(/[\\/]/).filter(Boolean).pop() || 'repo';
     try {
       await addRepo.mutateAsync({ name, path });
+      saveRecentRepo(path);
     } catch (e: any) {
       setError(e?.toString() ?? 'Failed to add repository');
     }

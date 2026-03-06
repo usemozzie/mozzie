@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
 import { Plus, ArrowUp, Loader2, ChevronDown } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
-import type { Ticket } from '@mozzie/db';
+import type { Repo, Ticket } from '@mozzie/db';
 import { useTickets } from '../../hooks/useTickets';
+import { useRepos } from '../../hooks/useRepos';
 import {
   useCreateTicket,
   useDeleteTicket,
@@ -21,8 +21,19 @@ import {
   usePlanOrchestratorActions,
   type OrchestratorAction,
   type OrchestratorProvider,
+  type OrchestratorTicketSpec,
 } from '../../hooks/useOrchestrator';
 import { getRecentRepos } from '../../lib/recentRepos';
+import { Button } from '../ui/button';
+import { Select } from '../ui/select';
+import {
+  applyRepoSelections,
+  buildRepoChoices,
+  executeCreateTickets,
+  missingRepoTitles,
+  preparePendingRepoSelection,
+  type PendingRepoSelection,
+} from './orchestratorCreateTickets';
 
 interface ChatEntry {
   id: string;
@@ -41,6 +52,7 @@ interface FloatingCommandBarProps {
 
 export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   const { data: tickets = [] } = useTickets();
+  const { data: repos = [] } = useRepos();
   const { data: license } = useLicense();
   const isPro = license?.is_pro ?? false;
   const createTicket = useCreateTicket();
@@ -53,6 +65,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   const [message, setMessage] = useState('');
   const [history, setHistory] = useState<ChatEntry[]>([]);
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
+  const [pendingRepoSelection, setPendingRepoSelection] = useState<PendingRepoSelection | null>(null);
   const [isActing, setIsActing] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -112,6 +125,11 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
       return;
     }
 
+    if (pendingRepoSelection) {
+      appendEntry('orchestrator', 'Finish choosing repositories for the pending tickets or cancel that step first.');
+      return;
+    }
+
     const config = getOrchestratorConfig();
     if (!config.apiKey.trim()) {
       appendEntry('orchestrator', 'Set the orchestrator API key in Settings before using chat orchestration.');
@@ -124,6 +142,8 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
         config,
         message: raw,
         tickets,
+        repos,
+        recentRepos: getRecentRepos(),
         history: history.slice(-8).map((entry) => ({
           role: entry.role,
           text: entry.text,
@@ -145,6 +165,9 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
           deleteTicket: deleteTicket.mutateAsync,
           startAgent,
           setPendingDelete,
+          repos,
+          recentRepos: getRecentRepos(),
+          setPendingRepoSelection,
         });
 
         if (result) {
@@ -209,6 +232,59 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
           <div className="mb-2 text-[12px] text-state-waiting bg-surface/80 border border-border rounded-xl px-4 py-2">
             Delete {pendingDelete.label}? Reply <code className="text-text">yes</code> to confirm or <code className="text-text">cancel</code>.
           </div>
+        )}
+
+        {pendingRepoSelection && (
+          <RepoSelectionCard
+            pending={pendingRepoSelection}
+            repos={repos}
+            recentRepos={getRecentRepos()}
+            onChange={(title, repoPath) =>
+              setPendingRepoSelection((current) =>
+                current
+                  ? {
+                      ...current,
+                      selections: { ...current.selections, [title]: repoPath },
+                    }
+                  : current
+              )
+            }
+            onCancel={() => {
+              setPendingRepoSelection(null);
+              appendEntry('orchestrator', 'Ticket creation cancelled.');
+            }}
+            onConfirm={async () => {
+              if (!pendingRepoSelection) return;
+              const repoChoices = buildRepoChoices(repos, getRecentRepos());
+              const resolvedSpecs = applyRepoSelections(
+                pendingRepoSelection.specs,
+                repoChoices,
+                pendingRepoSelection.selections,
+              );
+              const stillMissing = missingRepoTitles(resolvedSpecs);
+              if (stillMissing.length > 0) {
+                appendEntry('orchestrator', `Choose a repository for: ${stillMissing.join(', ')}.`);
+                return;
+              }
+
+              setIsActing(true);
+              try {
+                const result = await executeCreateTickets({
+                  specs: resolvedSpecs,
+                  createTicket: createTicket.mutateAsync,
+                  transitionTicket: transitionTicket.mutateAsync,
+                  isPro,
+                });
+                appendEntry('orchestrator', result);
+                setPendingRepoSelection(null);
+              } catch (error) {
+                appendEntry('orchestrator', `Ticket creation failed: ${String(error)}`);
+              } finally {
+                setIsActing(false);
+              }
+            }}
+            disabled={isActing}
+          />
         )}
 
         {/* Input box */}
@@ -307,7 +383,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   );
 }
 
-// ---- Action execution (moved from OrchestratorPanel) ----
+// ---- Action execution ----
 
 async function executeAction({
   action,
@@ -319,6 +395,9 @@ async function executeAction({
   deleteTicket,
   startAgent,
   setPendingDelete,
+  repos,
+  recentRepos,
+  setPendingRepoSelection,
 }: {
   action: OrchestratorAction;
   tickets: Ticket[];
@@ -329,6 +408,9 @@ async function executeAction({
   deleteTicket: (id: string) => Promise<void>;
   startAgent: (ticket: Ticket) => Promise<{ ok: boolean; error?: string }>;
   setPendingDelete: (value: PendingDelete | null) => void;
+  repos: Repo[];
+  recentRepos: string[];
+  setPendingRepoSelection: (value: PendingRepoSelection | null) => void;
 }) {
   switch (action.kind) {
     case 'summary':
@@ -368,54 +450,76 @@ async function executeAction({
       if (specs.length === 0) {
         return 'The LLM requested ticket creation, but provided no ticket specs.';
       }
-      const fallbackRepoPath = getRecentRepos()[0];
-      const created: string[] = [];
-      const titleToId = new Map<string, string>();
+      const repoChoices = buildRepoChoices(repos, recentRepos);
+      const pendingSelection = preparePendingRepoSelection(specs, repoChoices);
 
-      for (const spec of specs.slice(0, 8)) {
-        const ticket = await createTicket({
-          title: spec.title,
-          context: spec.context,
-          repo_path: spec.repo_path ?? fallbackRepoPath,
-          assigned_agent: spec.assigned_agent ?? 'claude-code',
-        });
-
-        titleToId.set(spec.title, ticket.id);
-
-        if ((spec.repo_path ?? fallbackRepoPath) && spec.context?.trim()) {
-          await transitionTicket({ id: ticket.id, toStatus: 'ready' });
-        }
-
-        created.push(spec.title);
+      if (pendingSelection) {
+        setPendingRepoSelection(pendingSelection);
+        return `Choose a repository for ${pendingSelection.unresolvedTitles.join(', ')}.`;
       }
 
-      // Wire up dependencies (Pro only)
-      if (isPro) {
-        let depsCreated = 0;
-        for (const spec of specs.slice(0, 8)) {
-          const ticketId = titleToId.get(spec.title);
-          if (!ticketId || !spec.depends_on_titles?.length) continue;
-
-          for (const depTitle of spec.depends_on_titles) {
-            const depId = titleToId.get(depTitle);
-            if (depId) {
-              try {
-                await invoke('add_ticket_dependency', { ticketId, dependsOnId: depId });
-                depsCreated++;
-              } catch {
-                // Cycle or duplicate — skip silently
-              }
-            }
-          }
-        }
-        if (depsCreated > 0) {
-          return `Created ${created.length} ticket${created.length === 1 ? '' : 's'} with ${depsCreated} dependency link${depsCreated === 1 ? '' : 's'}: ${created.join(', ')}.`;
-        }
+      if (repoChoices.length === 0 && specs.some((spec) => !spec.repo_path?.trim())) {
+        return 'I need a repository before creating those tickets. Add a repo or specify one in your prompt.';
       }
 
-      return `Created ${created.length} ticket${created.length === 1 ? '' : 's'}: ${created.join(', ')}.`;
+      const resolvedSpecs = applyRepoSelections(specs, repoChoices, {});
+      return executeCreateTickets({
+        specs: resolvedSpecs,
+        createTicket,
+        transitionTicket,
+        isPro,
+      });
     }
   }
+}
+
+function RepoSelectionCard({
+  pending,
+  repos,
+  recentRepos,
+  onChange,
+  onCancel,
+  onConfirm,
+  disabled,
+}: {
+  pending: PendingRepoSelection;
+  repos: Repo[];
+  recentRepos: string[];
+  onChange: (title: string, repoPath: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+  disabled: boolean;
+}) {
+  const choices = buildRepoChoices(repos, recentRepos);
+  const canConfirm = pending.unresolvedTitles.every((title) => pending.selections[title]);
+
+  return (
+    <div className="mb-2 rounded-2xl border border-border bg-surface px-4 py-3 shadow-xl shadow-black/20">
+      <div className="mb-2">
+        <div className="text-[12px] font-medium text-text">Choose repositories</div>
+        <div className="text-[11px] text-text-dim">The orchestrator needs a repo for these tickets before it can create them.</div>
+      </div>
+      <div className="space-y-2">
+        {pending.unresolvedTitles.map((title) => (
+          <div key={title} className="grid grid-cols-[minmax(0,1fr)_220px] items-center gap-3">
+            <div className="truncate text-[12px] text-text">{title}</div>
+            <Select
+              value={pending.selections[title] ?? ''}
+              onChange={(event) => onChange(title, event.target.value)}
+              options={choices.map((choice) => ({ value: choice.path, label: choice.label }))}
+              placeholder="Choose repository..."
+              disabled={disabled}
+              className="text-[12px]"
+            />
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex justify-end gap-2">
+        <Button variant="outline" size="sm" onClick={onCancel} disabled={disabled}>Cancel</Button>
+        <Button size="sm" onClick={onConfirm} disabled={disabled || !canConfirm}>Create Tickets</Button>
+      </div>
+    </div>
+  );
 }
 
 async function executeDelete(

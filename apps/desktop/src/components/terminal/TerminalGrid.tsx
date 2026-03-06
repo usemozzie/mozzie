@@ -11,7 +11,7 @@ import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutat
 import { useAcpRun } from '../../hooks/useAcpRun';
 import { useAgentLogs, useContinueAgent } from '../../hooks/useAgents';
 import { useReview } from '../../hooks/useReview';
-import { useApproveTicketReview, useRejectTicketReview } from '../../hooks/useWorktree';
+import { useApproveTicketReview, useRejectTicketReview, useCloseTicketReview } from '../../hooks/useWorktree';
 import { AGENT_OPTIONS } from '../../lib/agentOptions';
 import { getTicketColor } from '../../lib/ticketColors';
 import { StatusBadge } from '../ui/badge';
@@ -235,6 +235,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
   const updateTicket = useUpdateTicket();
   const approveReview = useApproveTicketReview();
   const rejectReview = useRejectTicketReview();
+  const closeReview = useCloseTicketReview();
   const continueAgent = useContinueAgent();
   const { data: ticket, isLoading } = useTicket(ticketId);
   const [isMutating, setIsMutating] = useState(false);
@@ -310,6 +311,19 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     setActionError(null);
     try {
       await rejectReview.mutateAsync(ticket.id);
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handleClose() {
+    if (!ticket) return;
+    setIsMutating(true);
+    setActionError(null);
+    try {
+      await closeReview.mutateAsync(ticket.id);
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -545,7 +559,9 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
             latestLog={latestLog}
             onApprove={handleApprove}
             onReject={handleReject}
+            onClose={handleClose}
             isMutating={isMutating}
+            actionError={actionError}
           />
         )
       )}

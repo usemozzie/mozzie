@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Check, GitBranch, Loader2, RotateCcw, ChevronLeft } from 'lucide-react';
+import { Check, GitBranch, Loader2, RotateCcw, ChevronLeft, CheckCheck } from 'lucide-react';
 import type { AgentLog, Ticket, TicketReviewState } from '@mozzie/db';
 import { useTicketStore } from '../../stores/ticketStore';
 import { DiffViewer, formatFileLabel, getFileStatus, parseDiff } from './DiffViewer';
@@ -16,6 +16,7 @@ interface ReviewPanelProps {
   isMutating?: boolean;
   onApprove?: () => void;
   onReject?: () => void;
+  onClose?: () => void;
   showBackButton?: boolean;
   actionError?: string | null;
 }
@@ -29,6 +30,7 @@ export function ReviewPanel({
   isMutating,
   onApprove,
   onReject,
+  onClose,
   showBackButton,
   actionError,
 }: ReviewPanelProps) {
@@ -54,7 +56,7 @@ export function ReviewPanel({
   }, [files, selectedFileKey]);
 
   return (
-    <div className="flex h-full flex-col bg-bg">
+    <div className="flex h-full min-h-0 flex-col bg-bg overflow-hidden">
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 bg-surface">
         {showBackButton && (
           <Button variant="ghost" size="icon" onClick={backToList} title="Back to list">
@@ -111,7 +113,7 @@ export function ReviewPanel({
       </div>
 
       <div className="flex-1 min-h-0 flex overflow-hidden">
-        <aside className="w-64 shrink-0 border-r border-border bg-surface/40 overflow-y-auto">
+        <aside className="w-64 shrink-0 border-r border-border bg-surface/40 overflow-y-auto min-h-0">
           <div className="px-3 py-2 text-[11px] uppercase tracking-wider text-text-dim border-b border-border">
             Changed Files
           </div>
@@ -150,7 +152,7 @@ export function ReviewPanel({
           )}
         </aside>
 
-        <div className="flex-1 min-w-0 overflow-auto">
+        <div className="flex-1 min-w-0 min-h-0 overflow-auto">
           {reviewLoading ? (
             <div className="h-full flex items-center justify-center gap-2 text-text-dim text-sm">
               <Loader2 className="w-4 h-4 animate-spin" />
@@ -175,8 +177,8 @@ export function ReviewPanel({
         </div>
       </div>
 
-      {(onApprove || onReject) && (
-        <div className="shrink-0 px-3 py-3 border-t border-border flex gap-2 bg-surface">
+      {(onApprove || onReject || onClose) && (
+        <div className="shrink-0 sticky bottom-0 z-10 px-3 py-3 border-t border-border flex gap-2 bg-surface">
           {onApprove && (
             <Button size="sm" className="flex-1" onClick={onApprove} disabled={isMutating || !review || (!review.has_changes && !review.is_merged)}>
               {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Check className="w-3 h-3" />Approve & Merge</>}
@@ -185,6 +187,11 @@ export function ReviewPanel({
           {onReject && (
             <Button variant="destructive" size="sm" className="flex-1" onClick={onReject} disabled={isMutating || !review?.worktree_present}>
               {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><RotateCcw className="w-3 h-3" />Discard Changes</>}
+            </Button>
+          )}
+          {onClose && (
+            <Button variant="outline" size="sm" className="flex-1" onClick={onClose} disabled={isMutating}>
+              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><CheckCheck className="w-3 h-3" />Close</>}
             </Button>
           )}
         </div>

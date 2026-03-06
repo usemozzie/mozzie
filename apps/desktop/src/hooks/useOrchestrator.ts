@@ -1,6 +1,6 @@
 import { useMutation } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
-import type { Ticket } from '@mozzie/db';
+import type { Repo, Ticket } from '@mozzie/db';
 
 export type OrchestratorProvider = 'openai' | 'anthropic' | 'gemini';
 
@@ -144,11 +144,15 @@ export function usePlanOrchestratorActions() {
       message,
       tickets,
       history,
+      repos,
+      recentRepos,
     }: {
       config: OrchestratorConfig;
       message: string;
       tickets: Ticket[];
       history: Array<{ role: 'user' | 'orchestrator'; text: string }>;
+      repos: Repo[];
+      recentRepos: string[];
     }) =>
       invoke<OrchestratorPlan>('plan_orchestrator_actions', {
         provider: config.provider,
@@ -168,6 +172,16 @@ export function usePlanOrchestratorActions() {
           }))
         ),
         historyJson: JSON.stringify(history),
+        reposJson: JSON.stringify(
+          repos.map((repo) => ({
+            id: repo.id,
+            name: repo.name,
+            path: repo.path,
+            default_branch: repo.default_branch,
+            last_used_at: repo.last_used_at,
+          }))
+        ),
+        recentReposJson: JSON.stringify(recentRepos),
       }),
   });
 }

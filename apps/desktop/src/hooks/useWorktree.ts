@@ -140,6 +140,16 @@ export function useRejectTicketReview() {
   });
 }
 
+export function useCloseTicketReview() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (ticketId: string) => invoke('close_ticket_review', { ticketId }),
+    onSuccess: (_value, ticketId) => {
+      queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+    },
+  });
+}
+
 export function useRepoBranch(repoPath: string | null | undefined) {
   return useQuery<RepoBranchInfo>({
     queryKey: ['repo_branch', repoPath],
