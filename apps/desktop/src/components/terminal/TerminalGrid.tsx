@@ -258,9 +258,9 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     ...liveItems,
   ];
 
-  const review = useReview(ticket, ticket?.status !== 'running');
+  const review = useReview(ticket);
   const accent = getTicketColor(colorIndex);
-  const canShowReview = !!review.review?.can_review;
+  const canShowReview = !!ticket;
   const canContinueConversation = !!(
     ticket &&
     ticket.assigned_agent &&
@@ -271,10 +271,10 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
   );
 
   useEffect(() => {
-    if (ticket?.status !== 'running' && review.review?.has_changes) {
+    if (review.review?.has_changes) {
       setActiveTab('review');
     }
-  }, [ticket?.status, review.review?.has_changes]);
+  }, [review.review?.has_changes]);
 
   async function handleAbort() {
     if (!ticket || slot == null) return;
@@ -456,7 +456,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
           [
             { id: 'ticket', label: 'Ticket', disabled: false },
             { id: 'agent',  label: 'Agent',  disabled: false },
-            { id: 'review', label: 'Review', disabled: !canShowReview },
+            { id: 'review', label: 'Review', disabled: false },
           ] as const
         ).map(({ id, label, disabled }) => {
           const active = activeTab === id;
@@ -550,20 +550,18 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
           </div>
         </>
       ) : (
-        canShowReview && (
-          <ReviewPanel
-            ticket={ticket}
-            review={review.review}
-            reviewLoading={review.reviewLoading}
-            reviewError={review.reviewError}
-            latestLog={latestLog}
-            onApprove={handleApprove}
-            onReject={handleReject}
-            onClose={handleClose}
-            isMutating={isMutating}
-            actionError={actionError}
-          />
-        )
+        <ReviewPanel
+          ticket={ticket}
+          review={review.review}
+          reviewLoading={review.reviewLoading}
+          reviewError={review.reviewError}
+          latestLog={latestLog}
+          onApprove={handleApprove}
+          onReject={handleReject}
+          onClose={handleClose}
+          isMutating={isMutating}
+          actionError={actionError}
+        />
       )}
     </div>
   );

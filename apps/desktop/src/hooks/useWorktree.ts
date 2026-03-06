@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { TicketReviewState } from '@mozzie/db';
 import type { TicketStateChangeEvent } from '../types/events';
+import { TICKET_KEY, TICKETS_KEY } from './useTickets';
 
 export interface WorktreeInfo {
   worktree_path: string;
@@ -126,6 +127,10 @@ export function useApproveTicketReview() {
     mutationFn: (ticketId: string) => invoke('approve_ticket_review', { ticketId }),
     onSuccess: (_value, ticketId) => {
       queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+      queryClient.invalidateQueries({ queryKey: [TICKETS_KEY] });
+      queryClient.invalidateQueries({ queryKey: [TICKET_KEY, ticketId] });
+      queryClient.invalidateQueries({ queryKey: ['repo_branch'] });
+      queryClient.invalidateQueries({ queryKey: ['repo_branches'] });
     },
   });
 }

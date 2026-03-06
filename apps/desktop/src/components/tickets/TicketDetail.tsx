@@ -84,7 +84,7 @@ export function TicketDetail() {
   const addDependency = useAddDependency();
   const removeDependency = useRemoveDependency();
   const [depSearch, setDepSearch] = useState('');
-  const reviewState = useReview(ticket, ticket?.status !== 'running');
+  const reviewState = useReview(ticket);
 
   // Sync form when ticket loads
   useEffect(() => {

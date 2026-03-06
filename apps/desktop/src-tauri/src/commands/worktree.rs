@@ -51,6 +51,24 @@ fn worktrees_base() -> PathBuf {
     PathBuf::from(home).join(".mozzie").join("worktrees")
 }
 
+fn integration_worktree_path(repo_path: &str, source_branch: &str) -> PathBuf {
+    let repo_slug = PathBuf::from(repo_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .collect::<String>();
+    let branch_slug = source_branch
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' })
+        .collect::<String>();
+
+    worktrees_base()
+        .join("_integration")
+        .join(format!("{repo_slug}-{branch_slug}"))
+}
+
 fn run_git_output(args: &[&str]) -> Result<Output, String> {
     std::process::Command::new("git")
         .args(args)
@@ -133,10 +151,50 @@ fn is_branch_merged(repo_path: &str, branch_name: &str, source_branch: &str) -> 
     }
 }
 
-fn remove_worktree_internal(worktree_path: &str, repo_path: &str, branch_name: &str) {
-    let _ = run_git_in_repo(repo_path, &["worktree", "remove", "--force", worktree_path]);
-    let _ = run_git_in_repo(repo_path, &["branch", "-D", branch_name]);
-    let _ = run_git_in_repo(repo_path, &["worktree", "prune"]);
+fn remove_worktree_internal(worktree_path: &str, repo_path: &str, branch_name: &str) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    if PathBuf::from(worktree_path).exists() {
+        if let Err(err) = run_git_in_repo(repo_path, &["worktree", "remove", "--force", worktree_path]) {
+            errors.push(format!("Failed to remove worktree: {err}"));
+        }
+    }
+
+    if branch_exists(repo_path, branch_name) {
+        if let Err(err) = run_git_in_repo(repo_path, &["branch", "-D", branch_name]) {
+            errors.push(format!("Failed to delete branch: {err}"));
+        }
+    }
+
+    if let Err(err) = run_git_in_repo(repo_path, &["worktree", "prune"]) {
+        errors.push(format!("Failed to prune worktrees: {err}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" | "))
+    }
+}
+
+fn remove_integration_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+
+    if PathBuf::from(worktree_path).exists() {
+        if let Err(err) = run_git_in_repo(repo_path, &["worktree", "remove", "--force", worktree_path]) {
+            errors.push(format!("Failed to remove integration worktree: {err}"));
+        }
+    }
+
+    if let Err(err) = run_git_in_repo(repo_path, &["worktree", "prune"]) {
+        errors.push(format!("Failed to prune worktrees: {err}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" | "))
+    }
 }
 
 fn get_diff_internal(worktree_path: &str, source_branch: Option<&str>) -> Result<String, String> {
@@ -195,8 +253,38 @@ fn merge_branch_internal(
     }
 
     let _ = commit_pending_changes(worktree_path, branch_name)?;
-    run_git_in_repo(repo_path, &["checkout", source_branch])?;
-    run_git_in_repo(repo_path, &["merge", "--no-ff", branch_name])?;
+    let integration_path = integration_worktree_path(repo_path, source_branch);
+    let integration_path_str = integration_path.to_string_lossy().to_string();
+
+    if let Some(parent) = integration_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Cannot create integration worktree directory: {err}"))?;
+    }
+
+    if has_valid_worktree(&integration_path_str) {
+        run_git_in_repo(repo_path, &["worktree", "remove", "--force", &integration_path_str])?;
+    } else if integration_path.exists() {
+        std::fs::remove_dir_all(&integration_path)
+            .map_err(|err| format!("Cannot clean stale integration worktree directory: {err}"))?;
+    }
+
+    run_git_in_repo(
+        repo_path,
+        &["worktree", "add", "--force", &integration_path_str, source_branch],
+    )?;
+
+    let merge_result = run_git(
+        &["-C", &integration_path_str, "merge", "--no-ff", "--no-edit", branch_name],
+    );
+    let cleanup_result = remove_integration_worktree(repo_path, &integration_path_str);
+
+    match (merge_result, cleanup_result) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(merge_err), Ok(())) => Err(merge_err),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
+        (Err(merge_err), Err(cleanup_err)) => Err(format!("{merge_err} | {cleanup_err}")),
+    }?;
+
     Ok(())
 }
 
@@ -266,8 +354,12 @@ fn compute_review_state(ticket: &TicketGitInfo) -> TicketReviewState {
     };
 
     let legacy_review = ticket.status == "review";
+    let has_git_context = ticket.repo_path.is_some()
+        || ticket.source_branch.is_some()
+        || ticket.branch_name.is_some()
+        || ticket.worktree_path.is_some();
     let is_closed = matches!(ticket.status.as_str(), "done" | "archived");
-    let can_review = !is_closed && (matches!(review_status, "changes" | "merged") || legacy_review);
+    let can_review = has_git_context || legacy_review || !matches!(review_status, "unavailable");
     let can_continue = !is_closed && worktree_present && branch_present && !is_merged;
 
     TicketReviewState {
@@ -367,8 +459,7 @@ pub async fn remove_worktree(
     repo_path: String,
     branch_name: String,
 ) -> Result<(), String> {
-    remove_worktree_internal(&worktree_path, &repo_path, &branch_name);
-    Ok(())
+    remove_worktree_internal(&worktree_path, &repo_path, &branch_name)
 }
 
 #[tauri::command]
@@ -411,11 +502,38 @@ pub async fn approve_ticket_review(
     let source_branch = ticket.source_branch.as_deref().ok_or("Ticket has no source_branch")?;
     let branch_name = ticket.branch_name.as_deref().ok_or("Ticket has no branch_name")?;
 
-    if has_valid_worktree(worktree_path) && branch_exists(repo_path, branch_name) {
-        merge_branch_internal(repo_path, worktree_path, source_branch, branch_name)?;
+    if !source_branch_exists(repo_path, source_branch) {
+        return Err(format!(
+            "Source branch '{source_branch}' is missing. Refusing to approve because merge cannot be verified."
+        ));
     }
 
-    remove_worktree_internal(worktree_path, repo_path, branch_name);
+    if !branch_exists(repo_path, branch_name) {
+        return Err(format!(
+            "Ticket branch '{branch_name}' is missing. Refusing to approve because merge cannot be verified."
+        ));
+    }
+
+    let already_merged = is_branch_merged(repo_path, branch_name, source_branch)?;
+
+    if !already_merged {
+        if !has_valid_worktree(worktree_path) {
+            return Err(
+                "Ticket worktree is missing. Cannot checkpoint pending work before merge; approval aborted."
+                    .to_string(),
+            );
+        }
+
+        merge_branch_internal(repo_path, worktree_path, source_branch, branch_name)?;
+
+        if !is_branch_merged(repo_path, branch_name, source_branch)? {
+            return Err(format!(
+                "Merge verification failed: branch '{branch_name}' is not an ancestor of '{source_branch}'."
+            ));
+        }
+    }
+
+    remove_worktree_internal(worktree_path, repo_path, branch_name)?;
 
     let now = now_iso();
     sqlx::query(
@@ -459,7 +577,7 @@ pub async fn reject_ticket_review(
         ticket.worktree_path.as_deref(),
         ticket.branch_name.as_deref(),
     ) {
-        remove_worktree_internal(worktree_path, repo_path, branch_name);
+        remove_worktree_internal(worktree_path, repo_path, branch_name)?;
     }
 
     let now = now_iso();
