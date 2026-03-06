@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import logo from './assets/icon.svg';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
-import { NotebookPen, Settings, PanelLeftClose, PanelLeftOpen, Command } from 'lucide-react';
+import { NotebookPen, Settings, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { TicketPanel } from './components/tickets/TicketPanel';
 import { TerminalGrid } from './components/terminal/TerminalGrid';
 import { SettingsPanel } from './components/settings/SettingsPanel';
@@ -94,17 +94,6 @@ export default function App() {
           <img src={logo} alt="Mozzie" className="w-5 h-5" />
           <span className="text-[13px] font-semibold text-text tracking-tight">Mozzie</span>
         </div>
-
-        {/* Command bar trigger */}
-        <button
-          onClick={() => setCommandBarOpen(true)}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-text-dim hover:text-text bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] transition-all duration-150 mr-2"
-          title="Orchestrator (Ctrl+K)"
-        >
-          <Command className="w-3 h-3" />
-          <span className="text-[11px]">Orchestrator</span>
-          <kbd className="text-[10px] text-text-dim bg-white/[0.04] px-1 py-0.5 rounded ml-1">Ctrl+K</kbd>
-        </button>
 
         <button
           onClick={() => setNotesOpen((value) => !value)}
