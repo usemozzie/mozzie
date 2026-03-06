@@ -7,11 +7,14 @@ import {
   useCreateTicket,
   useCloseTicket,
   useDeleteTicket,
+  useReopenTicket,
   useTransitionTicket,
   useUpdateTicket,
 } from '../../hooks/useTicketMutation';
 import { useStartAgent } from '../../hooks/useStartAgent';
 import { useLicense } from '../../hooks/useLicense';
+import { useAgentConfigs } from '../../hooks/useAgents';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import {
   getOrchestratorConfig,
   getDefaultModel,
@@ -53,12 +56,15 @@ interface FloatingCommandBarProps {
 export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   const { data: tickets = [] } = useTickets();
   const { data: repos = [] } = useRepos();
+  const { data: agents = [] } = useAgentConfigs();
   const { data: license } = useLicense();
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
   const isPro = license?.is_pro ?? false;
   const createTicket = useCreateTicket();
   const updateTicket = useUpdateTicket();
   const transitionTicket = useTransitionTicket();
   const closeTicket = useCloseTicket();
+  const reopenTicket = useReopenTicket();
   const deleteTicket = useDeleteTicket();
   const { startAgent } = useStartAgent();
   const planActions = usePlanOrchestratorActions();
@@ -145,7 +151,9 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
         message: raw,
         tickets,
         repos,
+        agents,
         recentRepos: getRecentRepos(),
+        workspaceId: activeWorkspaceId,
         history: history.slice(-8).map((entry) => ({
           role: entry.role,
           text: entry.text,
@@ -165,6 +173,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
           updateTicket: updateTicket.mutateAsync,
           transitionTicket: transitionTicket.mutateAsync,
           closeTicket: closeTicket.mutateAsync,
+          reopenTicket: reopenTicket.mutateAsync,
           deleteTicket: deleteTicket.mutateAsync,
           startAgent,
           setPendingDelete,
@@ -277,7 +286,9 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
               try {
                 const result = await executeCreateTickets({
                   specs: resolvedSpecs,
+                  existingTickets: tickets,
                   createTicket: createTicket.mutateAsync,
+                  reopenTicket: reopenTicket.mutateAsync,
                   transitionTicket: transitionTicket.mutateAsync,
                   isPro,
                 });
@@ -399,6 +410,7 @@ async function executeAction({
   updateTicket,
   transitionTicket,
   closeTicket,
+  reopenTicket,
   deleteTicket,
   startAgent,
   setPendingDelete,
@@ -409,10 +421,21 @@ async function executeAction({
   action: OrchestratorAction;
   tickets: Ticket[];
   isPro: boolean;
-  createTicket: (params: { title: string; context?: string; repo_path?: string; assigned_agent?: string }) => Promise<Ticket>;
+  createTicket: (params: {
+    title: string;
+    context?: string;
+    execution_context?: string;
+    orchestrator_note?: string;
+    repo_path?: string;
+    assigned_agent?: string;
+    duplicate_of_ticket_id?: string;
+    duplicate_policy?: string;
+    intent_type?: string;
+  }) => Promise<Ticket>;
   updateTicket: (params: { id: string; fields: Record<string, unknown> }) => Promise<Ticket>;
   transitionTicket: (params: { id: string; toStatus: Ticket['status'] }) => Promise<Ticket>;
   closeTicket: (id: string) => Promise<Ticket>;
+  reopenTicket: (id: string) => Promise<Ticket>;
   deleteTicket: (id: string) => Promise<void>;
   startAgent: (ticket: Ticket) => Promise<{ ok: boolean; error?: string }>;
   setPendingDelete: (value: PendingDelete | null) => void;
@@ -448,6 +471,23 @@ async function executeAction({
       return matches.length === 1
         ? `Closed "${matches[0].title}".`
         : `Closed ${matches.length} tickets: ${matches.map((ticket) => ticket.title).join(', ')}.`;
+    }
+
+    case 'reopen_tickets': {
+      const ids = (action.ticket_ids ?? []).filter(Boolean);
+      if (ids.length === 0) {
+        return 'The LLM requested reopen, but no ticket IDs were provided.';
+      }
+      const matches = tickets.filter((ticket) => ids.includes(ticket.id));
+      if (matches.length === 0) {
+        return 'No matching tickets were found to reopen.';
+      }
+      for (const ticket of matches) {
+        await reopenTicket(ticket.id);
+      }
+      return matches.length === 1
+        ? `Reopened "${matches[0].title}".`
+        : `Reopened ${matches.length} tickets: ${matches.map((ticket) => ticket.title).join(', ')}.`;
     }
 
     case 'delete_tickets': {
@@ -490,7 +530,9 @@ async function executeAction({
       const resolvedSpecs = applyRepoSelections(specs, repoChoices, {});
       return executeCreateTickets({
         specs: resolvedSpecs,
+        existingTickets: tickets,
         createTicket,
+        reopenTicket,
         transitionTicket,
         isPro,
       });

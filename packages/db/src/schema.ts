@@ -4,6 +4,11 @@ export interface Ticket {
   id: string;
   title: string;
   context: string | null;
+  execution_context: string | null;
+  orchestrator_note: string | null;
+  duplicate_of_ticket_id: string | null;
+  duplicate_policy: string | null;
+  intent_type: string | null;
   status: TicketStatus;
   repo_path: string | null;
   source_branch: string | null;
@@ -105,4 +110,10 @@ export interface AgentConfig {
   model: string | null;
   max_concurrent: number;
   enabled: number;
+  strengths: string | null;
+  weaknesses: string | null;
+  best_for: string | null;
+  reasoning_class: string | null;
+  speed_class: string | null;
+  edit_reliability: string | null;
 }

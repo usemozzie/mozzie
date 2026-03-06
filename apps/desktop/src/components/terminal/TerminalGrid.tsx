@@ -9,7 +9,7 @@ import { useTicketStore } from '../../stores/ticketStore';
 import { useTicket } from '../../hooks/useTickets';
 import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutation';
 import { useAcpRun } from '../../hooks/useAcpRun';
-import { useAgentLogs, useContinueAgent } from '../../hooks/useAgents';
+import { useAgentLogs, useContinueAgent, useInterruptAgent } from '../../hooks/useAgents';
 import { useReview } from '../../hooks/useReview';
 import { useApproveTicketReview, useRejectTicketReview, useCloseTicketReview } from '../../hooks/useWorktree';
 import { AGENT_OPTIONS } from '../../lib/agentOptions';
@@ -75,14 +75,15 @@ export function TerminalGrid() {
       <div className="h-full flex overflow-hidden">
         {/* Focused panel — takes ~60% */}
         <div className="flex-1 min-w-0 panel-tile panel-tile-focused">
-          <TicketInteractionPanel
-            key={`${focused.ticketId}:${focused.slot ?? 'selected'}`}
-            ticketId={focused.ticketId}
-            slot={focused.slot}
-            colorIndex={focused.colorIndex}
-            isFocused={true}
-            onToggleFocus={() => setFocusedTicketId(null)}
-          />
+        <TicketInteractionPanel
+          key={`${focused.ticketId}:${focused.slot ?? 'selected'}`}
+          ticketId={focused.ticketId}
+          slot={focused.slot}
+          colorIndex={focused.colorIndex}
+          isFocused={true}
+          hotkeyEnabled
+          onToggleFocus={() => setFocusedTicketId(null)}
+        />
         </div>
 
         {/* Background tiles sidebar */}
@@ -118,6 +119,7 @@ export function TerminalGrid() {
           slot={slot}
           colorIndex={colorIndex}
           isFocused={false}
+          hotkeyEnabled={count === 1}
           onToggleFocus={() => setFocusedTicketId(count > 1 ? ticketId : null)}
         />
       ))}
@@ -225,10 +227,11 @@ interface TicketInteractionPanelProps {
   slot?: number;
   colorIndex: number;
   isFocused: boolean;
+  hotkeyEnabled: boolean;
   onToggleFocus: () => void;
 }
 
-function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggleFocus }: TicketInteractionPanelProps) {
+function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyEnabled, onToggleFocus }: TicketInteractionPanelProps) {
   const releaseSlot = useTerminalStore((s) => s.releaseSlot);
   const getNextAvailableSlot = useTerminalStore((s) => s.getNextAvailableSlot);
   const transitionTicket = useTransitionTicket();
@@ -237,6 +240,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
   const rejectReview = useRejectTicketReview();
   const closeReview = useCloseTicketReview();
   const continueAgent = useContinueAgent();
+  const interruptAgent = useInterruptAgent();
   const { data: ticket, isLoading } = useTicket(ticketId);
   const [isMutating, setIsMutating] = useState(false);
   const [activeTab, setActiveTab] = useState<'ticket' | 'agent' | 'review'>('agent');
@@ -266,8 +270,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     ticket.assigned_agent &&
     review.review?.can_continue &&
     ticket.status !== 'done' &&
-    ticket.status !== 'archived' &&
-    ticket.status !== 'running'
+    ticket.status !== 'archived'
   );
 
   useEffect(() => {
@@ -276,15 +279,35 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     }
   }, [review.review?.has_changes]);
 
+  useEffect(() => {
+    if (!ticket || !hotkeyEnabled || ticket.status !== 'running') return;
+
+    function handleKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === 'textarea' || tag === 'input' || target?.isContentEditable) return;
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      void handleAbort();
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [ticket?.id, ticket?.status, hotkeyEnabled, slot, isMutating]);
+
   async function handleAbort() {
-    if (!ticket || slot == null) return;
+    if (!ticket) return;
     setIsMutating(true);
     setActionError(null);
     try {
-      try { await invoke('kill_process', { slot }); } catch { /* no-op */ }
-      releaseSlot(slot);
+      await interruptAgent.mutateAsync(ticket.id);
+      if (slot != null) {
+        releaseSlot(slot);
+      }
       await updateTicket.mutateAsync({ id: ticketId, fields: { terminal_slot: null } });
-      await transitionTicket.mutateAsync({ id: ticketId, toStatus: 'ready' });
+      if (ticket.status === 'running') {
+        await transitionTicket.mutateAsync({ id: ticketId, toStatus: 'ready' });
+      }
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -348,14 +371,20 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     setActionError(null);
 
     try {
-      await updateTicket.mutateAsync({ id: ticket.id, fields: { terminal_slot: nextSlot } });
-      await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'running' });
+      if (ticket.terminal_slot == null) {
+        await updateTicket.mutateAsync({ id: ticket.id, fields: { terminal_slot: nextSlot } });
+      }
+      if (ticket.status !== 'running') {
+        await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'running' });
+      }
       await continueAgent.mutateAsync({ ticketId: ticket.id, slot: nextSlot, message });
       setChatMessage('');
       setActiveTab('agent');
     } catch (error) {
-      releaseSlot(nextSlot);
-      await updateTicket.mutateAsync({ id: ticket.id, fields: { terminal_slot: null } });
+      if (ticket.terminal_slot == null) {
+        releaseSlot(nextSlot);
+        await updateTicket.mutateAsync({ id: ticket.id, fields: { terminal_slot: null } });
+      }
       if (previousStatus !== 'running') {
         try {
           await transitionTicket.mutateAsync({ id: ticket.id, toStatus: previousStatus });
@@ -531,9 +560,11 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
               onChange={(e) => { setChatMessage(e.target.value); setChatError(null); }}
               placeholder={
                 canContinueConversation
-                  ? 'Ask the agent to refine, fix, or continue...'
+                  ? ticket.status === 'running'
+                    ? 'Send a follow-up. The current run will be interrupted first...'
+                    : 'Ask the agent to refine, fix, or continue...'
                   : ticket.status === 'running'
-                    ? 'Wait for the current run to finish...'
+                    ? 'Interrupt the run to send a follow-up...'
                     : 'This ticket cannot accept follow-up messages.'
               }
               disabled={!canContinueConversation || isMutating}
@@ -544,7 +575,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
             />
             <div className="mt-2 flex justify-end">
               <Button size="sm" onClick={handleSendMessage} disabled={!canContinueConversation || isMutating}>
-                {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Send'}
+                {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : ticket.status === 'running' ? 'Interrupt & Send' : 'Send'}
               </Button>
             </div>
           </div>

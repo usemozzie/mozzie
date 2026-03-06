@@ -27,6 +27,12 @@ export function useSaveAgentConfig() {
         model: config.model ?? null,
         maxConcurrent: config.max_concurrent ?? 1,
         enabled: config.enabled ?? 1,
+        strengths: config.strengths ?? null,
+        weaknesses: config.weaknesses ?? null,
+        bestFor: config.best_for ?? null,
+        reasoningClass: config.reasoning_class ?? null,
+        speedClass: config.speed_class ?? null,
+        editReliability: config.edit_reliability ?? null,
       }),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: [AGENT_CONFIGS_KEY] }),
@@ -74,6 +80,12 @@ export function useContinueAgent() {
     onSuccess: (_logId, { ticketId, slot }) => {
       assignSlot(slot, ticketId);
     },
+  });
+}
+
+export function useInterruptAgent() {
+  return useMutation({
+    mutationFn: (ticketId: string) => invoke<void>('interrupt_agent', { ticketId }),
   });
 }
 

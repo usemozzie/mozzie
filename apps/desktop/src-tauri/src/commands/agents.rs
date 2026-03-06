@@ -9,6 +9,7 @@ use agent_client_protocol::{
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
@@ -17,6 +18,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::{
     io::AsyncReadExt,
     process::Command,
+    sync::watch,
     time::{timeout, Duration},
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -33,6 +35,12 @@ pub struct AgentConfig {
     pub model: Option<String>,
     pub max_concurrent: i64,
     pub enabled: i64,
+    pub strengths: Option<String>,
+    pub weaknesses: Option<String>,
+    pub best_for: Option<String>,
+    pub reasoning_class: Option<String>,
+    pub speed_class: Option<String>,
+    pub edit_reliability: Option<String>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for AgentConfig {
@@ -45,6 +53,12 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for AgentConfig {
             model: row.try_get("model")?,
             max_concurrent: row.try_get("max_concurrent")?,
             enabled: row.try_get("enabled")?,
+            strengths: row.try_get("strengths")?,
+            weaknesses: row.try_get("weaknesses")?,
+            best_for: row.try_get("best_for")?,
+            reasoning_class: row.try_get("reasoning_class")?,
+            speed_class: row.try_get("speed_class")?,
+            edit_reliability: row.try_get("edit_reliability")?,
         })
     }
 }
@@ -99,6 +113,21 @@ pub struct AcpEventItem {
     pub tool_input: Option<String>,
     pub tool_call_id: Option<String>,
     pub ts: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct ActiveRunHandle {
+    pub(crate) slot: u8,
+    cancel: watch::Sender<bool>,
+}
+
+#[derive(Clone)]
+pub struct ActiveRuns(pub Arc<Mutex<HashMap<String, ActiveRunHandle>>>);
+
+impl Default for ActiveRuns {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
 }
 
 fn now_iso() -> String {
@@ -447,7 +476,7 @@ fn build_command(command_line: &str, cwd: &str, api_key_ref: Option<&str>, api_k
 #[tauri::command]
 pub async fn list_agent_configs(db: State<'_, SqlitePool>) -> Result<Vec<AgentConfig>, String> {
     sqlx::query_as::<_, AgentConfig>(
-        "SELECT id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled \
+        "SELECT id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled, strengths, weaknesses, best_for, reasoning_class, speed_class, edit_reliability \
          FROM agent_config ORDER BY id",
     )
     .fetch_all(db.inner())
@@ -465,21 +494,33 @@ pub async fn save_agent_config(
     model: Option<String>,
     max_concurrent: Option<i64>,
     enabled: Option<i64>,
+    strengths: Option<String>,
+    weaknesses: Option<String>,
+    best_for: Option<String>,
+    reasoning_class: Option<String>,
+    speed_class: Option<String>,
+    edit_reliability: Option<String>,
 ) -> Result<AgentConfig, String> {
     let max_concurrent = max_concurrent.unwrap_or(1);
     let enabled = enabled.unwrap_or(1);
 
     sqlx::query(
         r#"INSERT INTO agent_config
-             (id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+             (id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled, strengths, weaknesses, best_for, reasoning_class, speed_class, edit_reliability)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              display_name   = excluded.display_name,
              acp_url        = excluded.acp_url,
              api_key_ref    = excluded.api_key_ref,
              model          = excluded.model,
              max_concurrent = excluded.max_concurrent,
-             enabled        = excluded.enabled"#,
+             enabled        = excluded.enabled,
+             strengths      = excluded.strengths,
+             weaknesses     = excluded.weaknesses,
+             best_for       = excluded.best_for,
+             reasoning_class = excluded.reasoning_class,
+             speed_class    = excluded.speed_class,
+             edit_reliability = excluded.edit_reliability"#,
     )
     .bind(&id)
     .bind(&display_name)
@@ -488,12 +529,18 @@ pub async fn save_agent_config(
     .bind(&model)
     .bind(max_concurrent)
     .bind(enabled)
+    .bind(&strengths)
+    .bind(&weaknesses)
+    .bind(&best_for)
+    .bind(&reasoning_class)
+    .bind(&speed_class)
+    .bind(&edit_reliability)
     .execute(db.inner())
     .await
     .map_err(|e| e.to_string())?;
 
     sqlx::query_as::<_, AgentConfig>(
-        "SELECT id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled \
+        "SELECT id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled, strengths, weaknesses, best_for, reasoning_class, speed_class, edit_reliability \
          FROM agent_config WHERE id = ?",
     )
     .bind(&id)
@@ -518,10 +565,12 @@ async fn start_agent_run(
     app: AppHandle,
     pool: &SqlitePool,
     ticket_id: String,
+    slot: u8,
+    active_runs: State<'_, ActiveRuns>,
     extra_instruction: Option<String>,
 ) -> Result<String, String> {
     let row = sqlx::query(
-        "SELECT context, worktree_path, assigned_agent FROM tickets WHERE id = ?",
+        "SELECT context, execution_context, worktree_path, assigned_agent FROM tickets WHERE id = ?",
     )
     .bind(&ticket_id)
     .fetch_optional(pool)
@@ -530,6 +579,7 @@ async fn start_agent_run(
     .ok_or_else(|| format!("Ticket {} not found", ticket_id))?;
 
     let context: Option<String> = row.try_get("context").ok().flatten();
+    let execution_context: Option<String> = row.try_get("execution_context").ok().flatten();
     let worktree_path: Option<String> = row.try_get("worktree_path").ok().flatten();
     let assigned_agent: Option<String> = row.try_get("assigned_agent").ok().flatten();
 
@@ -547,9 +597,11 @@ async fn start_agent_run(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| format!("Agent config '{}' not found", agent_id))?;
 
-    let base_prompt = context
+    let base_prompt = execution_context
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "Ticket is missing 'What Should Be Done'".to_string())?;
+        .or(context.filter(|s| !s.trim().is_empty()))
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "Ticket is missing executable context".to_string())?;
     let full_prompt = match extra_instruction {
         Some(message) if !message.trim().is_empty() => format!(
             "{base_prompt}\n\nContinue from the current worktree state.\n\nFollow-up user message:\n{}",
@@ -582,6 +634,23 @@ async fn start_agent_run(
     let ticket_id_bg = ticket_id.clone();
     let log_id_bg = log_id.clone();
     let agent_name = agent_id.clone();
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+
+    {
+        let mut runs = active_runs
+            .0
+            .lock()
+            .map_err(|_| "Active run state is unavailable".to_string())?;
+        runs.insert(
+            ticket_id.clone(),
+            ActiveRunHandle {
+                slot,
+                cancel: cancel_tx,
+            },
+        );
+    }
+
+    let active_runs_bg = active_runs.inner().clone();
 
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -590,6 +659,9 @@ async fn start_agent_run(
         {
             Ok(runtime) => runtime,
             Err(err) => {
+                if let Ok(mut runs) = active_runs_bg.0.lock() {
+                    runs.remove(ticket_id_bg.as_str());
+                }
                 let message = format!("Failed to create ACP runtime: {err}");
                 emit_error_event(&app, &ticket_id_bg, &log_id_bg, &message);
                 return;
@@ -601,6 +673,9 @@ async fn start_agent_run(
             pool_bg,
             ticket_id_bg,
             log_id_bg,
+            slot,
+            active_runs_bg,
+            cancel_rx,
             agent.acp_url,
             agent_name,
             full_prompt,
@@ -621,11 +696,11 @@ async fn start_agent_run(
 pub async fn launch_agent(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_runs: State<'_, ActiveRuns>,
     ticket_id: String,
     slot: u8,
 ) -> Result<String, String> {
-    let _ = slot; // slot is retained for UI tracking; ACP doesn't need it
-    start_agent_run(app, db.inner(), ticket_id, None).await
+    start_agent_run(app, db.inner(), ticket_id, slot, active_runs, None).await
 }
 
 /// Continue an ACP agent run for a ticket with a follow-up user message.
@@ -633,12 +708,23 @@ pub async fn launch_agent(
 pub async fn continue_agent(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_runs: State<'_, ActiveRuns>,
     ticket_id: String,
     slot: u8,
     message: String,
 ) -> Result<String, String> {
-    let _ = slot; // slot is retained for UI tracking; ACP doesn't need it
-    start_agent_run(app, db.inner(), ticket_id, Some(message)).await
+    interrupt_run(&ticket_id, active_runs.inner())
+        .await
+        .map_err(|err| format!("Could not interrupt current run: {err}"))?;
+    start_agent_run(app, db.inner(), ticket_id, slot, active_runs, Some(message)).await
+}
+
+#[tauri::command]
+pub async fn interrupt_agent(
+    active_runs: State<'_, ActiveRuns>,
+    ticket_id: String,
+) -> Result<(), String> {
+    interrupt_run(&ticket_id, active_runs.inner()).await
 }
 
 // ─── ACP Streaming Run ────────────────────────────────────────────────────────
@@ -648,6 +734,9 @@ async fn run_acp_agent(
     pool: SqlitePool,
     ticket_id: String,
     log_id: String,
+    slot: u8,
+    active_runs: ActiveRuns,
+    mut cancel_rx: watch::Receiver<bool>,
     acp_target: String,
     agent_name: String,
     prompt: String,
@@ -816,12 +905,36 @@ async fn run_acp_agent(
                     }
                 };
 
-                let prompt_result = connection
-                    .prompt(PromptRequest::new(
+                let prompt_result = {
+                    let prompt_future = connection.prompt(PromptRequest::new(
                         session.session_id.clone(),
                         vec![ContentBlock::from(prompt.clone())],
-                    ))
-                    .await;
+                    ));
+                    tokio::pin!(prompt_future);
+
+                    tokio::select! {
+                        result = &mut prompt_future => result,
+                        changed = cancel_rx.changed() => {
+                            let _ = changed;
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            let stderr = stderr_task.await.unwrap_or_default();
+                            return (
+                                Some(session.session_id.to_string()),
+                                None,
+                                None,
+                                130,
+                                Some(if stderr.is_empty() {
+                                    "Interrupted by user".to_string()
+                                } else {
+                                    format!("Interrupted by user ({stderr})")
+                                }),
+                                false,
+                                None,
+                            );
+                        }
+                    }
+                };
                 drop(connection);
                 let status = match timeout(Duration::from_secs(5), child.wait()).await {
                     Ok(Ok(status)) => status,
@@ -940,6 +1053,44 @@ async fn run_acp_agent(
         cleanup_warning_message,
     )
     .await;
+
+    if let Ok(mut runs) = active_runs.0.lock() {
+        let should_remove = runs
+            .get(ticket_id.as_str())
+            .map(|handle| handle.slot == slot)
+            .unwrap_or(false);
+        if should_remove {
+            runs.remove(ticket_id.as_str());
+        }
+    }
+}
+
+async fn interrupt_run(ticket_id: &str, active_runs: &ActiveRuns) -> Result<(), String> {
+    let sender = {
+        let runs = active_runs
+            .0
+            .lock()
+            .map_err(|_| "Active run state is unavailable".to_string())?;
+        runs.get(ticket_id).map(|handle| handle.cancel.clone())
+    };
+
+    if let Some(cancel) = sender {
+        let _ = cancel.send(true);
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let still_running = active_runs
+                .0
+                .lock()
+                .map_err(|_| "Active run state is unavailable".to_string())?
+                .contains_key(ticket_id);
+            if !still_running {
+                return Ok(());
+            }
+        }
+        return Err("Timed out waiting for the agent to stop".to_string());
+    }
+
+    Ok(())
 }
 
 fn emit_error_event(app: &AppHandle, ticket_id: &str, log_id: &str, message: &str) {

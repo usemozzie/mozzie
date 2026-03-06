@@ -43,6 +43,12 @@ pub fn run() {
             sql: include_str!("../migrations/006_ticket_dependencies.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 7,
+            description: "orchestrator_v3_metadata",
+            sql: include_str!("../migrations/007_orchestrator_v3.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -166,6 +172,63 @@ pub fn run() {
                     .execute(&pool)
                     .await?;
 
+                // Orchestrator v3 metadata columns (idempotent).
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE tickets ADD COLUMN execution_context TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE tickets ADD COLUMN orchestrator_note TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE tickets ADD COLUMN duplicate_of_ticket_id TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE tickets ADD COLUMN duplicate_policy TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE tickets ADD COLUMN intent_type TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE agent_config ADD COLUMN strengths TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE agent_config ADD COLUMN weaknesses TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE agent_config ADD COLUMN best_for TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE agent_config ADD COLUMN reasoning_class TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE agent_config ADD COLUMN speed_class TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE agent_config ADD COLUMN edit_reliability TEXT;"
+                )
+                .execute(&pool)
+                .await;
+
                 // On every startup, reset tickets that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
                 // restarts, so queued/running tickets would be stuck indefinitely.
@@ -185,6 +248,7 @@ pub fn run() {
             })?;
 
             app.manage(pool);
+            app.manage(commands::agents::ActiveRuns::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -198,7 +262,9 @@ pub fn run() {
             commands::tickets::transition_ticket,
             commands::tickets::archive_ticket,
             commands::tickets::close_ticket,
+            commands::tickets::reopen_ticket,
             commands::tickets::delete_ticket,
+            commands::tickets::find_similar_tickets,
             commands::tickets::search_repo_files,
             commands::tickets::add_ticket_dependency,
             commands::tickets::remove_ticket_dependency,
@@ -224,6 +290,7 @@ pub fn run() {
             commands::agents::delete_agent_config,
             commands::agents::launch_agent,
             commands::agents::continue_agent,
+            commands::agents::interrupt_agent,
             commands::agents::get_agent_logs,
             commands::agents::get_acp_messages,
             // Repos

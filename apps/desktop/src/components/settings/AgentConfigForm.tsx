@@ -13,6 +13,12 @@ const EMPTY_FORM: Partial<AgentConfig> = {
   model: null,
   max_concurrent: 1,
   enabled: 1,
+  strengths: null,
+  weaknesses: null,
+  best_for: null,
+  reasoning_class: null,
+  speed_class: null,
+  edit_reliability: null,
 };
 
 export function AgentConfigSection() {
@@ -195,6 +201,61 @@ function AgentEditor({
           value={form.max_concurrent ?? 1}
           onChange={(e) => set('max_concurrent', parseInt(e.target.value, 10) || 1)}
           className="w-24"
+        />
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-0.5">
+          <label className="text-text-dim">Strengths</label>
+          <Input
+            value={form.strengths ?? ''}
+            onChange={(e) => set('strengths', e.target.value || null)}
+            placeholder="large refactors, ambiguous tasks"
+          />
+        </div>
+        <div className="space-y-0.5">
+          <label className="text-text-dim">Best For</label>
+          <Input
+            value={form.best_for ?? ''}
+            onChange={(e) => set('best_for', e.target.value || null)}
+            placeholder="cross-file changes, repo navigation"
+          />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2">
+        <div className="space-y-0.5">
+          <label className="text-text-dim">Reasoning</label>
+          <Input
+            value={form.reasoning_class ?? ''}
+            onChange={(e) => set('reasoning_class', e.target.value || null)}
+            placeholder="high"
+          />
+        </div>
+        <div className="space-y-0.5">
+          <label className="text-text-dim">Speed</label>
+          <Input
+            value={form.speed_class ?? ''}
+            onChange={(e) => set('speed_class', e.target.value || null)}
+            placeholder="medium"
+          />
+        </div>
+        <div className="space-y-0.5">
+          <label className="text-text-dim">Edit Reliability</label>
+          <Input
+            value={form.edit_reliability ?? ''}
+            onChange={(e) => set('edit_reliability', e.target.value || null)}
+            placeholder="high"
+          />
+        </div>
+      </div>
+
+      <div className="space-y-0.5">
+        <label className="text-text-dim">Weaknesses</label>
+        <Input
+          value={form.weaknesses ?? ''}
+          onChange={(e) => set('weaknesses', e.target.value || null)}
+          placeholder="slower, over-explores"
         />
       </div>
 

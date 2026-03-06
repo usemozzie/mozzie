@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
-import type { Repo, Ticket } from '@mozzie/db';
+import type { AgentConfig, Repo, Ticket } from '@mozzie/db';
 
 export type OrchestratorProvider = 'openai' | 'anthropic' | 'gemini';
 
@@ -29,13 +29,18 @@ export interface OrchestratorKeyStore {
 export interface OrchestratorTicketSpec {
   title: string;
   context: string;
+  execution_context?: string | null;
+  orchestrator_note?: string | null;
   repo_path?: string | null;
   assigned_agent?: string | null;
   depends_on_titles?: string[] | null;
+  duplicate_of_ticket_id?: string | null;
+  duplicate_policy?: string | null;
+  intent_type?: string | null;
 }
 
 export interface OrchestratorAction {
-  kind: 'summary' | 'create_tickets' | 'start_ticket' | 'run_all_ready' | 'delete_tickets' | 'close_tickets';
+  kind: 'summary' | 'create_tickets' | 'start_ticket' | 'run_all_ready' | 'delete_tickets' | 'close_tickets' | 'reopen_tickets';
   ticket_id?: string | null;
   ticket_ids?: string[] | null;
   tickets?: OrchestratorTicketSpec[] | null;
@@ -177,29 +182,40 @@ export function usePlanOrchestratorActions() {
       tickets,
       history,
       repos,
+      agents,
       recentRepos,
+      workspaceId,
     }: {
       config: OrchestratorConfig;
       message: string;
       tickets: Ticket[];
       history: Array<{ role: 'user' | 'orchestrator'; text: string }>;
       repos: Repo[];
+      agents: AgentConfig[];
       recentRepos: string[];
+      workspaceId: string;
     }) =>
       invoke<OrchestratorPlan>('plan_orchestrator_actions', {
         provider: config.provider,
         apiKey: config.apiKey,
         model: config.model,
         message,
+        workspaceId,
         ticketsJson: JSON.stringify(
           tickets.map((ticket) => ({
             id: ticket.id,
             title: ticket.title,
             status: ticket.status,
+            context: ticket.context,
+            execution_context: ticket.execution_context,
+            orchestrator_note: ticket.orchestrator_note,
             repo_path: ticket.repo_path,
             assigned_agent: ticket.assigned_agent,
             worktree_path: ticket.worktree_path,
             branch_name: ticket.branch_name,
+            duplicate_of_ticket_id: ticket.duplicate_of_ticket_id,
+            duplicate_policy: ticket.duplicate_policy,
+            intent_type: ticket.intent_type,
             updated_at: ticket.updated_at,
           }))
         ),
@@ -211,6 +227,20 @@ export function usePlanOrchestratorActions() {
             path: repo.path,
             default_branch: repo.default_branch,
             last_used_at: repo.last_used_at,
+          }))
+        ),
+        agentsJson: JSON.stringify(
+          agents.map((agent) => ({
+            id: agent.id,
+            display_name: agent.display_name,
+            model: agent.model,
+            enabled: agent.enabled,
+            strengths: agent.strengths,
+            weaknesses: agent.weaknesses,
+            best_for: agent.best_for,
+            reasoning_class: agent.reasoning_class,
+            speed_class: agent.speed_class,
+            edit_reliability: agent.edit_reliability,
           }))
         ),
         recentReposJson: JSON.stringify(recentRepos),

@@ -81,29 +81,71 @@ export function missingRepoTitles(specs: OrchestratorTicketSpec[]): string[] {
 
 export async function executeCreateTickets({
   specs,
+  existingTickets,
   createTicket,
+  reopenTicket,
   transitionTicket,
   isPro,
 }: {
   specs: OrchestratorTicketSpec[];
-  createTicket: (params: { title: string; context?: string; repo_path?: string; assigned_agent?: string }) => Promise<Ticket>;
+  existingTickets: Ticket[];
+  createTicket: (params: {
+    title: string;
+    context?: string;
+    execution_context?: string;
+    orchestrator_note?: string;
+    repo_path?: string;
+    assigned_agent?: string;
+    duplicate_of_ticket_id?: string;
+    duplicate_policy?: string;
+    intent_type?: string;
+  }) => Promise<Ticket>;
+  reopenTicket: (id: string) => Promise<Ticket>;
   transitionTicket: (params: { id: string; toStatus: Ticket['status'] }) => Promise<Ticket>;
   isPro: boolean;
 }) {
   const created: string[] = [];
+  const reopened: string[] = [];
   const titleToId = new Map<string, string>();
 
   for (const spec of specs.slice(0, 8)) {
+    const normalizedTitle = spec.title.trim().toLowerCase();
+    const exactMatch = existingTickets.find((ticket) => ticket.title.trim().toLowerCase() === normalizedTitle);
+
+    if (exactMatch && spec.duplicate_policy !== 'intentional_new_ticket') {
+      if (spec.intent_type === 'reopen_ticket' && (exactMatch.status === 'done' || exactMatch.status === 'archived')) {
+        const reopenedTicket = await reopenTicket(exactMatch.id);
+        titleToId.set(spec.title, reopenedTicket.id);
+        reopened.push(spec.title);
+        continue;
+      }
+
+      if (exactMatch.status !== 'done' && exactMatch.status !== 'archived') {
+        titleToId.set(spec.title, exactMatch.id);
+        continue;
+      }
+    }
+
+    const executionContext = sanitizeExecutionContext(spec.execution_context ?? spec.context);
+    if (!executionContext) {
+      continue;
+    }
+
     const ticket = await createTicket({
       title: spec.title,
       context: spec.context,
+      execution_context: executionContext,
+      orchestrator_note: spec.orchestrator_note ?? undefined,
       repo_path: spec.repo_path ?? undefined,
       assigned_agent: spec.assigned_agent ?? 'claude-code',
+      duplicate_of_ticket_id: spec.duplicate_of_ticket_id ?? exactMatch?.id ?? undefined,
+      duplicate_policy: spec.duplicate_policy ?? undefined,
+      intent_type: spec.intent_type ?? 'create_ticket',
     });
 
     titleToId.set(spec.title, ticket.id);
 
-    if (spec.repo_path && spec.context?.trim()) {
+    if (spec.repo_path && executionContext.trim()) {
       await transitionTicket({ id: ticket.id, toStatus: 'ready' });
     }
 
@@ -134,5 +176,37 @@ export async function executeCreateTickets({
     }
   }
 
-  return `Created ${created.length} ticket${created.length === 1 ? '' : 's'}: ${created.join(', ')}.`;
+  const parts: string[] = [];
+  if (created.length > 0) {
+    parts.push(`Created ${created.length} ticket${created.length === 1 ? '' : 's'}: ${created.join(', ')}.`);
+  }
+  if (reopened.length > 0) {
+    parts.push(`Reopened ${reopened.length} ticket${reopened.length === 1 ? '' : 's'}: ${reopened.join(', ')}.`);
+  }
+  return parts.join(' ') || 'No ticket changes were needed.';
+}
+
+function sanitizeExecutionContext(raw: string | null | undefined): string {
+  const value = (raw ?? '').trim();
+  if (!value) return '';
+
+  const forbiddenPhrases = [
+    'create a ticket',
+    'open a ticket',
+    'make a task',
+    'track this',
+    'create this ticket',
+    'ask the orchestrator',
+    'use the orchestrator',
+  ];
+
+  const lower = value.toLowerCase();
+  const cleaned = forbiddenPhrases.reduce((current, phrase) => current.replaceAll(phrase, ''), lower);
+  const normalized = cleaned.replace(/\s+/g, ' ').trim();
+
+  if (!normalized) {
+    return '';
+  }
+
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }

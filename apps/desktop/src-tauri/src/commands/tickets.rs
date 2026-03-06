@@ -10,6 +10,11 @@ pub struct Ticket {
     pub id: String,
     pub title: String,
     pub context: Option<String>,
+    pub execution_context: Option<String>,
+    pub orchestrator_note: Option<String>,
+    pub duplicate_of_ticket_id: Option<String>,
+    pub duplicate_policy: Option<String>,
+    pub intent_type: Option<String>,
     pub status: String,
     pub repo_path: Option<String>,
     pub source_branch: Option<String>,
@@ -30,6 +35,11 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Ticket {
             id: row.try_get("id")?,
             title: row.try_get("title")?,
             context: row.try_get("context")?,
+            execution_context: row.try_get("execution_context")?,
+            orchestrator_note: row.try_get("orchestrator_note")?,
+            duplicate_of_ticket_id: row.try_get("duplicate_of_ticket_id")?,
+            duplicate_policy: row.try_get("duplicate_policy")?,
+            intent_type: row.try_get("intent_type")?,
             status: row.try_get("status")?,
             repo_path: row.try_get("repo_path")?,
             source_branch: row.try_get("source_branch")?,
@@ -189,7 +199,7 @@ fn collect_repo_files(
 }
 
 const SELECT_COLS: &str = r#"
-    SELECT id, title, context, status,
+    SELECT id, title, context, execution_context, orchestrator_note, duplicate_of_ticket_id, duplicate_policy, intent_type, status,
            repo_path, source_branch, branch_name, worktree_path, assigned_agent, terminal_slot,
            workspace_id, created_at, updated_at, started_at, completed_at
     FROM tickets
@@ -212,10 +222,15 @@ pub async fn create_ticket(
     db: State<'_, SqlitePool>,
     title: String,
     context: Option<String>,
+    execution_context: Option<String>,
+    orchestrator_note: Option<String>,
     repo_path: Option<String>,
     assigned_agent: Option<String>,
     branch_name: Option<String>,
     source_branch: Option<String>,
+    duplicate_of_ticket_id: Option<String>,
+    duplicate_policy: Option<String>,
+    intent_type: Option<String>,
     workspace_id: Option<String>,
 ) -> Result<Ticket, String> {
     let id = Ulid::new().to_string();
@@ -234,14 +249,19 @@ pub async fn create_ticket(
 
     sqlx::query(
         r#"INSERT INTO tickets (
-            id, title, context, status, repo_path, source_branch, branch_name, worktree_path,
+            id, title, context, execution_context, orchestrator_note, duplicate_of_ticket_id, duplicate_policy, intent_type, status, repo_path, source_branch, branch_name, worktree_path,
             assigned_agent, terminal_slot, workspace_id, created_at, updated_at,
             started_at, completed_at
-        ) VALUES (?, ?, ?, 'draft', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, NULL, NULL)"#,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, NULL, NULL)"#,
     )
     .bind(&id)
     .bind(&title)
     .bind(&context)
+    .bind(&execution_context)
+    .bind(&orchestrator_note)
+    .bind(&duplicate_of_ticket_id)
+    .bind(&duplicate_policy)
+    .bind(&intent_type)
     .bind(&repo_path)
     .bind(&source_branch)
     .bind(&branch_name)
@@ -271,6 +291,11 @@ pub async fn update_ticket(
     let allowed_fields = [
         "title",
         "context",
+        "execution_context",
+        "orchestrator_note",
+        "duplicate_of_ticket_id",
+        "duplicate_policy",
+        "intent_type",
         "repo_path",
         "source_branch",
         "branch_name",
@@ -318,6 +343,129 @@ pub async fn update_ticket(
         .execute(db.inner())
         .await
         .map_err(|e| e.to_string())?;
+
+    fetch_ticket(db.inner(), &id).await
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SimilarTicketCandidate {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub score: i64,
+    pub repo_path: Option<String>,
+    pub updated_at: String,
+}
+
+fn normalize_for_match(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn similarity_score(query: &str, ticket: &Ticket) -> i64 {
+    let query_norm = normalize_for_match(query);
+    let title_norm = normalize_for_match(&ticket.title);
+    if query_norm.is_empty() || title_norm.is_empty() {
+        return 0;
+    }
+
+    if query_norm == title_norm {
+        return 1000;
+    }
+
+    let mut score = 0_i64;
+    if title_norm.contains(&query_norm) || query_norm.contains(&title_norm) {
+        score += 700;
+    }
+
+    let query_tokens: std::collections::HashSet<_> = query_norm.split_whitespace().collect();
+    let title_tokens: std::collections::HashSet<_> = title_norm.split_whitespace().collect();
+    let overlap = query_tokens.intersection(&title_tokens).count() as i64;
+    score += overlap * 100;
+
+    if let Some(context) = ticket.execution_context.as_deref().or(ticket.context.as_deref()) {
+        let context_norm = normalize_for_match(context);
+        if context_norm.contains(&query_norm) {
+            score += 150;
+        }
+    }
+
+    if ticket.status == "done" {
+        score += 20;
+    }
+
+    score
+}
+
+#[tauri::command]
+pub async fn find_similar_tickets(
+    db: State<'_, SqlitePool>,
+    query: String,
+    workspace_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<SimilarTicketCandidate>, String> {
+    let tickets = list_tickets(db, None, workspace_id).await?;
+    let limit = limit.unwrap_or(5).clamp(1, 20) as usize;
+
+    let mut matches = tickets
+        .into_iter()
+        .map(|ticket| SimilarTicketCandidate {
+            score: similarity_score(&query, &ticket),
+            id: ticket.id,
+            title: ticket.title,
+            status: ticket.status,
+            repo_path: ticket.repo_path,
+            updated_at: ticket.updated_at,
+        })
+        .filter(|candidate| candidate.score > 0)
+        .collect::<Vec<_>>();
+
+    matches.sort_by(|a, b| b.score.cmp(&a.score).then(b.updated_at.cmp(&a.updated_at)));
+    matches.truncate(limit);
+    Ok(matches)
+}
+
+#[tauri::command]
+pub async fn reopen_ticket(
+    app: AppHandle,
+    db: State<'_, SqlitePool>,
+    id: String,
+) -> Result<Ticket, String> {
+    let ticket = fetch_ticket(db.inner(), &id).await?;
+    if !matches!(ticket.status.as_str(), "done" | "archived") {
+        return Err(format!("Can only reopen done or archived tickets, current state: {}", ticket.status));
+    }
+
+    let to_status = if ticket.repo_path.is_some() && ticket.assigned_agent.is_some() {
+        "ready"
+    } else {
+        "draft"
+    };
+    let now = now_iso();
+    sqlx::query(
+        "UPDATE tickets SET status = ?, completed_at = NULL, updated_at = ? WHERE id = ?",
+    )
+    .bind(to_status)
+    .bind(&now)
+    .bind(&id)
+    .execute(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    app.emit(
+        "ticket:state-change",
+        serde_json::json!({
+            "ticketId": id,
+            "from": ticket.status,
+            "to": to_status,
+        }),
+    )
+    .map_err(|e| e.to_string())?;
 
     fetch_ticket(db.inner(), &id).await
 }
@@ -387,12 +535,13 @@ pub async fn transition_ticket(
                 return Err("Title is required to mark ticket as ready".to_string());
             }
             if ticket
-                .context
+                .execution_context
                 .as_deref()
+                .or(ticket.context.as_deref())
                 .map(|s| s.trim().is_empty())
                 .unwrap_or(true)
             {
-                return Err("Context is required to mark ticket as ready".to_string());
+                return Err("Execution context is required to mark ticket as ready".to_string());
             }
             if ticket
                 .repo_path
