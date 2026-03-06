@@ -18,6 +18,7 @@ pub struct OrchestratorTicketSpec {
     pub context: String,
     pub repo_path: Option<String>,
     pub assigned_agent: Option<String>,
+    pub depends_on_titles: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -90,7 +91,8 @@ Schema:
           "title": "required for create_tickets",
           "context": "required for create_tickets",
           "repo_path": "optional absolute path or null",
-          "assigned_agent": "optional or null"
+          "assigned_agent": "optional or null",
+          "depends_on_titles": ["optional array of ticket titles this ticket depends on"]
         }}
       ]
     }}
@@ -104,6 +106,7 @@ Rules:
 - If the user is only asking for status or summary, return a summary action or no actions.
 - Do not invent ticket IDs.
 - Keep assistant_message concise.
+- When creating multiple tickets where some depend on others, use depends_on_titles to reference prerequisite tickets by their exact title in the same batch. Dependencies are only set for Pro users.
 
 Current ticket snapshot:
 {tickets}

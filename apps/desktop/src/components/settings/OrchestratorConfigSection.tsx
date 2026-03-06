@@ -1,101 +1,112 @@
 import { useState } from 'react';
-import { Button } from '../ui/button';
+import { Eye, EyeOff, Check } from 'lucide-react';
 import { Input } from '../ui/input';
 import {
-  getDefaultModel,
-  getOrchestratorConfig,
-  saveOrchestratorConfig,
-  type OrchestratorConfig,
+  getKeyStore,
+  saveKeyStore,
+  ALL_PROVIDERS,
+  PROVIDER_META,
+  type OrchestratorKeyStore,
   type OrchestratorProvider,
 } from '../../hooks/useOrchestrator';
 
-const PROVIDERS: Array<{ value: OrchestratorProvider; label: string }> = [
-  { value: 'openai', label: 'ChatGPT' },
-  { value: 'anthropic', label: 'Claude' },
-  { value: 'gemini', label: 'Gemini' },
-];
-
 export function OrchestratorConfigSection() {
-  const [form, setForm] = useState<OrchestratorConfig>(() => getOrchestratorConfig());
+  const [store, setStore] = useState<OrchestratorKeyStore>(() => getKeyStore());
+  const [reveal, setReveal] = useState<Partial<Record<OrchestratorProvider, boolean>>>({});
   const [saved, setSaved] = useState(false);
 
-  function set<K extends keyof OrchestratorConfig>(key: K, value: OrchestratorConfig[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
+  function updateKey(provider: OrchestratorProvider, value: string) {
+    setStore((prev) => ({ ...prev, keys: { ...prev.keys, [provider]: value } }));
     setSaved(false);
   }
 
-  function handleProviderChange(provider: OrchestratorProvider) {
-    setForm((prev) => ({
-      ...prev,
-      provider,
-      model:
-        prev.model === getDefaultModel(prev.provider)
-          ? getDefaultModel(provider)
-          : prev.model,
-    }));
+  function updateModel(provider: OrchestratorProvider, value: string) {
+    setStore((prev) => ({ ...prev, models: { ...prev.models, [provider]: value } }));
     setSaved(false);
   }
 
   function handleSave() {
-    saveOrchestratorConfig(form);
+    saveKeyStore(store);
     setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
   }
 
   return (
     <div className="space-y-3">
-      <div>
-        <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
-          Orchestrator LLM
-        </h3>
-        <p className="text-[11px] text-text-dim mt-1">
-          Choose one provider for backlog orchestration. The orchestrator behavior stays the same across providers.
-        </p>
-      </div>
+      {ALL_PROVIDERS.map((provider) => {
+        const meta = PROVIDER_META[provider];
+        const key = store.keys[provider];
+        const model = store.models[provider];
+        const hasKey = key.trim().length > 0;
+        const isRevealed = reveal[provider] ?? false;
 
-      <div className="grid grid-cols-3 gap-2">
-        {PROVIDERS.map((provider) => (
-          <button
-            key={provider.value}
-            type="button"
-            onClick={() => handleProviderChange(provider.value)}
-            className={`rounded border px-2 py-2 text-xs transition-colors ${
-              form.provider === provider.value
-                ? 'border-accent bg-accent/10 text-text'
-                : 'border-border bg-bg text-text-dim hover:text-text'
-            }`}
+        return (
+          <div
+            key={provider}
+            className="rounded-lg border border-border bg-bg p-3 space-y-2.5"
           >
-            {provider.label}
-          </button>
-        ))}
-      </div>
+            {/* Provider header */}
+            <div className="flex items-center gap-2">
+              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${hasKey ? 'bg-state-success' : 'bg-state-idle'}`} />
+              <span className="text-[13px] font-medium text-text">{meta.label}</span>
+              {hasKey && (
+                <span className="text-[10px] text-state-success ml-auto">Connected</span>
+              )}
+            </div>
 
-      <div className="space-y-1">
-        <label className="text-xs text-text-dim">API Key</label>
-        <Input
-          type="password"
-          value={form.apiKey}
-          onChange={(event) => set('apiKey', event.target.value)}
-          placeholder="Paste your API key"
-        />
-      </div>
+            {/* API key */}
+            <div className="space-y-1">
+              <label className="text-[11px] text-text-dim">API Key</label>
+              <div className="flex gap-1.5">
+                <Input
+                  type={isRevealed ? 'text' : 'password'}
+                  value={key}
+                  onChange={(e) => updateKey(provider, e.target.value)}
+                  placeholder={meta.placeholder}
+                  className="flex-1 font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={() => setReveal((prev) => ({ ...prev, [provider]: !isRevealed }))}
+                  className="w-8 h-8 flex items-center justify-center rounded-md border border-border text-text-dim hover:text-text hover:bg-white/[0.04] transition-colors shrink-0"
+                  title={isRevealed ? 'Hide' : 'Reveal'}
+                >
+                  {isRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
 
-      <div className="space-y-1">
-        <label className="text-xs text-text-dim">Model</label>
-        <Input
-          value={form.model}
-          onChange={(event) => set('model', event.target.value)}
-          placeholder={getDefaultModel(form.provider)}
-        />
-      </div>
+            {/* Model override */}
+            <div className="space-y-1">
+              <label className="text-[11px] text-text-dim">Model</label>
+              <Input
+                value={model}
+                onChange={(e) => updateModel(provider, e.target.value)}
+                placeholder={meta.defaultModel}
+                className="text-xs"
+              />
+            </div>
+          </div>
+        );
+      })}
 
-      <div className="flex items-center justify-between">
-        <div className="text-[11px] text-text-dim">
-          {saved ? 'Saved locally for this app session/device.' : 'Changes are local until saved.'}
-        </div>
-        <Button size="sm" onClick={handleSave}>
-          Save
-        </Button>
-      </div>
+      <button
+        onClick={handleSave}
+        className={`w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-[12px] font-medium transition-all duration-200 ${
+          saved
+            ? 'bg-state-success/15 text-state-success border border-state-success/30'
+            : 'bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25'
+        }`}
+      >
+        {saved ? (
+          <>
+            <Check className="w-3.5 h-3.5" />
+            Saved
+          </>
+        ) : (
+          'Save API Keys'
+        )}
+      </button>
     </div>
   );
 }

@@ -1,5 +1,9 @@
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useEffect } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import type { TicketReviewState } from '@mozzie/db';
+import type { TicketStateChangeEvent } from '../types/events';
 
 export interface WorktreeInfo {
   worktree_path: string;
@@ -12,7 +16,7 @@ export interface RepoBranchInfo {
   detached: boolean;
 }
 
-// ─── Create ───────────────────────────────────────────────────────────────────
+const TICKET_REVIEW_KEY = 'ticket_review';
 
 export function useCreateWorktree() {
   return useMutation({
@@ -36,8 +40,6 @@ export function useCreateWorktree() {
   });
 }
 
-// ─── Remove ───────────────────────────────────────────────────────────────────
-
 export function useRemoveWorktree() {
   return useMutation({
     mutationFn: ({
@@ -57,11 +59,6 @@ export function useRemoveWorktree() {
   });
 }
 
-// ─── Diff ─────────────────────────────────────────────────────────────────────
-
-/**
- * Fetches the diff between the ticket worktree's current contents and its base branch.
- */
 export function useDiff(
   worktreePath: string | null | undefined,
   sourceBranch?: string | null | undefined,
@@ -77,8 +74,6 @@ export function useDiff(
     staleTime: 30_000,
   });
 }
-
-// ─── Merge ────────────────────────────────────────────────────────────────────
 
 export function useMergeBranch() {
   return useMutation({
@@ -99,6 +94,49 @@ export function useMergeBranch() {
         sourceBranch,
         branchName,
       }),
+  });
+}
+
+export function useTicketReviewState(ticketId: string | null | undefined) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!ticketId) return;
+    const unlisten = listen<TicketStateChangeEvent>('ticket:state-change', (event) => {
+      if (event.payload.ticketId === ticketId) {
+        queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [ticketId, queryClient]);
+
+  return useQuery<TicketReviewState>({
+    queryKey: [TICKET_REVIEW_KEY, ticketId],
+    queryFn: () => invoke('get_ticket_review_state', { ticketId }),
+    enabled: !!ticketId,
+    staleTime: 5_000,
+  });
+}
+
+export function useApproveTicketReview() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (ticketId: string) => invoke('approve_ticket_review', { ticketId }),
+    onSuccess: (_value, ticketId) => {
+      queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+    },
+  });
+}
+
+export function useRejectTicketReview() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (ticketId: string) => invoke('reject_ticket_review', { ticketId }),
+    onSuccess: (_value, ticketId) => {
+      queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+    },
   });
 }
 

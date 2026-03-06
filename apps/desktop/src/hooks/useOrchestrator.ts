@@ -4,10 +4,25 @@ import type { Ticket } from '@mozzie/db';
 
 export type OrchestratorProvider = 'openai' | 'anthropic' | 'gemini';
 
+export const ALL_PROVIDERS: OrchestratorProvider[] = ['openai', 'anthropic', 'gemini'];
+
+export const PROVIDER_META: Record<OrchestratorProvider, { label: string; defaultModel: string; placeholder: string }> = {
+  openai: { label: 'ChatGPT', defaultModel: 'gpt-4.1-mini', placeholder: 'sk-...' },
+  anthropic: { label: 'Claude', defaultModel: 'claude-3-5-sonnet-latest', placeholder: 'sk-ant-...' },
+  gemini: { label: 'Gemini', defaultModel: 'gemini-2.0-flash', placeholder: 'AI...' },
+};
+
 export interface OrchestratorConfig {
   provider: OrchestratorProvider;
   apiKey: string;
   model: string;
+}
+
+/** Per-provider API keys + models stored in localStorage */
+export interface OrchestratorKeyStore {
+  activeProvider: OrchestratorProvider;
+  keys: Record<OrchestratorProvider, string>;
+  models: Record<OrchestratorProvider, string>;
 }
 
 export interface OrchestratorTicketSpec {
@@ -15,6 +30,7 @@ export interface OrchestratorTicketSpec {
   context: string;
   repo_path?: string | null;
   assigned_agent?: string | null;
+  depends_on_titles?: string[] | null;
 }
 
 export interface OrchestratorAction {
@@ -31,61 +47,94 @@ export interface OrchestratorPlan {
 
 const STORAGE_KEY = 'mozzie.orchestratorConfig';
 
-const DEFAULT_CONFIGS: Record<OrchestratorProvider, OrchestratorConfig> = {
-  openai: {
-    provider: 'openai',
-    apiKey: '',
-    model: 'gpt-4.1-mini',
-  },
-  anthropic: {
-    provider: 'anthropic',
-    apiKey: '',
-    model: 'claude-3-5-sonnet-latest',
-  },
-  gemini: {
-    provider: 'gemini',
-    apiKey: '',
-    model: 'gemini-2.0-flash',
-  },
-};
-
 function canUseStorage() {
   return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
 }
 
-export function getOrchestratorConfig(): OrchestratorConfig {
+function emptyKeys(): Record<OrchestratorProvider, string> {
+  return { openai: '', anthropic: '', gemini: '' };
+}
+
+function defaultModels(): Record<OrchestratorProvider, string> {
+  return {
+    openai: PROVIDER_META.openai.defaultModel,
+    anthropic: PROVIDER_META.anthropic.defaultModel,
+    gemini: PROVIDER_META.gemini.defaultModel,
+  };
+}
+
+export function getKeyStore(): OrchestratorKeyStore {
   if (!canUseStorage()) {
-    return DEFAULT_CONFIGS.openai;
+    return { activeProvider: 'openai', keys: emptyKeys(), models: defaultModels() };
   }
 
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      return DEFAULT_CONFIGS.openai;
+    if (!raw) return { activeProvider: 'openai', keys: emptyKeys(), models: defaultModels() };
+
+    const parsed = JSON.parse(raw);
+
+    // Migrate old single-key format
+    if ('apiKey' in parsed && !('keys' in parsed)) {
+      const provider: OrchestratorProvider = isProvider(parsed.provider) ? parsed.provider : 'openai';
+      const keys = emptyKeys();
+      if (typeof parsed.apiKey === 'string') keys[provider] = parsed.apiKey;
+      const models = defaultModels();
+      if (typeof parsed.model === 'string' && parsed.model.trim()) models[provider] = parsed.model;
+      const store: OrchestratorKeyStore = { activeProvider: provider, keys, models };
+      saveKeyStore(store);
+      return store;
     }
 
-    const parsed = JSON.parse(raw) as Partial<OrchestratorConfig>;
-    const provider = isProvider(parsed.provider) ? parsed.provider : 'openai';
-    const defaults = DEFAULT_CONFIGS[provider];
-
     return {
-      provider,
-      apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : defaults.apiKey,
-      model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model : defaults.model,
+      activeProvider: isProvider(parsed.activeProvider) ? parsed.activeProvider : 'openai',
+      keys: {
+        openai: typeof parsed.keys?.openai === 'string' ? parsed.keys.openai : '',
+        anthropic: typeof parsed.keys?.anthropic === 'string' ? parsed.keys.anthropic : '',
+        gemini: typeof parsed.keys?.gemini === 'string' ? parsed.keys.gemini : '',
+      },
+      models: {
+        openai: typeof parsed.models?.openai === 'string' && parsed.models.openai.trim() ? parsed.models.openai : PROVIDER_META.openai.defaultModel,
+        anthropic: typeof parsed.models?.anthropic === 'string' && parsed.models.anthropic.trim() ? parsed.models.anthropic : PROVIDER_META.anthropic.defaultModel,
+        gemini: typeof parsed.models?.gemini === 'string' && parsed.models.gemini.trim() ? parsed.models.gemini : PROVIDER_META.gemini.defaultModel,
+      },
     };
   } catch {
-    return DEFAULT_CONFIGS.openai;
+    return { activeProvider: 'openai', keys: emptyKeys(), models: defaultModels() };
   }
 }
 
-export function saveOrchestratorConfig(config: OrchestratorConfig) {
+export function saveKeyStore(store: OrchestratorKeyStore) {
   if (!canUseStorage()) return;
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+}
 
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+/** Returns true if the given provider has an API key configured */
+export function hasApiKey(provider: OrchestratorProvider): boolean {
+  return getKeyStore().keys[provider].trim().length > 0;
+}
+
+/** Get the resolved config for the currently active provider */
+export function getOrchestratorConfig(): OrchestratorConfig {
+  const store = getKeyStore();
+  return {
+    provider: store.activeProvider,
+    apiKey: store.keys[store.activeProvider],
+    model: store.models[store.activeProvider] || PROVIDER_META[store.activeProvider].defaultModel,
+  };
+}
+
+/** Save a resolved config (updates the key store) */
+export function saveOrchestratorConfig(config: OrchestratorConfig) {
+  const store = getKeyStore();
+  store.activeProvider = config.provider;
+  store.keys[config.provider] = config.apiKey;
+  store.models[config.provider] = config.model;
+  saveKeyStore(store);
 }
 
 export function getDefaultModel(provider: OrchestratorProvider) {
-  return DEFAULT_CONFIGS[provider].model;
+  return PROVIDER_META[provider].defaultModel;
 }
 
 export function usePlanOrchestratorActions() {

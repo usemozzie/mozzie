@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Loader2, X, Check, ChevronRight, Maximize2, Minimize2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Loader2, X, Check, ChevronRight, Maximize2, Minimize2, Copy, Bot, Clock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -11,13 +11,13 @@ import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutat
 import { useAcpRun } from '../../hooks/useAcpRun';
 import { useAgentLogs, useContinueAgent } from '../../hooks/useAgents';
 import { useReview } from '../../hooks/useReview';
-import { useMergeBranch, useRemoveWorktree } from '../../hooks/useWorktree';
+import { useApproveTicketReview, useRejectTicketReview } from '../../hooks/useWorktree';
 import { AGENT_OPTIONS } from '../../lib/agentOptions';
 import { getTicketColor } from '../../lib/ticketColors';
 import { StatusBadge } from '../ui/badge';
 import { Button } from '../ui/button';
 import { Select } from '../ui/select';
-import { DiffViewer } from '../review/DiffViewer';
+import { ReviewPanel } from '../review/ReviewPanel';
 
 function getColCount(count: number): number {
   if (count <= 1) return 1;
@@ -233,8 +233,8 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
   const getNextAvailableSlot = useTerminalStore((s) => s.getNextAvailableSlot);
   const transitionTicket = useTransitionTicket();
   const updateTicket = useUpdateTicket();
-  const mergeBranch = useMergeBranch();
-  const removeWorktree = useRemoveWorktree();
+  const approveReview = useApproveTicketReview();
+  const rejectReview = useRejectTicketReview();
   const continueAgent = useContinueAgent();
   const { data: ticket, isLoading } = useTicket(ticketId);
   const [isMutating, setIsMutating] = useState(false);
@@ -257,24 +257,23 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     ...liveItems,
   ];
 
-  const hasRecoverableWorktree = !!(
-    ticket &&
-    ticket.status === 'ready' &&
-    ticket.repo_path &&
-    ticket.worktree_path &&
-    ticket.branch_name
-  );
-  const review = useReview(ticket, ticket?.status === 'review' || hasRecoverableWorktree);
+  const review = useReview(ticket, ticket?.status !== 'running');
   const accent = getTicketColor(colorIndex);
-  const canShowReview = ticket?.status === 'review' || hasRecoverableWorktree;
+  const canShowReview = !!review.review?.can_review;
   const canContinueConversation = !!(
     ticket &&
     ticket.assigned_agent &&
-    ticket.worktree_path &&
+    review.review?.can_continue &&
     ticket.status !== 'done' &&
     ticket.status !== 'archived' &&
     ticket.status !== 'running'
   );
+
+  useEffect(() => {
+    if (ticket?.status !== 'running' && review.review?.has_changes) {
+      setActiveTab('review');
+    }
+  }, [ticket?.status, review.review?.has_changes]);
 
   async function handleAbort() {
     if (!ticket || slot == null) return;
@@ -292,52 +291,12 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     }
   }
 
-  async function handleResumeReview() {
-    if (!ticket) return;
-    setIsMutating(true);
-    setActionError(null);
-    try {
-      setActiveTab('review');
-      await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'review' });
-    } catch (error) {
-      setActionError(String(error));
-    } finally {
-      setIsMutating(false);
-    }
-  }
-
   async function handleApprove() {
-    if (!ticket?.repo_path || !ticket.worktree_path || !ticket.source_branch || !ticket.branch_name) return;
-    setIsMutating(true);
-    setActionError(null);
-    try {
-      await mergeBranch.mutateAsync({
-        repoPath: ticket.repo_path,
-        worktreePath: ticket.worktree_path,
-        sourceBranch: ticket.source_branch,
-        branchName: ticket.branch_name,
-      });
-      await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'done' });
-    } catch (error) {
-      setActionError(String(error));
-    } finally {
-      setIsMutating(false);
-    }
-  }
-
-  async function handleClose() {
     if (!ticket) return;
     setIsMutating(true);
     setActionError(null);
     try {
-      if (ticket.worktree_path && ticket.repo_path && ticket.branch_name) {
-        await removeWorktree.mutateAsync({
-          worktreePath: ticket.worktree_path,
-          repoPath: ticket.repo_path,
-          branchName: ticket.branch_name,
-        });
-      }
-      await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'done' });
+      await approveReview.mutateAsync(ticket.id);
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -350,14 +309,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
     setIsMutating(true);
     setActionError(null);
     try {
-      if (ticket.worktree_path && ticket.repo_path && ticket.branch_name) {
-        await removeWorktree.mutateAsync({
-          worktreePath: ticket.worktree_path,
-          repoPath: ticket.repo_path,
-          branchName: ticket.branch_name,
-        });
-      }
-      await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'ready' });
+      await rejectReview.mutateAsync(ticket.id);
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -520,6 +472,18 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
         <TicketInfoTab
           ticket={ticket}
           onAgentChange={handleAgentChange}
+          onTransition={async (toStatus) => {
+            setIsMutating(true);
+            setActionError(null);
+            try {
+              await transitionTicket.mutateAsync({ id: ticket.id, toStatus: toStatus as any });
+            } catch (error) {
+              setActionError(String(error));
+            } finally {
+              setIsMutating(false);
+            }
+          }}
+          isMutating={isMutating}
           agentError={agentError}
           isUpdatingAgent={isUpdatingAgent}
         />
@@ -573,62 +537,16 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
         </>
       ) : (
         canShowReview && (
-          <>
-            {/* Review header */}
-            <div className="shrink-0 border-b border-border px-3 py-2 bg-surface">
-              {hasRecoverableWorktree && ticket.status === 'ready' && (
-                <p className="mb-1.5 text-[11px] text-state-waiting">
-                  This ticket has unreviewed work in its existing worktree.
-                </p>
-              )}
-              {latestLog?.cleanup_warning_message && (
-                <p className="mb-1.5 text-[11px] text-state-waiting">{latestLog.cleanup_warning_message}</p>
-              )}
-              {ticket.source_branch && ticket.branch_name && (
-                <div className="text-[11px] text-text-muted font-mono">
-                  <span className="text-text-dim">diff: </span>
-                  <span>{ticket.source_branch}</span>
-                  <span className="text-text-dim"> &larr; </span>
-                  <span>{ticket.branch_name}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Diff viewer */}
-            <div className="flex-1 min-h-0 overflow-auto bg-bg">
-              {review.diffLoading ? (
-                <div className="h-full flex items-center justify-center gap-2 text-text-muted text-[13px]">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Loading diff...
-                </div>
-              ) : review.diffError ? (
-                <div className="p-3 text-[13px] text-red-400">{review.diffError}</div>
-              ) : (
-                <DiffViewer diff={review.diff ?? ''} />
-              )}
-            </div>
-
-            {/* Review actions */}
-            <div className="shrink-0 border-t border-border px-3 py-3 flex gap-2 bg-surface">
-              {ticket.status === 'ready' ? (
-                <Button variant="outline" size="sm" onClick={handleResumeReview} disabled={isMutating} className="flex-1">
-                  {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Resume Review'}
-                </Button>
-              ) : (
-                <>
-                  <Button size="sm" onClick={handleApprove} disabled={isMutating} className="flex-1">
-                    {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Check className="w-3 h-3" />Approve</>}
-                  </Button>
-                  <Button variant="destructive" size="sm" onClick={handleReject} disabled={isMutating} className="flex-1">
-                    {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Reject'}
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={handleClose} disabled={isMutating} className="flex-1">
-                    {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Close'}
-                  </Button>
-                </>
-              )}
-            </div>
-          </>
+          <ReviewPanel
+            ticket={ticket}
+            review={review.review}
+            reviewLoading={review.reviewLoading}
+            reviewError={review.reviewError}
+            latestLog={latestLog}
+            onApprove={handleApprove}
+            onReject={handleReject}
+            isMutating={isMutating}
+          />
         )
       )}
     </div>
@@ -637,107 +555,220 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, onToggl
 
 // ---- Ticket info tab ----
 
+const AGENT_COLORS: Record<string, string> = {
+  'claude-code': '#D97706',
+  'gemini-cli': '#3B82F6',
+  'codex-cli': '#10B981',
+};
+
+function middleTruncate(path: string, maxLen = 40): string {
+  if (path.length <= maxLen) return path;
+  const keep = Math.floor((maxLen - 3) / 2);
+  return path.slice(0, keep) + '...' + path.slice(-keep);
+}
+
+function CopyableValue({ value, mono, truncateMiddle }: { value: string; mono?: boolean; truncateMiddle?: boolean }) {
+  const [copied, setCopied] = useState(false);
+
+  return (
+    <span className="group/copy inline-flex items-center gap-1 min-w-0">
+      <span
+        className={`${mono ? 'font-mono' : ''} text-text-muted ${truncateMiddle ? 'truncate' : ''}`}
+        title={value}
+      >
+        {truncateMiddle ? middleTruncate(value) : value}
+      </span>
+      <button
+        onClick={() => { navigator.clipboard.writeText(value); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+        className="shrink-0 opacity-0 group-hover/copy:opacity-100 transition-opacity w-4 h-4 flex items-center justify-center rounded text-text-dim hover:text-text"
+        title="Copy"
+      >
+        {copied ? <Check className="w-2.5 h-2.5 text-state-success" /> : <Copy className="w-2.5 h-2.5" />}
+      </button>
+    </span>
+  );
+}
+
 function TicketInfoTab({
   ticket,
   onAgentChange,
+  onTransition,
+  isMutating,
   agentError,
   isUpdatingAgent,
 }: {
   ticket: Ticket;
   onAgentChange: (agent: string) => void;
+  onTransition: (toStatus: string) => void;
+  isMutating: boolean;
   agentError: string | null;
   isUpdatingAgent: boolean;
 }) {
+  const agentLabel = AGENT_OPTIONS.find((a) => a.value === ticket.assigned_agent)?.label ?? ticket.assigned_agent;
+  const agentColor = AGENT_COLORS[ticket.assigned_agent ?? ''] ?? '#64748B';
+  const hasTechMeta = !!(ticket.repo_path || ticket.source_branch || ticket.branch_name || ticket.worktree_path || ticket.terminal_slot != null);
+
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4 text-[12px]">
-
-      {/* Title + status */}
-      <div>
-        {/* 30% Primary: bold title */}
-        <p className="text-[15px] font-semibold text-text leading-snug">{ticket.title || <span className="italic text-text-dim">Untitled</span>}</p>
-        <div className="mt-1.5">
-          <StatusBadge status={ticket.status} />
-        </div>
-      </div>
-
-      {/* Context / description */}
-      {ticket.context ? (
-        <div>
-          <p className="text-[10px] font-medium uppercase tracking-wider text-text-dim mb-1.5">Description</p>
-          <div className="font-mono text-[12px] leading-[1.6]">
-            <MarkdownText content={ticket.context} />
+    <div className="flex-1 min-h-0 overflow-y-auto">
+      {/* Hero Header */}
+      <div className="px-5 pt-4 pb-3 border-b border-border bg-surface/50">
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="text-[15px] font-semibold text-text leading-snug flex-1 min-w-0">
+            {ticket.title || <span className="italic text-text-dim">Untitled</span>}
+          </h2>
+          <div className="flex items-center gap-2 shrink-0 pt-0.5">
+            <StatusBadge status={ticket.status} />
+            {ticket.status === 'draft' && (
+              <Button
+                size="sm"
+                onClick={() => onTransition('ready')}
+                disabled={isMutating}
+                className="bg-indigo-600 hover:bg-indigo-500 text-white border-0"
+              >
+                {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Mark Ready'}
+              </Button>
+            )}
           </div>
         </div>
-      ) : (
-        <p className="italic text-text-dim">No description.</p>
-      )}
-
-      {/* Meta fields — 60% Neutral: smaller, dimmer */}
-      <div className="space-y-2 pt-2 border-t border-border">
-        <div className="space-y-1">
-          <span className="text-text-dim shrink-0 block">Agent</span>
-          <Select
-            value={ticket.assigned_agent ?? ''}
-            options={AGENT_OPTIONS.map((option) => ({ ...option }))}
-            onChange={(event) => onAgentChange(event.target.value)}
-            disabled={ticket.status === 'running' || isUpdatingAgent}
-          />
-          {agentError && (
-            <div className="text-[11px] text-red-400">{agentError}</div>
-          )}
-        </div>
-        {ticket.repo_path && (
-          <Row label="Repo" value={ticket.repo_path} mono truncate />
-        )}
-        {ticket.source_branch && (
-          <Row label="Base branch" value={ticket.source_branch} mono />
-        )}
-        {ticket.branch_name && (
-          <Row label="Worktree branch" value={ticket.branch_name} mono />
-        )}
-        {ticket.worktree_path && (
-          <Row label="Worktree path" value={ticket.worktree_path} mono truncate />
-        )}
-        {ticket.terminal_slot != null && (
-          <Row label="Slot" value={String(ticket.terminal_slot)} mono />
-        )}
       </div>
 
-      {/* Timestamps — smallest, most dimmed */}
-      <div className="space-y-1.5 pt-2 border-t border-border text-[11px]">
-        <Row label="Created" value={new Date(ticket.created_at).toLocaleString()} />
-        <Row label="Updated" value={new Date(ticket.updated_at).toLocaleString()} />
-        {ticket.started_at && (
-          <Row label="Started" value={new Date(ticket.started_at).toLocaleString()} />
+      {/* 70/30 Split: Content + Sidebar */}
+      <div className="flex min-h-0">
+        {/* Main column — Description + Agent */}
+        <div className="flex-1 min-w-0 px-5 py-4 space-y-4">
+          {/* Agent card */}
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-text-dim/70 mb-2">Agent</p>
+            {ticket.assigned_agent ? (
+              <div
+                className="inline-flex items-center gap-2.5 px-3 py-2 rounded-lg border transition-colors"
+                style={{
+                  backgroundColor: `${agentColor}0A`,
+                  borderColor: `${agentColor}20`,
+                }}
+              >
+                <div
+                  className="w-6 h-6 rounded-md flex items-center justify-center shrink-0"
+                  style={{ backgroundColor: `${agentColor}18` }}
+                >
+                  <Bot className="w-3.5 h-3.5" style={{ color: agentColor }} />
+                </div>
+                <span className="text-[13px] font-medium text-text">{agentLabel}</span>
+              </div>
+            ) : (
+              <Select
+                value=""
+                options={AGENT_OPTIONS.map((option) => ({ ...option }))}
+                placeholder="Assign an agent..."
+                onChange={(event) => onAgentChange(event.target.value)}
+                disabled={isUpdatingAgent}
+              />
+            )}
+            {ticket.assigned_agent && (
+              <div className="mt-2">
+                <Select
+                  value={ticket.assigned_agent}
+                  options={AGENT_OPTIONS.map((option) => ({ ...option }))}
+                  onChange={(event) => onAgentChange(event.target.value)}
+                  disabled={isUpdatingAgent}
+                />
+              </div>
+            )}
+            {agentError && (
+              <div className="mt-1.5 text-[11px] text-red-400">{agentError}</div>
+            )}
+          </div>
+
+          {/* Description */}
+          <div>
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-text-dim/70 mb-2">Description</p>
+            {ticket.context ? (
+              <div className="text-[12.5px] leading-[1.625] text-text-muted">
+                <MarkdownText content={ticket.context} />
+              </div>
+            ) : (
+              <p className="italic text-text-dim text-[12px]">No description provided.</p>
+            )}
+          </div>
+        </div>
+
+        {/* Info sidebar — Technical metadata */}
+        {hasTechMeta && (
+          <div className="w-[200px] shrink-0 border-l border-border bg-[#0B1120] px-3.5 py-4 space-y-3.5">
+            {ticket.repo_path && (
+              <MetaField label="Repository">
+                <CopyableValue value={ticket.repo_path} mono truncateMiddle />
+              </MetaField>
+            )}
+            {ticket.source_branch && (
+              <MetaField label="Base Branch">
+                <CopyableValue value={ticket.source_branch} mono />
+              </MetaField>
+            )}
+            {ticket.branch_name && (
+              <MetaField label="Worktree Branch">
+                <CopyableValue value={ticket.branch_name} mono />
+              </MetaField>
+            )}
+            {ticket.worktree_path && (
+              <MetaField label="Worktree Path">
+                <CopyableValue value={ticket.worktree_path} mono truncateMiddle />
+              </MetaField>
+            )}
+            {ticket.terminal_slot != null && (
+              <MetaField label="Slot">
+                <span className="font-mono text-text-muted">#{ticket.terminal_slot}</span>
+              </MetaField>
+            )}
+
+            {/* Timestamps — sidebar footer */}
+            <div className="pt-3 mt-3 border-t border-white/[0.06] space-y-2">
+              <div className="flex items-center gap-1.5 mb-1.5">
+                <Clock className="w-3 h-3 text-text-dim/50" />
+                <span className="text-[9px] font-semibold uppercase tracking-widest text-text-dim/50">Timeline</span>
+              </div>
+              <TimestampRow label="Created" date={ticket.created_at} />
+              <TimestampRow label="Updated" date={ticket.updated_at} />
+              {ticket.started_at && <TimestampRow label="Started" date={ticket.started_at} />}
+              {ticket.completed_at && <TimestampRow label="Completed" date={ticket.completed_at} />}
+            </div>
+          </div>
         )}
-        {ticket.completed_at && (
-          <Row label="Completed" value={new Date(ticket.completed_at).toLocaleString()} />
+
+        {/* If no tech meta, just show timestamps inline */}
+        {!hasTechMeta && (
+          <div className="w-[180px] shrink-0 border-l border-border bg-[#0B1120] px-3.5 py-4">
+            <div className="flex items-center gap-1.5 mb-2.5">
+              <Clock className="w-3 h-3 text-text-dim/50" />
+              <span className="text-[9px] font-semibold uppercase tracking-widest text-text-dim/50">Timeline</span>
+            </div>
+            <div className="space-y-2">
+              <TimestampRow label="Created" date={ticket.created_at} />
+              <TimestampRow label="Updated" date={ticket.updated_at} />
+              {ticket.started_at && <TimestampRow label="Started" date={ticket.started_at} />}
+              {ticket.completed_at && <TimestampRow label="Completed" date={ticket.completed_at} />}
+            </div>
+          </div>
         )}
       </div>
     </div>
   );
 }
 
-function Row({
-  label,
-  value,
-  mono,
-  truncate,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-  truncate?: boolean;
-}) {
+function MetaField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-baseline gap-2">
-      <span className="text-text-dim shrink-0 w-28 text-[11px]">{label}</span>
-      <span
-        className={`text-[11px] ${mono ? 'font-mono' : ''} text-text-muted ${truncate ? 'truncate' : ''}`}
-        title={truncate ? value : undefined}
-      >
-        {value}
-      </span>
+    <div className="space-y-1">
+      <span className="text-[9px] font-semibold uppercase tracking-widest text-text-dim/50 block">{label}</span>
+      <div className="text-[11px]">{children}</div>
+    </div>
+  );
+}
+
+function TimestampRow({ label, date }: { label: string; date: string }) {
+  return (
+    <div className="text-[10px]">
+      <span className="text-text-dim/60 block">{label}</span>
+      <span className="text-text-dim">{new Date(date).toLocaleString()}</span>
     </div>
   );
 }

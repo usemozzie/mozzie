@@ -4,12 +4,14 @@ import { listen } from '@tauri-apps/api/event';
 import { useEffect } from 'react';
 import type { Ticket, TicketStatus } from '@mozzie/db';
 import type { TicketStateChangeEvent } from '../types/events';
+import { useWorkspaceStore } from '../stores/workspaceStore';
 
 export const TICKETS_KEY = 'tickets';
 export const TICKET_KEY = 'ticket';
 
 export function useTickets(statusFilter?: TicketStatus[]) {
   const queryClient = useQueryClient();
+  const workspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
 
   useEffect(() => {
     const unlisten = listen<TicketStateChangeEvent>(
@@ -24,10 +26,11 @@ export function useTickets(statusFilter?: TicketStatus[]) {
   }, [queryClient]);
 
   return useQuery({
-    queryKey: [TICKETS_KEY, statusFilter],
+    queryKey: [TICKETS_KEY, statusFilter, workspaceId],
     queryFn: () =>
       invoke<Ticket[]>('list_tickets', {
         statusFilter: statusFilter ?? null,
+        workspaceId,
       }),
   });
 }

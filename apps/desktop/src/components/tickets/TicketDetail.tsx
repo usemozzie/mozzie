@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react';
-import { ChevronLeft, Loader2, FolderOpen } from 'lucide-react';
+import { ChevronLeft, Loader2, FolderOpen, X, GitBranch } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { Ticket, TicketStatus } from '@mozzie/db';
-import { useTicket } from '../../hooks/useTickets';
+import { useTicket, useTickets } from '../../hooks/useTickets';
 import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutation';
-import { useCreateWorktree, useRemoveWorktree, useMergeBranch, useRepoBranch, useRepoBranches } from '../../hooks/useWorktree';
+import { useCreateWorktree, useApproveTicketReview, useRejectTicketReview, useRepoBranch, useRepoBranches } from '../../hooks/useWorktree';
 import { useLaunchAgent } from '../../hooks/useAgents';
+import { useTicketDependencies, useTicketDependents, useAddDependency, useRemoveDependency } from '../../hooks/useDependencies';
+import { useLicense } from '../../hooks/useLicense';
+import { useReview } from '../../hooks/useReview';
 import { AGENT_OPTIONS } from '../../lib/agentOptions';
 import { saveRecentRepo } from '../../lib/recentRepos';
 import { useTicketStore } from '../../stores/ticketStore';
@@ -33,6 +36,10 @@ function getTransitions(status: TicketStatus): TransitionButtonConfig[] {
         { label: 'Queue', toStatus: 'queued' },
         { label: 'Back to Draft', toStatus: 'draft', variant: 'outline' },
       ];
+    case 'blocked':
+      return [
+        { label: 'Force Unblock', toStatus: 'ready', variant: 'outline' },
+      ];
     case 'queued':
       return [
         { label: 'Run Now', toStatus: 'running' },
@@ -41,7 +48,6 @@ function getTransitions(status: TicketStatus): TransitionButtonConfig[] {
     case 'running':
       return [{ label: 'Abort', toStatus: 'ready', variant: 'destructive' }];
     case 'review':
-      // ReviewPanel renders its own Approve / Reject buttons
       return [];
     case 'done':
       return [{ label: 'Archive', toStatus: 'archived', variant: 'outline' }];
@@ -56,8 +62,8 @@ export function TicketDetail() {
   const updateTicket = useUpdateTicket();
   const transitionTicket = useTransitionTicket();
   const createWorktree = useCreateWorktree();
-  const removeWorktree = useRemoveWorktree();
-  const mergeBranch = useMergeBranch();
+  const approveReview = useApproveTicketReview();
+  const rejectReview = useRejectTicketReview();
   const launchAgent = useLaunchAgent();
   const getNextAvailableSlot = useTerminalStore((s) => s.getNextAvailableSlot);
   const releaseSlot = useTerminalStore((s) => s.releaseSlot);
@@ -67,6 +73,17 @@ export function TicketDetail() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const repoBranch = useRepoBranch(form.repo_path ?? '');
   const repoBranches = useRepoBranches(form.repo_path ?? '');
+
+  // Dependencies (Pro only)
+  const { data: license } = useLicense();
+  const isPro = license?.is_pro ?? false;
+  const { data: deps } = useTicketDependencies(activeTicketId);
+  const { data: dependents } = useTicketDependents(activeTicketId);
+  const { data: allTickets } = useTickets();
+  const addDependency = useAddDependency();
+  const removeDependency = useRemoveDependency();
+  const [depSearch, setDepSearch] = useState('');
+  const reviewState = useReview(ticket, ticket?.status !== 'running');
 
   // Sync form when ticket loads
   useEffect(() => {
@@ -91,17 +108,19 @@ export function TicketDetail() {
     );
   }
 
-  // Review state gets its own full-panel component
-  if (ticket.status === 'review') {
+  if (ticket.status === 'review' || reviewState.review?.can_review) {
     return (
       <ReviewPanel
         ticket={ticket}
-        onTransition={handleTransition}
-        isTransitioning={
-          transitionTicket.isPending ||
-          mergeBranch.isPending ||
-          removeWorktree.isPending
-        }
+        review={reviewState.review}
+        reviewLoading={reviewState.reviewLoading}
+        reviewError={reviewState.reviewError}
+        latestLog={reviewState.latestLog}
+        onApprove={handleApproveReview}
+        onReject={handleRejectReview}
+        isMutating={approveReview.isPending || rejectReview.isPending}
+        showBackButton
+        actionError={saveError}
       />
     );
   }
@@ -130,6 +149,26 @@ export function TicketDetail() {
     try {
       await updateTicket.mutateAsync({ id: ticket.id, fields });
       setDirty(false);
+    } catch (e) {
+      setSaveError(String(e));
+    }
+  }
+
+  async function handleApproveReview() {
+    if (!ticket) return;
+    setSaveError(null);
+    try {
+      await approveReview.mutateAsync(ticket.id);
+    } catch (e) {
+      setSaveError(String(e));
+    }
+  }
+
+  async function handleRejectReview() {
+    if (!ticket) return;
+    setSaveError(null);
+    try {
+      await rejectReview.mutateAsync(ticket.id);
     } catch (e) {
       setSaveError(String(e));
     }
@@ -182,40 +221,6 @@ export function TicketDetail() {
         return;
       }
 
-      // ── review → done: merge branch into repo HEAD ────────────────────
-      if (ticket.status === 'review' && toStatus === 'done') {
-        if (
-          ticket.repo_path &&
-          ticket.worktree_path &&
-          ticket.source_branch &&
-          ticket.branch_name
-        ) {
-          await mergeBranch.mutateAsync({
-            repoPath: ticket.repo_path,
-            worktreePath: ticket.worktree_path,
-            sourceBranch: ticket.source_branch,
-            branchName: ticket.branch_name,
-          });
-        }
-        await transitionTicket.mutateAsync({ id: ticket.id, toStatus });
-        if (ticket.terminal_slot != null) releaseSlot(ticket.terminal_slot);
-        return;
-      }
-
-      // ── review → ready: reject — remove worktree + branch ────────────
-      if (ticket.status === 'review' && toStatus === 'ready') {
-        if (ticket.worktree_path && ticket.repo_path && ticket.branch_name) {
-          await removeWorktree.mutateAsync({
-            worktreePath: ticket.worktree_path,
-            repoPath: ticket.repo_path,
-            branchName: ticket.branch_name,
-          });
-        }
-        await transitionTicket.mutateAsync({ id: ticket.id, toStatus });
-        if (ticket.terminal_slot != null) releaseSlot(ticket.terminal_slot);
-        return;
-      }
-
       // ── running → ready: abort — kill process + release slot ─────────
       if (ticket.status === 'running' && toStatus === 'ready') {
         const slot = ticket.terminal_slot;
@@ -223,15 +228,11 @@ export function TicketDetail() {
           try {
             await invoke('kill_process', { slot });
           } catch {
-            // Process may have already exited; ignore
+            // Process may have already exited.
           }
           releaseSlot(slot);
         }
-        // Clear terminal_slot on the ticket before transitioning
-        await updateTicket.mutateAsync({
-          id: ticket.id,
-          fields: { terminal_slot: null },
-        });
+        await updateTicket.mutateAsync({ id: ticket.id, fields: { terminal_slot: null } });
         await transitionTicket.mutateAsync({ id: ticket.id, toStatus });
         return;
       }
@@ -244,16 +245,11 @@ export function TicketDetail() {
   }
 
   const transitions = getTransitions(ticket.status);
-  const hasRecoverableWorktree =
-    ticket.status === 'ready' &&
-    !!ticket.repo_path &&
-    !!ticket.worktree_path &&
-    !!ticket.branch_name;
   const anyPending =
     transitionTicket.isPending ||
     createWorktree.isPending ||
-    removeWorktree.isPending ||
-    mergeBranch.isPending ||
+    approveReview.isPending ||
+    rejectReview.isPending ||
     launchAgent.isPending ||
     updateTicket.isPending;
 
@@ -411,6 +407,113 @@ export function TicketDetail() {
             </div>
           )}
 
+        {/* Dependencies (Pro only) */}
+        {isPro && (
+          <div className="space-y-2 pt-2 border-t border-border">
+            <label className="text-xs text-text-muted font-medium flex items-center gap-1.5">
+              <GitBranch className="w-3 h-3" />
+              Dependencies
+            </label>
+
+            {/* Current dependencies */}
+            {deps && deps.length > 0 && (
+              <div className="space-y-1">
+                {deps.map((dep) => {
+                  const depTicket = allTickets?.find((t) => t.id === dep.depends_on_id);
+                  return (
+                    <div key={dep.depends_on_id} className="flex items-center gap-2 text-xs bg-surface-raised rounded px-2 py-1.5">
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        depTicket?.status === 'done' || depTicket?.status === 'archived'
+                          ? 'bg-state-success'
+                          : 'bg-amber-500'
+                      }`} />
+                      <span className="flex-1 text-text truncate">
+                        {depTicket?.title ?? dep.depends_on_id}
+                      </span>
+                      <span className="text-[10px] text-text-dim">{depTicket?.status}</span>
+                      {!isLocked && (
+                        <button
+                          onClick={() => removeDependency.mutate({ ticketId: ticket.id, dependsOnId: dep.depends_on_id })}
+                          className="text-text-dim hover:text-red-400 transition-colors"
+                          title="Remove dependency"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Add dependency picker */}
+            {!isLocked && ticket.status !== 'done' && ticket.status !== 'archived' && (
+              <div className="space-y-1">
+                <Input
+                  value={depSearch}
+                  onChange={(e) => setDepSearch(e.target.value)}
+                  placeholder="Search tickets to add as dependency…"
+                  className="text-xs"
+                />
+                {depSearch.trim() && (
+                  <div className="max-h-32 overflow-y-auto border border-border rounded bg-bg">
+                    {(allTickets ?? [])
+                      .filter((t) =>
+                        t.id !== ticket.id &&
+                        !deps?.some((d) => d.depends_on_id === t.id) &&
+                        t.title.toLowerCase().includes(depSearch.toLowerCase())
+                      )
+                      .slice(0, 8)
+                      .map((t) => (
+                        <button
+                          key={t.id}
+                          onClick={async () => {
+                            try {
+                              await addDependency.mutateAsync({ ticketId: ticket.id, dependsOnId: t.id });
+                              setDepSearch('');
+                              setSaveError(null);
+                            } catch (e) {
+                              setSaveError(String(e));
+                            }
+                          }}
+                          className="w-full text-left px-2 py-1.5 text-xs hover:bg-surface transition-colors flex items-center gap-2"
+                        >
+                          <span className="text-text truncate flex-1">{t.title}</span>
+                          <span className="text-[10px] text-text-dim shrink-0">{t.status}</span>
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Dependents (who depends on this ticket) */}
+            {dependents && dependents.length > 0 && (
+              <div className="space-y-1 pt-1">
+                <label className="text-[11px] text-text-dim">Blocks {dependents.length} ticket{dependents.length > 1 ? 's' : ''}</label>
+                {dependents.map((dep) => {
+                  const depTicket = allTickets?.find((t) => t.id === dep.ticket_id);
+                  return (
+                    <div key={dep.ticket_id} className="text-xs text-text-dim px-2 py-1 truncate">
+                      {depTicket?.title ?? dep.ticket_id}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Blocked status info */}
+        {ticket.status === 'blocked' && deps && deps.length > 0 && (
+          <div className="text-xs text-amber-400 bg-amber-900/10 border border-amber-800/30 rounded px-2 py-1.5">
+            Waiting for {deps.filter((d) => {
+              const t = allTickets?.find((t) => t.id === d.depends_on_id);
+              return t && t.status !== 'done' && t.status !== 'archived';
+            }).length} dependency ticket{deps.length > 1 ? 's' : ''} to be approved.
+          </div>
+        )}
+
         {/* Timestamps */}
         <div className="text-xs text-text-dim space-y-0.5 pt-2 border-t border-border">
           <div>Created: {new Date(ticket.created_at).toLocaleString()}</div>
@@ -429,17 +532,6 @@ export function TicketDetail() {
       {/* Action buttons at bottom */}
       {transitions.length > 0 && (
         <div className="shrink-0 px-3 py-3 border-t border-border flex gap-2">
-          {hasRecoverableWorktree && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => handleTransition('review')}
-              disabled={anyPending}
-              className="flex-1"
-            >
-              View Diff
-            </Button>
-          )}
           {transitions.map((t) => (
             <Button
               key={t.toStatus}

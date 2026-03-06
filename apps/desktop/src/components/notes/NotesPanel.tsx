@@ -1,35 +1,55 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { X, Pencil, Eye } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useTicketStore } from '../../stores/ticketStore';
+import { useNotes, useSaveNotes } from '../../hooks/useNotes';
 
 interface NotesPanelProps {
   onClose: () => void;
 }
 
-const NOTES_STORAGE_KEY = 'mozzie.notes';
-
 export function NotesPanel({ onClose }: NotesPanelProps) {
+  const { data: savedNotes, isLoading } = useNotes();
+  const saveNotes = useSaveNotes();
   const [notes, setNotes] = useState('');
-  const [isHydrated, setIsHydrated] = useState(false);
+  const [hydrated, setHydrated] = useState(false);
   const [selectedText, setSelectedText] = useState('');
   const [mode, setMode] = useState<'edit' | 'preview'>('edit');
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const openNewTicketModal = useTicketStore((s) => s.openNewTicketModal);
 
+  // Load from DB when query resolves or workspace changes
   useEffect(() => {
-    const stored = localStorage.getItem(NOTES_STORAGE_KEY);
-    if (stored !== null) {
-      setNotes(stored);
+    if (savedNotes !== undefined) {
+      setNotes(savedNotes);
+      setHydrated(true);
     }
-    setIsHydrated(true);
+  }, [savedNotes]);
+
+  // Debounced save to DB on every change
+  const debouncedSave = useCallback(
+    (content: string) => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => {
+        saveNotes.mutate(content);
+      }, 500);
+    },
+    [saveNotes],
+  );
+
+  // Flush on unmount
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
   }, []);
 
-  useEffect(() => {
-    if (!isHydrated) return;
-    localStorage.setItem(NOTES_STORAGE_KEY, notes);
-  }, [notes, isHydrated]);
+  function handleChange(value: string) {
+    setNotes(value);
+    if (hydrated) debouncedSave(value);
+  }
 
   function syncSelection() {
     const el = textareaRef.current;
@@ -74,21 +94,23 @@ export function NotesPanel({ onClose }: NotesPanelProps) {
         </div>
       </div>
 
-      <div className="flex-1 p-4 min-h-0 flex flex-col gap-2">
-        {mode === 'edit' ? (
+      <div className="flex-1 min-h-0 flex flex-col gap-2">
+        {isLoading ? (
+          <div className="flex-1 flex items-center justify-center text-text-dim text-sm">Loading...</div>
+        ) : mode === 'edit' ? (
           <textarea
             ref={textareaRef}
             value={notes}
-            onChange={(event) => setNotes(event.target.value)}
+            onChange={(event) => handleChange(event.target.value)}
             onSelect={syncSelection}
             onKeyUp={syncSelection}
             onMouseUp={syncSelection}
             placeholder="Write notes... (supports Markdown)"
-            className="w-full flex-1 min-h-0 resize-none rounded-lg border border-border bg-bg/80 text-sm text-text px-3 py-2
-              focus:outline-none focus:border-accent/50 placeholder:text-text-dim leading-relaxed"
+            className="w-full flex-1 min-h-0 resize-none bg-transparent text-sm text-text px-4 py-3
+              focus:outline-none placeholder:text-text-dim leading-relaxed"
           />
         ) : (
-          <div className="flex-1 min-h-0 overflow-y-auto rounded-lg border border-border bg-bg/80 px-3 py-2">
+          <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
             {notes.trim() ? (
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
@@ -133,7 +155,7 @@ export function NotesPanel({ onClose }: NotesPanelProps) {
           </div>
         )}
         {selectedText && mode === 'edit' && (
-          <div className="shrink-0 flex items-center justify-between rounded-lg border border-border bg-bg/70 px-3 py-2">
+          <div className="shrink-0 flex items-center justify-between border-t border-border px-4 py-2">
             <span className="text-xs text-text-dim truncate pr-3">
               Create ticket from selected text
             </span>

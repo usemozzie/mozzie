@@ -3,3 +3,7 @@ pub mod tickets;
 pub mod agents;
 pub mod worktree;
 pub mod orchestrator;
+pub mod repos;
+pub mod workspaces;
+pub mod license;
+pub mod notes;

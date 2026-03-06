@@ -7,6 +7,7 @@ const statusConfig: Record<
 > = {
   draft:    { dot: 'bg-state-idle',    bg: 'bg-state-idle/10',    text: 'text-slate-400',   label: 'Draft' },
   ready:    { dot: 'bg-state-active',  bg: 'bg-state-active/10',  text: 'text-blue-400',    label: 'Ready' },
+  blocked:  { dot: 'bg-amber-500',     bg: 'bg-amber-500/10',     text: 'text-amber-400',   label: 'Blocked' },
   queued:   { dot: 'bg-state-active',  bg: 'bg-state-active/10',  text: 'text-blue-300',    label: 'Queued' },
   running:  { dot: 'bg-state-active',  bg: 'bg-state-active/10',  text: 'text-blue-300',    label: 'Running', animate: true },
   review:   { dot: 'bg-state-waiting', bg: 'bg-state-waiting/10', text: 'text-amber-400',   label: 'Review' },

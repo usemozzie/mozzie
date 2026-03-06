@@ -982,7 +982,7 @@ async fn finalize(
     cleanup_warning_message: Option<String>,
 ) {
     let messages_json = serde_json::to_string(events).unwrap_or_else(|_| "[]".to_string());
-    let to_status = if exit_code == 0 { "review" } else { "ready" };
+    let to_status = "ready";
     let now = now_iso();
 
     let _ = sqlx::query(

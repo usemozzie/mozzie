@@ -17,6 +17,7 @@ pub struct Ticket {
     pub worktree_path: Option<String>,
     pub assigned_agent: Option<String>,
     pub terminal_slot: Option<i64>,
+    pub workspace_id: String,
     pub created_at: String,
     pub updated_at: String,
     pub started_at: Option<String>,
@@ -36,6 +37,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for Ticket {
             worktree_path: row.try_get("worktree_path")?,
             assigned_agent: row.try_get("assigned_agent")?,
             terminal_slot: row.try_get("terminal_slot")?,
+            workspace_id: row.try_get::<String, _>("workspace_id").unwrap_or_else(|_| "default".to_string()),
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             started_at: row.try_get("started_at")?,
@@ -55,10 +57,11 @@ fn status_weight(status: &str) -> i32 {
         "running" => 0,
         "review" => 1,
         "queued" => 2,
-        "ready" => 3,
-        "draft" => 4,
-        "done" => 5,
-        "archived" => 6,
+        "blocked" => 3,
+        "ready" => 4,
+        "draft" => 5,
+        "done" => 6,
+        "archived" => 7,
         _ => 99,
     }
 }
@@ -68,9 +71,12 @@ fn is_valid_transition(from: &str, to: &str) -> bool {
         (from, to),
         ("draft", "ready")
             | ("ready", "queued")
+            | ("ready", "blocked")
             | ("ready", "draft")
             | ("ready", "review")
             | ("ready", "running")
+            | ("blocked", "ready")
+            | ("blocked", "queued")
             | ("queued", "running")
             | ("queued", "ready")
             | ("running", "review")
@@ -185,7 +191,7 @@ fn collect_repo_files(
 const SELECT_COLS: &str = r#"
     SELECT id, title, context, status,
            repo_path, source_branch, branch_name, worktree_path, assigned_agent, terminal_slot,
-           created_at, updated_at, started_at, completed_at
+           workspace_id, created_at, updated_at, started_at, completed_at
     FROM tickets
 "#;
 
@@ -210,9 +216,11 @@ pub async fn create_ticket(
     assigned_agent: Option<String>,
     branch_name: Option<String>,
     source_branch: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<Ticket, String> {
     let id = Ulid::new().to_string();
     let now = now_iso();
+    let workspace_id = workspace_id.unwrap_or_else(|| "default".to_string());
     let assigned_agent = assigned_agent
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -227,9 +235,9 @@ pub async fn create_ticket(
     sqlx::query(
         r#"INSERT INTO tickets (
             id, title, context, status, repo_path, source_branch, branch_name, worktree_path,
-            assigned_agent, terminal_slot, created_at, updated_at,
+            assigned_agent, terminal_slot, workspace_id, created_at, updated_at,
             started_at, completed_at
-        ) VALUES (?, ?, ?, 'draft', ?, ?, ?, NULL, ?, NULL, ?, ?, NULL, NULL)"#,
+        ) VALUES (?, ?, ?, 'draft', ?, ?, ?, NULL, ?, NULL, ?, ?, ?, NULL, NULL)"#,
     )
     .bind(&id)
     .bind(&title)
@@ -238,6 +246,7 @@ pub async fn create_ticket(
     .bind(&source_branch)
     .bind(&branch_name)
     .bind(&assigned_agent)
+    .bind(&workspace_id)
     .bind(&now)
     .bind(&now)
     .execute(db.inner())
@@ -317,21 +326,25 @@ pub async fn update_ticket(
 pub async fn list_tickets(
     db: State<'_, SqlitePool>,
     status_filter: Option<Vec<String>>,
+    workspace_id: Option<String>,
 ) -> Result<Vec<Ticket>, String> {
+    let ws = workspace_id.unwrap_or_else(|| "default".to_string());
+
     let mut tickets = if let Some(statuses) = status_filter.filter(|s| !s.is_empty()) {
         let placeholders = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql = format!(
-            "{} WHERE status IN ({}) ORDER BY updated_at DESC",
+            "{} WHERE workspace_id = ? AND status IN ({}) ORDER BY updated_at DESC",
             SELECT_COLS, placeholders
         );
-        let mut q = sqlx::query_as::<_, Ticket>(&sql);
+        let mut q = sqlx::query_as::<_, Ticket>(&sql).bind(&ws);
         for s in &statuses {
             q = q.bind(s);
         }
         q.fetch_all(db.inner()).await.map_err(|e| e.to_string())?
     } else {
-        let sql = format!("{} ORDER BY updated_at DESC", SELECT_COLS);
+        let sql = format!("{} WHERE workspace_id = ? ORDER BY updated_at DESC", SELECT_COLS);
         sqlx::query_as::<_, Ticket>(&sql)
+            .bind(&ws)
             .fetch_all(db.inner())
             .await
             .map_err(|e| e.to_string())?
@@ -519,6 +532,11 @@ pub async fn transition_ticket(
     )
     .map_err(|e| e.to_string())?;
 
+    // When a ticket is approved (done), cascade-unblock any blocked dependents
+    if to_status == "done" {
+        let _ = cascade_unblock_dependents(&app, db.inner(), &id).await;
+    }
+
     fetch_ticket(db.inner(), &id).await
 }
 
@@ -555,6 +573,14 @@ pub async fn delete_ticket(
     }
 
     sqlx::query("DELETE FROM agent_logs WHERE ticket_id = ?")
+        .bind(&id)
+        .execute(db.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Remove all dependency edges involving this ticket
+    sqlx::query("DELETE FROM ticket_dependencies WHERE ticket_id = ? OR depends_on_id = ?")
+        .bind(&id)
         .bind(&id)
         .execute(db.inner())
         .await
@@ -610,4 +636,233 @@ pub async fn search_repo_files(
     matches.truncate(12);
 
     Ok(matches)
+}
+
+// ─── Dependency types ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TicketDependency {
+    pub ticket_id: String,
+    pub depends_on_id: String,
+    pub created_at: String,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for TicketDependency {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        Ok(TicketDependency {
+            ticket_id: row.try_get("ticket_id")?,
+            depends_on_id: row.try_get("depends_on_id")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+// ─── Dependency Commands ──────────────────────────────────────────────────────
+
+/// Check if adding a dependency would create a cycle (DFS from depends_on_id).
+async fn would_create_cycle(pool: &SqlitePool, ticket_id: &str, depends_on_id: &str) -> Result<bool, String> {
+    // DFS: starting from depends_on_id, follow its own dependencies.
+    // If we reach ticket_id, it's a cycle.
+    let mut stack = vec![depends_on_id.to_string()];
+    let mut visited = std::collections::HashSet::new();
+
+    while let Some(current) = stack.pop() {
+        if current == ticket_id {
+            return Ok(true);
+        }
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let deps: Vec<(String,)> = sqlx::query_as(
+            "SELECT depends_on_id FROM ticket_dependencies WHERE ticket_id = ?",
+        )
+        .bind(&current)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        for (dep,) in deps {
+            stack.push(dep);
+        }
+    }
+
+    Ok(false)
+}
+
+#[tauri::command]
+pub async fn add_ticket_dependency(
+    app: AppHandle,
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+    depends_on_id: String,
+) -> Result<(), String> {
+    if ticket_id == depends_on_id {
+        return Err("A ticket cannot depend on itself".to_string());
+    }
+
+    // Verify both tickets exist
+    let _ = fetch_ticket(db.inner(), &ticket_id).await?;
+    let _ = fetch_ticket(db.inner(), &depends_on_id).await?;
+
+    // Check for cycles
+    if would_create_cycle(db.inner(), &ticket_id, &depends_on_id).await? {
+        return Err("Adding this dependency would create a circular dependency".to_string());
+    }
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO ticket_dependencies (ticket_id, depends_on_id, created_at) VALUES (?, ?, ?)",
+    )
+    .bind(&ticket_id)
+    .bind(&depends_on_id)
+    .bind(now_iso())
+    .execute(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    app.emit(
+        "ticket:deps-changed",
+        serde_json::json!({ "ticketId": ticket_id }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_ticket_dependency(
+    app: AppHandle,
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+    depends_on_id: String,
+) -> Result<(), String> {
+    sqlx::query(
+        "DELETE FROM ticket_dependencies WHERE ticket_id = ? AND depends_on_id = ?",
+    )
+    .bind(&ticket_id)
+    .bind(&depends_on_id)
+    .execute(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    app.emit(
+        "ticket:deps-changed",
+        serde_json::json!({ "ticketId": ticket_id }),
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Get tickets that this ticket depends on (upstream dependencies).
+#[tauri::command]
+pub async fn get_ticket_dependencies(
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+) -> Result<Vec<TicketDependency>, String> {
+    sqlx::query_as::<_, TicketDependency>(
+        "SELECT ticket_id, depends_on_id, created_at FROM ticket_dependencies WHERE ticket_id = ? ORDER BY created_at",
+    )
+    .bind(&ticket_id)
+    .fetch_all(db.inner())
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Get tickets that depend on this ticket (downstream dependents).
+#[tauri::command]
+pub async fn get_ticket_dependents(
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+) -> Result<Vec<TicketDependency>, String> {
+    sqlx::query_as::<_, TicketDependency>(
+        "SELECT ticket_id, depends_on_id, created_at FROM ticket_dependencies WHERE depends_on_id = ? ORDER BY created_at",
+    )
+    .bind(&ticket_id)
+    .fetch_all(db.inner())
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Check if a ticket has unmet dependencies (any dependency not in done/archived).
+#[tauri::command]
+pub async fn has_unmet_dependencies(
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+) -> Result<bool, String> {
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM ticket_dependencies td \
+         JOIN tickets t ON t.id = td.depends_on_id \
+         WHERE td.ticket_id = ? AND t.status NOT IN ('done', 'archived')",
+    )
+    .bind(&ticket_id)
+    .fetch_one(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(count.0 > 0)
+}
+
+/// After a ticket is approved (done), find blocked dependents that are now unblocked
+/// and transition them to ready. Returns the list of unblocked ticket IDs.
+pub async fn cascade_unblock_dependents(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    approved_ticket_id: &str,
+) -> Result<Vec<String>, String> {
+    // Find all blocked tickets that depend on the approved ticket
+    let blocked_dependents: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT td.ticket_id FROM ticket_dependencies td \
+         JOIN tickets t ON t.id = td.ticket_id \
+         WHERE td.depends_on_id = ? AND t.status = 'blocked'",
+    )
+    .bind(approved_ticket_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let now = now_iso();
+    let mut unblocked = Vec::new();
+
+    for (dep_ticket_id,) in blocked_dependents {
+        // Check if ALL dependencies of this ticket are now done/archived
+        let unmet: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM ticket_dependencies td \
+             JOIN tickets t ON t.id = td.depends_on_id \
+             WHERE td.ticket_id = ? AND t.status NOT IN ('done', 'archived')",
+        )
+        .bind(&dep_ticket_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if unmet.0 == 0 {
+            // All deps met — unblock to ready
+            sqlx::query("UPDATE tickets SET status = 'ready', updated_at = ? WHERE id = ? AND status = 'blocked'")
+                .bind(&now)
+                .bind(&dep_ticket_id)
+                .execute(pool)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let _ = app.emit(
+                "ticket:state-change",
+                serde_json::json!({
+                    "ticketId": dep_ticket_id,
+                    "from": "blocked",
+                    "to": "ready",
+                }),
+            );
+
+            unblocked.push(dep_ticket_id);
+        }
+    }
+
+    if !unblocked.is_empty() {
+        let _ = app.emit(
+            "ticket:deps-unblocked",
+            serde_json::json!({ "ticketIds": unblocked }),
+        );
+    }
+
+    Ok(unblocked)
 }

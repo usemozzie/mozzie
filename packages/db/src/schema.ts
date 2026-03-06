@@ -1,4 +1,4 @@
-export type TicketStatus = 'draft' | 'ready' | 'queued' | 'running' | 'review' | 'done' | 'archived';
+export type TicketStatus = 'draft' | 'ready' | 'blocked' | 'queued' | 'running' | 'review' | 'done' | 'archived';
 
 export interface Ticket {
   id: string;
@@ -11,10 +11,27 @@ export interface Ticket {
   worktree_path: string | null;
   assigned_agent: string | null;
   terminal_slot: number | null;
+  workspace_id: string;
   created_at: string;
   updated_at: string;
   started_at: string | null;
   completed_at: string | null;
+}
+
+export interface TicketReviewState {
+  ticket_id: string;
+  review_status: 'unavailable' | 'clean' | 'changes' | 'merged' | string;
+  summary: string;
+  source_branch: string | null;
+  branch_name: string | null;
+  worktree_path: string | null;
+  diff: string;
+  has_changes: boolean;
+  is_merged: boolean;
+  worktree_present: boolean;
+  branch_present: boolean;
+  can_review: boolean;
+  can_continue: boolean;
 }
 
 /** A single streamed event item from an ACP run, stored as JSON in agent_logs.messages. */
@@ -44,6 +61,37 @@ export interface AgentLog {
   duration_ms: number | null;
   cleanup_warning: number | null;
   cleanup_warning_message: string | null;
+  created_at: string;
+}
+
+export interface Repo {
+  id: string;
+  name: string;
+  path: string;
+  default_branch: string | null;
+  last_used_at: string | null;
+  workspace_id: string;
+  created_at: string;
+}
+
+export interface Workspace {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LicenseStatus {
+  is_pro: boolean;
+  license_key: string | null;
+  email: string | null;
+  status: string | null;
+  validated_at: string | null;
+}
+
+export interface TicketDependency {
+  ticket_id: string;
+  depends_on_id: string;
   created_at: string;
 }
 

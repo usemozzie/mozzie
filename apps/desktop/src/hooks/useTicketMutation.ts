@@ -2,9 +2,11 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
 import type { Ticket, TicketStatus } from '@mozzie/db';
 import { TICKET_KEY, TICKETS_KEY } from './useTickets';
+import { useWorkspaceStore } from '../stores/workspaceStore';
 
 export function useCreateTicket() {
   const queryClient = useQueryClient();
+  const workspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
   return useMutation({
     mutationFn: (params: {
       title: string;
@@ -21,6 +23,7 @@ export function useCreateTicket() {
         assignedAgent: params.assigned_agent ?? null,
         branchName: params.branch_name ?? null,
         sourceBranch: params.source_branch ?? null,
+        workspaceId,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [TICKETS_KEY] });

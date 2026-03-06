@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useCreateWorktree } from './useWorktree';
 import { useUpdateTicket, useTransitionTicket } from './useTicketMutation';
 import { useLaunchAgent } from './useAgents';
@@ -35,6 +36,23 @@ export function useStartAgent() {
 
   async function startAgent(ticket: Ticket): Promise<{ ok: boolean; error?: string }> {
     // Pre-flight checks — fail fast with clear messages
+    // Check for unmet dependencies — if any, transition to blocked
+    try {
+      const hasUnmet = await invoke<boolean>('has_unmet_dependencies', { ticketId: ticket.id });
+      if (hasUnmet) {
+        // Transition to blocked if currently ready
+        if (ticket.status === 'ready') {
+          await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'blocked' });
+        }
+        const message = 'Ticket has unmet dependencies. It will auto-start when dependencies are approved.';
+        setError(message);
+        setRunError(ticket.id, message);
+        return { ok: false, error: message };
+      }
+    } catch (e) {
+      // If dependency check fails, proceed without blocking
+    }
+
     if (!ticket.repo_path) {
       const message = 'Set a repository path on the ticket before starting.';
       setError(message);

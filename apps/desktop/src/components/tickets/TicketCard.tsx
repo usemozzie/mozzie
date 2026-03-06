@@ -1,7 +1,8 @@
-import { Play, Loader2 } from 'lucide-react';
+import { Play, Loader2, GitBranch } from 'lucide-react';
 import type { Ticket, TicketStatus } from '@mozzie/db';
 import { formatDistanceToNow } from '../../lib/time';
 import { useStartAgent } from '../../hooks/useStartAgent';
+import { useTicketDependencies } from '../../hooks/useDependencies';
 import { getTicketColor } from '../../lib/ticketColors';
 import { useTicketStore } from '../../stores/ticketStore';
 
@@ -9,6 +10,7 @@ import { useTicketStore } from '../../stores/ticketStore';
 const statusDot: Record<TicketStatus, string> = {
   draft:    'bg-state-idle',
   ready:    'bg-state-active',
+  blocked:  'bg-amber-500',
   queued:   'bg-state-active',
   running:  'bg-state-active dot-pulse',
   review:   'bg-state-waiting',
@@ -27,7 +29,10 @@ export function TicketCard({ ticket, isSelected, selectedIndex, onClick }: Ticke
   const { startAgent, isStarting } = useStartAgent();
   const runError = useTicketStore((s) => s.runErrorsByTicketId[ticket.id]);
   const selectTicket = useTicketStore((s) => s.selectTicket);
+  const { data: deps } = useTicketDependencies(ticket.id);
   const isReady = ticket.status === 'ready';
+  const isBlocked = ticket.status === 'blocked';
+  const hasDeps = deps && deps.length > 0;
   const accent = getTicketColor(selectedIndex);
 
   return (
@@ -49,6 +54,15 @@ export function TicketCard({ ticket, isSelected, selectedIndex, onClick }: Ticke
 
         {/* Right meta — 60% Neutral: smaller, dimmer */}
         <div className="flex items-center gap-2 shrink-0">
+          {hasDeps && (
+            <span className="flex items-center gap-0.5 text-[10px] text-amber-400 opacity-70" title={`${deps.length} dep${deps.length > 1 ? 's' : ''}`}>
+              <GitBranch className="w-2.5 h-2.5" />
+              {deps.length}
+            </span>
+          )}
+          {isBlocked && (
+            <span className="text-[10px] text-amber-400 font-medium">blocked</span>
+          )}
           {ticket.assigned_agent && (
             <span className="text-[10px] text-text-dim opacity-50 max-w-[70px] truncate">
               {ticket.assigned_agent}

@@ -1,17 +1,18 @@
 interface DiffViewerProps {
   diff: string;
+  selectedFileKey?: string | null;
 }
 
-type ParsedLineKind = 'add' | 'remove' | 'context' | 'meta';
+export type ParsedLineKind = 'add' | 'remove' | 'context' | 'meta';
 
-interface ParsedLine {
+export interface ParsedLine {
   kind: ParsedLineKind;
   text: string;
   oldLine: number | null;
   newLine: number | null;
 }
 
-interface DiffFile {
+export interface DiffFile {
   key: string;
   oldPath: string;
   newPath: string;
@@ -38,30 +39,25 @@ interface MetaRow {
 
 type DisplayRow = SplitRow | HunkRow | MetaRow;
 
-// GitHub dark diff exact colors
 const GH = {
-  bg:           '#0d1117',
-  surface:      '#161b22',
-  border:       '#30363d',
-  borderSub:    '#21262d',
-  text:         '#c9d1d9',
-  textMuted:    '#7d8590',
-  // Added
-  addContent:   '#0d2818',
-  addGutter:    '#033a16',
-  addMarker:    '#3fb950',
-  // Removed
-  remContent:   '#2d1b1e',
-  remGutter:    '#48090d',
-  remMarker:    '#f85149',
-  // Hunk header
-  hunkBg:       '#152032',
-  hunkText:     '#79c0ff',
-  // Empty side
-  empty:        '#161b22',
+  bg: '#0d1117',
+  surface: '#161b22',
+  border: '#30363d',
+  borderSub: '#21262d',
+  text: '#c9d1d9',
+  textMuted: '#7d8590',
+  addContent: '#0d2818',
+  addGutter: '#033a16',
+  addMarker: '#3fb950',
+  remContent: '#2d1b1e',
+  remGutter: '#48090d',
+  remMarker: '#f85149',
+  hunkBg: '#152032',
+  hunkText: '#79c0ff',
+  empty: '#161b22',
 } as const;
 
-export function DiffViewer({ diff }: DiffViewerProps) {
+export function DiffViewer({ diff, selectedFileKey }: DiffViewerProps) {
   if (!diff.trim()) {
     return (
       <div className="px-4 py-8 text-[#7d8590] text-sm text-center font-mono">
@@ -70,7 +66,10 @@ export function DiffViewer({ diff }: DiffViewerProps) {
     );
   }
 
-  const files = parseDiff(diff);
+  const parsedFiles = parseDiff(diff);
+  const files = selectedFileKey
+    ? parsedFiles.filter((file) => file.key === selectedFileKey)
+    : parsedFiles;
 
   if (files.length === 0) {
     return (
@@ -84,9 +83,7 @@ export function DiffViewer({ diff }: DiffViewerProps) {
     <div style={{ background: GH.bg }} className="p-3 space-y-3">
       {files.map((file) => {
         const rows = buildDisplayRows(file.lines);
-        return (
-          <FileSection key={file.key} file={file} rows={rows} />
-        );
+        return <FileSection key={file.key} file={file} rows={rows} />;
       })}
     </div>
   );
@@ -105,7 +102,6 @@ function FileSection({ file, rows }: { file: DiffFile; rows: DisplayRow[] }) {
         background: GH.bg,
       }}
     >
-      {/* GitHub-style file header */}
       <header
         style={{
           background: GH.surface,
@@ -117,15 +113,10 @@ function FileSection({ file, rows }: { file: DiffFile; rows: DisplayRow[] }) {
           minHeight: 40,
         }}
       >
-        {/* Collapse arrow */}
         <span style={{ color: GH.textMuted, fontSize: 12, userSelect: 'none' }}>▾</span>
-
-        {/* File icon */}
         <svg width="16" height="16" viewBox="0 0 16 16" fill={GH.textMuted}>
           <path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 8.75 4.25V1.5Zm6.75.5v2.25c0 .138.112.25.25.25h2.25Z" />
         </svg>
-
-        {/* Status badge */}
         {status !== 'modified' && (
           <span
             style={{
@@ -143,8 +134,6 @@ function FileSection({ file, rows }: { file: DiffFile; rows: DisplayRow[] }) {
             {status}
           </span>
         )}
-
-        {/* File path */}
         <span
           style={{
             fontSize: 12,
@@ -159,36 +148,23 @@ function FileSection({ file, rows }: { file: DiffFile; rows: DisplayRow[] }) {
         >
           {label}
         </span>
-
-        {/* Stat pills — colored blocks like GitHub */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-          <span style={{ fontSize: 12, color: GH.addMarker, fontFamily: 'monospace' }}>
-            +{file.additions}
-          </span>
-          <span style={{ fontSize: 12, color: GH.remMarker, fontFamily: 'monospace' }}>
-            -{file.deletions}
-          </span>
+          <span style={{ fontSize: 12, color: GH.addMarker, fontFamily: 'monospace' }}>+{file.additions}</span>
+          <span style={{ fontSize: 12, color: GH.remMarker, fontFamily: 'monospace' }}>-{file.deletions}</span>
           <StatBlocks additions={file.additions} deletions={file.deletions} />
         </div>
       </header>
 
-      {/* Diff table */}
       <div style={{ overflowX: 'auto' }}>
         <div style={{ minWidth: 800, fontFamily: 'ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, monospace', fontSize: 12 }}>
           {rows.map((row, i) => {
             if (row.type === 'hunk') {
-              return (
-                <HunkHeader key={`${file.key}:hunk:${i}`} text={row.text} />
-              );
+              return <HunkHeader key={`${file.key}:hunk:${i}`} text={row.text} />;
             }
             if (row.type === 'meta') {
-              return (
-                <MetaLine key={`${file.key}:meta:${i}`} text={row.text} />
-              );
+              return <MetaLine key={`${file.key}:meta:${i}`} text={row.text} />;
             }
-            return (
-              <SplitRow key={`${file.key}:row:${i}`} left={row.left} right={row.right} />
-            );
+            return <SplitRow key={`${file.key}:row:${i}`} left={row.left} right={row.right} />;
           })}
         </div>
       </div>
@@ -196,7 +172,6 @@ function FileSection({ file, rows }: { file: DiffFile; rows: DisplayRow[] }) {
   );
 }
 
-/** The 5-block colored stat bar exactly like GitHub */
 function StatBlocks({ additions, deletions }: { additions: number; deletions: number }) {
   const total = additions + deletions;
   if (total === 0) return null;
@@ -217,9 +192,7 @@ function StatBlocks({ additions, deletions }: { additions: number; deletions: nu
   );
 }
 
-/** Full-width @@ hunk header — styled exactly like GitHub's blue tint */
 function HunkHeader({ text }: { text: string }) {
-  // Extract the function/context hint after the @@ ... @@ part
   const contextMatch = /^@@ [^@]+ @@(.*)$/.exec(text);
   const hunkRange = contextMatch ? text.slice(0, text.indexOf(contextMatch[1])).trim() : text;
   const contextHint = contextMatch?.[1]?.trim() ?? '';
@@ -228,29 +201,25 @@ function HunkHeader({ text }: { text: string }) {
     <div
       style={{
         background: GH.hunkBg,
-        borderTop: `1px solid #1c3659`,
-        borderBottom: `1px solid #1c3659`,
+        borderTop: '1px solid #1c3659',
+        borderBottom: '1px solid #1c3659',
         display: 'flex',
         alignItems: 'center',
         padding: '2px 0',
         lineHeight: '20px',
       }}
     >
-      {/* Expand icon placeholder */}
       <div style={{ width: 80, flexShrink: 0, display: 'flex', justifyContent: 'center' }}>
         <svg width="16" height="16" viewBox="0 0 16 16" fill={GH.hunkText} style={{ opacity: 0.5 }}>
           <path d="M8.75 1.75a.75.75 0 0 0-1.5 0v5.5h-5.5a.75.75 0 0 0 0 1.5h5.5v5.5a.75.75 0 0 0 1.5 0v-5.5h5.5a.75.75 0 0 0 0-1.5h-5.5Z" />
         </svg>
       </div>
       <span style={{ color: GH.hunkText, fontSize: 12 }}>{hunkRange}</span>
-      {contextHint && (
-        <span style={{ color: GH.textMuted, fontSize: 12, marginLeft: 8 }}>{contextHint}</span>
-      )}
+      {contextHint && <span style={{ color: GH.textMuted, fontSize: 12, marginLeft: 8 }}>{contextHint}</span>}
     </div>
   );
 }
 
-/** Non-@@ meta lines (index, new file mode, etc.) — subtle full-width bar */
 function MetaLine({ text }: { text: string }) {
   return (
     <div
@@ -268,7 +237,6 @@ function MetaLine({ text }: { text: string }) {
   );
 }
 
-/** A split diff row — left (old) | divider | right (new) */
 function SplitRow({ left, right }: { left: ParsedLine | null; right: ParsedLine | null }) {
   return (
     <div
@@ -279,14 +247,12 @@ function SplitRow({ left, right }: { left: ParsedLine | null; right: ParsedLine 
       }}
     >
       <DiffCell line={left} side="left" />
-      {/* Center divider */}
       <div style={{ background: GH.border }} />
       <DiffCell line={right} side="right" />
     </div>
   );
 }
 
-/** One side of a split diff row */
 function DiffCell({ line, side }: { line: ParsedLine | null; side: 'left' | 'right' }) {
   const isAdd = line?.kind === 'add' && side === 'right';
   const isRem = line?.kind === 'remove' && side === 'left';
@@ -323,7 +289,6 @@ function DiffCell({ line, side }: { line: ParsedLine | null; side: 'left' | 'rig
 
   return (
     <div style={{ display: 'flex', background: contentBg, minWidth: 0 }}>
-      {/* Gutter: line number */}
       <div
         style={{
           background: gutterBg,
@@ -339,7 +304,6 @@ function DiffCell({ line, side }: { line: ParsedLine | null; side: 'left' | 'rig
       >
         {lineNum ?? ''}
       </div>
-      {/* Marker (+/-) */}
       <div
         style={{
           background: gutterBg,
@@ -356,7 +320,6 @@ function DiffCell({ line, side }: { line: ParsedLine | null; side: 'left' | 'rig
       >
         {marker}
       </div>
-      {/* Content */}
       <div
         style={{
           flex: 1,
@@ -373,8 +336,6 @@ function DiffCell({ line, side }: { line: ParsedLine | null; side: 'left' | 'rig
   );
 }
 
-// ─── Parser (unchanged logic) ──────────────────────────────────────────────
-
 function buildDisplayRows(lines: ParsedLine[]): DisplayRow[] {
   const rows: DisplayRow[] = [];
   let index = 0;
@@ -383,7 +344,6 @@ function buildDisplayRows(lines: ParsedLine[]): DisplayRow[] {
     const line = lines[index];
 
     if (line.kind === 'meta') {
-      // @@ hunk headers get a special row type
       if (line.text.startsWith('@@')) {
         rows.push({ type: 'hunk', text: line.text });
       } else {
@@ -417,7 +377,7 @@ function buildDisplayRows(lines: ParsedLine[]): DisplayRow[] {
   return rows;
 }
 
-function parseDiff(diff: string): DiffFile[] {
+export function parseDiff(diff: string): DiffFile[] {
   const files: DiffFile[] = [];
   let current: DiffFile | null = null;
   let oldLine = 0;
@@ -508,14 +468,14 @@ function normalizePathToken(token: string) {
   return trimmed === '/dev/null' ? trimmed : trimmed.replace(/^[ab]\//, '');
 }
 
-function formatFileLabel(oldPath: string, newPath: string) {
+export function formatFileLabel(oldPath: string, newPath: string) {
   if (oldPath === '/dev/null') return newPath;
   if (newPath === '/dev/null') return oldPath;
   if (oldPath === newPath) return newPath;
   return `${oldPath} → ${newPath}`;
 }
 
-function getFileStatus(file: DiffFile) {
+export function getFileStatus(file: DiffFile) {
   if (file.oldPath === '/dev/null') return 'new';
   if (file.newPath === '/dev/null') return 'deleted';
   return 'modified';
