@@ -40,10 +40,13 @@ export interface OrchestratorTicketSpec {
 }
 
 export interface OrchestratorAction {
-  kind: 'summary' | 'create_tickets' | 'start_ticket' | 'run_all_ready' | 'delete_tickets' | 'close_tickets' | 'reopen_tickets';
+  kind: 'summary' | 'create_tickets' | 'start_ticket' | 'run_all_ready' | 'delete_tickets' | 'close_tickets' | 'reopen_tickets' | 'analyze_and_plan';
   ticket_id?: string | null;
   ticket_ids?: string[] | null;
   tickets?: OrchestratorTicketSpec[] | null;
+  repo_path?: string | null;
+  repo_paths?: string[] | null;
+  objective?: string | null;
 }
 
 export interface OrchestratorPlan {

@@ -1,6 +1,7 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tauri::Emitter;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
@@ -12,6 +13,7 @@ pub enum OrchestratorActionKind {
     CloseTickets,
     ReopenTickets,
     DeleteTickets,
+    AnalyzeAndPlan,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -34,6 +36,17 @@ pub struct OrchestratorAction {
     pub ticket_id: Option<String>,
     pub ticket_ids: Option<Vec<String>>,
     pub tickets: Option<Vec<OrchestratorTicketSpec>>,
+    pub repo_path: Option<String>,
+    pub objective: Option<String>,
+    pub repo_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AnalysisWorkItem {
+    pub title: String,
+    pub description: String,
+    pub files: Option<Vec<String>>,
+    pub depends_on: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -122,9 +135,12 @@ Schema:
   "assistant_message": "short explanation for the user",
   "actions": [
     {{
-      "kind": "summary" | "create_tickets" | "start_ticket" | "run_all_ready" | "close_tickets" | "reopen_tickets" | "delete_tickets",
+      "kind": "summary" | "create_tickets" | "start_ticket" | "run_all_ready" | "close_tickets" | "reopen_tickets" | "delete_tickets" | "analyze_and_plan",
       "ticket_id": "required only for start_ticket",
       "ticket_ids": ["required only for close_tickets, reopen_tickets or delete_tickets"],
+      "objective": "required only for analyze_and_plan — the goal to analyze and decompose",
+      "repo_path": "primary repo path for analyze_and_plan",
+      "repo_paths": ["optional array of repo paths for analyze_and_plan when multiple repos are involved"],
       "tickets": [
         {{
           "title": "required for create_tickets",
@@ -162,6 +178,7 @@ Rules:
   - `reopen_tickets` means move matching done/archived tickets back into an active state. Use this for requests like reopen, resume, continue the old one.
   - `delete_tickets` means permanently remove tickets. Only use it when the user clearly wants deletion, not closure.
   - `summary` means explain the state without mutating anything.
+  - `analyze_and_plan` means spawn a CLI agent to explore the codebase and return work items. Use this when the user asks to "analyze", "explore", "plan", "break down", or "figure out what needs to be done" for a feature or change that requires understanding the codebase first. Requires `objective` (what to analyze/implement) and `repo_path` (which repo to explore). Use `repo_paths` when multiple repos are involved (e.g. "analyze my app and update my landing page"). The analysis agent will read files, understand the architecture, and return parallelizable work items.
 - Never use `start_ticket` when the user asks to close, finish, mark done, cancel, skip, abandon, or otherwise stop tracking a ticket.
 - A close request can apply to tickets in any state. Prefer `close_tickets` over `start_ticket` for those requests.
 - Never copy ticket-management language into `execution_context`. Forbidden examples: "create a ticket", "open a task", "track this", "ask the orchestrator", "create this ticket anyway".
@@ -582,4 +599,247 @@ fn clean_json_response(raw: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+/// Extract JSON from CLI agent output. The agent may include preamble text
+/// before the actual JSON array/object. Find the first `[` or `{` and the
+/// matching closing bracket.
+fn extract_json_from_output(raw: &str) -> String {
+    let cleaned = clean_json_response(raw);
+
+    // Try to find a JSON array first (most common for work items)
+    if let Some(start) = cleaned.find('[') {
+        if let Some(end) = cleaned.rfind(']') {
+            if end > start {
+                return cleaned[start..=end].to_string();
+            }
+        }
+    }
+
+    // Fall back to JSON object
+    if let Some(start) = cleaned.find('{') {
+        if let Some(end) = cleaned.rfind('}') {
+            if end > start {
+                return cleaned[start..=end].to_string();
+            }
+        }
+    }
+
+    cleaned
+}
+
+// ─── CLI Agent Analysis ────────────────────────────────────────────────────────
+
+fn build_analysis_prompt(objective: &str, repo_paths: &[String]) -> String {
+    let repo_list = repo_paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("  {}. {}", i + 1, p))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"You are a technical project manager performing codebase analysis.
+
+OBJECTIVE: {objective}
+
+REPOSITORIES TO ANALYZE:
+{repo_list}
+
+INSTRUCTIONS:
+1. Explore the repository structure, key files, and architecture
+2. Understand what exists and what the objective requires
+3. Break the objective into 3-6 independent, parallelizable work items
+4. For each work item, identify which files/directories it will touch
+5. Ensure work items do NOT overlap on the same files — this is critical for parallel execution
+6. Write detailed execution context for each work item so a coding agent can start immediately
+
+You are running in a non-interactive pipeline. Do not ask follow-up questions.
+Do not offer to do more work. Return ONLY the final JSON and nothing else.
+
+Return a JSON array of work items in this exact format:
+[
+  {{
+    "title": "Short descriptive title",
+    "description": "Detailed instructions for the coding agent. Include specific files to modify, what to change, and acceptance criteria.",
+    "files": ["list", "of", "files/dirs", "this", "touches"],
+    "depends_on": ["optional title of another work item this depends on"]
+  }}
+]
+
+Return ONLY the JSON array. No markdown fences, no commentary, no follow-up questions."#,
+        objective = objective.trim(),
+        repo_list = repo_list,
+    )
+}
+
+fn resolve_cli_agent() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        // On Windows, use cmd /C to run claude
+        vec!["cmd".to_string(), "/C".to_string(), "claude".to_string()]
+    } else {
+        vec!["claude".to_string()]
+    }
+}
+
+#[tauri::command]
+pub async fn analyze_and_plan(
+    app: tauri::AppHandle,
+    objective: String,
+    repo_paths: Vec<String>,
+    max_turns: Option<u32>,
+) -> Result<Vec<OrchestratorTicketSpec>, String> {
+    if objective.trim().is_empty() {
+        return Err("Objective is required".to_string());
+    }
+    if repo_paths.is_empty() {
+        return Err("At least one repository path is required".to_string());
+    }
+
+    // Verify repo paths exist
+    for path in &repo_paths {
+        if !std::path::Path::new(path).exists() {
+            return Err(format!("Repository path does not exist: {path}"));
+        }
+    }
+
+    let prompt = build_analysis_prompt(&objective, &repo_paths);
+    let turns = max_turns.unwrap_or(25);
+
+    // Use the first repo as the working directory
+    let cwd = &repo_paths[0];
+
+    let _ = app.emit("analysis:status", json!({
+        "status": "running",
+        "message": "Analyzing codebase..."
+    }));
+
+    // Build the command: claude -p "prompt" --allowedTools "..." --output-format json --max-turns N
+    let parts = resolve_cli_agent();
+    let mut command = if parts[0] == "cmd" {
+        let mut cmd = tokio::process::Command::new(&parts[0]);
+        // Build the full claude command as a single string for cmd /C
+        let claude_cmd = format!(
+            "claude -p {} --allowedTools \"Read,Glob,Grep,Bash(grep:*),Bash(find:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*)\" --output-format json --max-turns {}",
+            shell_escape(&prompt),
+            turns,
+        );
+        cmd.arg("/C").arg(&claude_cmd);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new(&parts[0]);
+        cmd.arg("-p")
+            .arg(&prompt)
+            .arg("--allowedTools")
+            .arg("Read,Glob,Grep,Bash(grep:*),Bash(find:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*)")
+            .arg("--output-format")
+            .arg("json")
+            .arg("--max-turns")
+            .arg(turns.to_string());
+        cmd
+    };
+
+    command
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let _ = app.emit("analysis:status", json!({
+        "status": "running",
+        "message": "CLI agent is exploring the codebase..."
+    }));
+
+    let child = command
+        .spawn()
+        .map_err(|err| format!("Failed to spawn CLI agent: {err}. Is 'claude' installed and in PATH?"))?;
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|err| format!("CLI agent process failed: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = app.emit("analysis:status", json!({
+            "status": "error",
+            "message": format!("CLI agent failed: {stderr}")
+        }));
+        return Err(format!("CLI agent exited with status {}: {stderr}", output.status));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let _ = app.emit("analysis:status", json!({
+        "status": "parsing",
+        "message": "Parsing analysis results..."
+    }));
+
+    // Parse the JSON output — claude --output-format json wraps result in a JSON object
+    let work_items = parse_analysis_output(&stdout, &repo_paths)?;
+
+    let _ = app.emit("analysis:status", json!({
+        "status": "done",
+        "message": format!("Analysis complete: {} work items", work_items.len())
+    }));
+
+    Ok(work_items)
+}
+
+fn parse_analysis_output(raw: &str, repo_paths: &[String]) -> Result<Vec<OrchestratorTicketSpec>, String> {
+    let cleaned = clean_json_response(raw);
+
+    // claude --output-format json wraps the result like: {"type":"result","result":"..."}
+    // Try to extract the inner result first
+    let inner = if let Ok(wrapper) = serde_json::from_str::<Value>(&cleaned) {
+        if let Some(result_str) = wrapper.get("result").and_then(Value::as_str) {
+            result_str.to_string()
+        } else {
+            cleaned.clone()
+        }
+    } else {
+        cleaned.clone()
+    };
+
+    let json_str = extract_json_from_output(&inner);
+
+    // Try parsing as AnalysisWorkItem array
+    let items: Vec<AnalysisWorkItem> = serde_json::from_str(&json_str)
+        .map_err(|err| format!("Failed to parse analysis output as work items: {err}. Raw: {json_str}"))?;
+
+    if items.is_empty() {
+        return Err("CLI agent returned no work items".to_string());
+    }
+
+    // Convert AnalysisWorkItem -> OrchestratorTicketSpec
+    let primary_repo = repo_paths.first().map(|s| s.as_str());
+    let specs = items
+        .into_iter()
+        .map(|item| {
+            let files_note = item.files
+                .as_ref()
+                .map(|files| format!("\n\nFiles: {}", files.join(", ")))
+                .unwrap_or_default();
+
+            OrchestratorTicketSpec {
+                title: item.title,
+                context: item.description.chars().take(200).collect(),
+                execution_context: Some(format!("{}{}", item.description, files_note)),
+                orchestrator_note: Some("Generated by CLI agent analysis".to_string()),
+                repo_path: primary_repo.map(|s| s.to_string()),
+                assigned_agent: None,
+                depends_on_titles: item.depends_on,
+                duplicate_of_ticket_id: None,
+                duplicate_policy: None,
+                intent_type: Some("create_ticket".to_string()),
+            }
+        })
+        .collect();
+
+    Ok(specs)
+}
+
+fn shell_escape(s: &str) -> String {
+    // For Windows cmd /C, wrap in double quotes and escape inner double quotes
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }

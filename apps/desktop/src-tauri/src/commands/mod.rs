@@ -7,3 +7,4 @@ pub mod repos;
 pub mod workspaces;
 pub mod license;
 pub mod notes;
+pub mod conversations;

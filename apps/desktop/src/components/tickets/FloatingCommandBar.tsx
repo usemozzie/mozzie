@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { Plus, ArrowUp, Loader2, ChevronDown, CircleDot, FolderGit2, Bot, Play, BarChart3, Zap, XCircle, RotateCcw } from 'lucide-react';
-import type { Repo, Ticket } from '@mozzie/db';
+import { Plus, ArrowUp, Loader2, ChevronDown, CircleDot, FolderGit2, Bot, Play, BarChart3, Zap, XCircle, RotateCcw, MessageSquare, Trash2 } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import type { Repo, Ticket, ConversationMessage } from '@mozzie/db';
 import { useTickets } from '../../hooks/useTickets';
 import { useRepos } from '../../hooks/useRepos';
 import {
@@ -16,6 +17,13 @@ import { useLicense } from '../../hooks/useLicense';
 import { useAgentConfigs } from '../../hooks/useAgents';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import {
+  useConversations,
+  useConversationMessages,
+  useCreateConversation,
+  useDeleteConversation,
+  useAppendMessage,
+} from '../../hooks/useConversations';
+import {
   getOrchestratorConfig,
   getDefaultModel,
   getKeyStore,
@@ -25,6 +33,7 @@ import {
   useOrchestratorKeyStore,
   type OrchestratorAction,
   type OrchestratorProvider,
+  type OrchestratorTicketSpec,
 } from '../../hooks/useOrchestrator';
 import { getRecentRepos } from '../../lib/recentRepos';
 import { Button } from '../ui/button';
@@ -77,8 +86,27 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   const { startAgent } = useStartAgent();
   const planActions = usePlanOrchestratorActions();
 
+  // Conversation persistence
+  const { data: conversations = [] } = useConversations();
+  const createConversation = useCreateConversation();
+  const deleteConversation = useDeleteConversation();
+  const appendMessageMutation = useAppendMessage();
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [showConversationList, setShowConversationList] = useState(false);
+  const { data: persistedMessages = [] } = useConversationMessages(activeConversationId);
+
+  // Map persisted messages to the ChatEntry shape used by rendering
+  const history: ChatEntry[] = useMemo(
+    () =>
+      persistedMessages.map((m) => ({
+        id: m.id,
+        role: m.role as 'user' | 'orchestrator',
+        text: m.text,
+      })),
+    [persistedMessages],
+  );
+
   const [message, setMessage] = useState('');
-  const [history, setHistory] = useState<ChatEntry[]>([]);
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   const [pendingRepoSelection, setPendingRepoSelection] = useState<PendingRepoSelection | null>(null);
   const [isActing, setIsActing] = useState(false);
@@ -98,12 +126,12 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
     inputRef.current?.focus();
   }, []);
 
-  // Scroll to bottom on new messages
+  // Scroll to bottom on new messages or when conversation changes
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [history]);
+  }, [persistedMessages]);
 
   // Close on Escape (only when popover is not open)
   useEffect(() => {
@@ -125,8 +153,21 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
     }
   }, [popoverIndex]);
 
-  function appendEntry(role: ChatEntry['role'], text: string) {
-    setHistory((prev) => [...prev, { id: crypto.randomUUID(), role, text }]);
+  /** Ensure a conversation exists (create on first message), then append. */
+  async function appendEntry(role: ChatEntry['role'], text: string, metadata?: string | null) {
+    let convId = activeConversationId;
+    if (!convId) {
+      const title = role === 'user' ? text.slice(0, 60) : null;
+      const conv = await createConversation.mutateAsync(title ?? undefined);
+      convId = conv.id;
+      setActiveConversationId(convId);
+    }
+    await appendMessageMutation.mutateAsync({
+      conversationId: convId,
+      role,
+      text,
+      metadata: metadata ?? null,
+    });
   }
 
   // -- Mention items --
@@ -194,13 +235,17 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
       switch (item.action) {
         case 'run':
           setMessage('');
-          appendEntry('user', '/run');
-          void handleCommandAction('Run all ready tickets');
+          void (async () => {
+            await appendEntry('user', '/run');
+            await handleCommandAction('Run all ready tickets');
+          })();
           break;
         case 'status':
           setMessage('');
-          appendEntry('user', '/status');
-          void handleCommandAction('Show me a summary of all tickets');
+          void (async () => {
+            await appendEntry('user', '/status');
+            await handleCommandAction('Show me a summary of all tickets');
+          })();
           break;
         case 'create':
           setMessage('Create ticket: ');
@@ -229,7 +274,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
   async function handleCommandAction(prompt: string) {
     const config = getOrchestratorConfig();
     if (!config.apiKey.trim()) {
-      appendEntry('orchestrator', 'Set the orchestrator API key in Settings before using chat orchestration.');
+      await appendEntry('orchestrator', 'Set the orchestrator API key in Settings before using chat orchestration.');
       return;
     }
     setIsActing(true);
@@ -245,7 +290,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
         history: history.slice(-8).map((entry) => ({ role: entry.role, text: entry.text })),
       });
       if (plan.assistant_message?.trim()) {
-        appendEntry('orchestrator', plan.assistant_message.trim());
+        await appendEntry('orchestrator', plan.assistant_message.trim(), JSON.stringify(plan));
       }
       for (const action of plan.actions ?? []) {
         const result = await executeAction({
@@ -260,13 +305,13 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
           recentRepos: getRecentRepos(),
           setPendingRepoSelection,
         });
-        if (result) appendEntry('orchestrator', result);
+        if (result) await appendEntry('orchestrator', result);
       }
       if ((!plan.actions || plan.actions.length === 0) && !plan.assistant_message?.trim()) {
-        appendEntry('orchestrator', 'No action taken.');
+        await appendEntry('orchestrator', 'No action taken.');
       }
     } catch (error) {
-      appendEntry('orchestrator', `Orchestrator error: ${String(error)}`);
+      await appendEntry('orchestrator', `Orchestrator error: ${String(error)}`);
     } finally {
       setIsActing(false);
     }
@@ -339,7 +384,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
     const raw = message.trim();
     if (!raw || isActing) return;
 
-    appendEntry('user', raw);
+    await appendEntry('user', raw);
     setMessage('');
     setPopoverType(null);
 
@@ -347,9 +392,9 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
       setIsActing(true);
       try {
         await executeDelete(pendingDelete.ticketIds, deleteTicket.mutateAsync);
-        appendEntry('orchestrator', `Deleted ${pendingDelete.label}.`);
+        await appendEntry('orchestrator', `Deleted ${pendingDelete.label}.`);
       } catch (error) {
-        appendEntry('orchestrator', `Delete failed: ${String(error)}`);
+        await appendEntry('orchestrator', `Delete failed: ${String(error)}`);
       } finally {
         setPendingDelete(null);
         setIsActing(false);
@@ -359,18 +404,18 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
 
     if (pendingDelete && isCancel(raw)) {
       setPendingDelete(null);
-      appendEntry('orchestrator', 'Delete cancelled.');
+      await appendEntry('orchestrator', 'Delete cancelled.');
       return;
     }
 
     if (pendingRepoSelection) {
-      appendEntry('orchestrator', 'Finish choosing repositories for the pending tickets or cancel that step first.');
+      await appendEntry('orchestrator', 'Finish choosing repositories for the pending tickets or cancel that step first.');
       return;
     }
 
     const config = getOrchestratorConfig();
     if (!config.apiKey.trim()) {
-      appendEntry('orchestrator', 'Set the orchestrator API key in Settings before using chat orchestration.');
+      await appendEntry('orchestrator', 'Set the orchestrator API key in Settings before using chat orchestration.');
       return;
     }
 
@@ -391,7 +436,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
       });
 
       if (plan.assistant_message?.trim()) {
-        appendEntry('orchestrator', plan.assistant_message.trim());
+        await appendEntry('orchestrator', plan.assistant_message.trim(), JSON.stringify(plan));
       }
 
       for (const action of plan.actions ?? []) {
@@ -413,15 +458,15 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
         });
 
         if (result) {
-          appendEntry('orchestrator', result);
+          await appendEntry('orchestrator', result);
         }
       }
 
       if ((!plan.actions || plan.actions.length === 0) && !plan.assistant_message?.trim()) {
-        appendEntry('orchestrator', 'No action taken.');
+        await appendEntry('orchestrator', 'No action taken.');
       }
     } catch (error) {
-      appendEntry('orchestrator', `Orchestrator error: ${String(error)}`);
+      await appendEntry('orchestrator', `Orchestrator error: ${String(error)}`);
     } finally {
       setIsActing(false);
     }
@@ -463,6 +508,81 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
 
       {/* Floating bar */}
       <div className="fixed z-50 top-11 left-1/2 w-[640px] max-w-[90vw] command-bar-enter">
+        {/* Conversation header */}
+        <div className="flex items-center gap-2 mb-2">
+          <button
+            onClick={() => setShowConversationList((v) => !v)}
+            className="flex items-center gap-1.5 text-[12px] text-text-dim/70 hover:text-text-dim transition-colors"
+          >
+            <MessageSquare className="w-3.5 h-3.5" />
+            <span>
+              {activeConversationId
+                ? conversations.find((c) => c.id === activeConversationId)?.title || 'Conversation'
+                : 'New conversation'}
+            </span>
+            <ChevronDown className="w-3 h-3" />
+          </button>
+          <div className="flex-1" />
+          {activeConversationId && (
+            <button
+              onClick={() => {
+                setActiveConversationId(null);
+                setPendingDelete(null);
+                setPendingRepoSelection(null);
+              }}
+              className="text-[11px] text-text-dim/50 hover:text-text-dim transition-colors"
+            >
+              New
+            </button>
+          )}
+        </div>
+
+        {/* Conversation list dropdown */}
+        {showConversationList && (
+          <>
+            <div className="fixed inset-0 z-[1]" onClick={() => setShowConversationList(false)} />
+            <div className="relative z-[2] mb-2 max-h-48 overflow-y-auto rounded-xl border border-border bg-surface shadow-xl shadow-black/30 py-1">
+              {conversations.length === 0 && (
+                <div className="px-3 py-2 text-[12px] text-text-dim/50">No conversations yet</div>
+              )}
+              {conversations.map((conv) => (
+                <div
+                  key={conv.id}
+                  className={`flex items-center gap-2 px-3 py-2 text-[12px] cursor-pointer transition-colors
+                    ${conv.id === activeConversationId
+                      ? 'bg-white/[0.08] text-text'
+                      : 'text-text-dim hover:bg-white/[0.04] hover:text-text'
+                    }`}
+                >
+                  <button
+                    className="flex-1 text-left truncate"
+                    onClick={() => {
+                      setActiveConversationId(conv.id);
+                      setShowConversationList(false);
+                      setPendingDelete(null);
+                      setPendingRepoSelection(null);
+                    }}
+                  >
+                    {conv.title || 'Untitled'}
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (activeConversationId === conv.id) {
+                        setActiveConversationId(null);
+                      }
+                      void deleteConversation.mutateAsync(conv.id);
+                    }}
+                    className="shrink-0 text-text-dim/30 hover:text-state-error transition-colors"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
         {/* Chat history */}
         {history.length > 0 && (
           <div ref={scrollRef} className="max-h-72 overflow-y-auto mb-2 space-y-2">
@@ -502,9 +622,9 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
                   : current
               )
             }
-            onCancel={() => {
+            onCancel={async () => {
               setPendingRepoSelection(null);
-              appendEntry('orchestrator', 'Ticket creation cancelled.');
+              await appendEntry('orchestrator', 'Ticket creation cancelled.');
             }}
             onConfirm={async () => {
               if (!pendingRepoSelection) return;
@@ -516,7 +636,7 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
               );
               const stillMissing = missingRepoTitles(resolvedSpecs);
               if (stillMissing.length > 0) {
-                appendEntry('orchestrator', `Choose a repository for: ${stillMissing.join(', ')}.`);
+                await appendEntry('orchestrator', `Choose a repository for: ${stillMissing.join(', ')}.`);
                 return;
               }
 
@@ -530,10 +650,10 @@ export function FloatingCommandBar({ onClose }: FloatingCommandBarProps) {
                   transitionTicket: transitionTicket.mutateAsync,
                   isPro,
                 });
-                appendEntry('orchestrator', result);
+                await appendEntry('orchestrator', result);
                 setPendingRepoSelection(null);
               } catch (error) {
-                appendEntry('orchestrator', `Ticket creation failed: ${String(error)}`);
+                await appendEntry('orchestrator', `Ticket creation failed: ${String(error)}`);
               } finally {
                 setIsActing(false);
               }
@@ -829,6 +949,65 @@ async function executeAction({
         transitionTicket,
         isPro,
       });
+    }
+
+    case 'analyze_and_plan': {
+      const objective = action.objective?.trim();
+      if (!objective) {
+        return 'The LLM requested analysis, but no objective was provided.';
+      }
+
+      // Build the list of repo paths to analyze
+      let repoPaths: string[] = [];
+      if (action.repo_paths?.length) {
+        repoPaths = action.repo_paths;
+      } else if (action.repo_path) {
+        repoPaths = [action.repo_path];
+      } else {
+        // Try to infer from available repos
+        if (repos.length === 1) {
+          repoPaths = [repos[0].path];
+        } else if (repos.length === 0) {
+          return 'No repositories available. Add a repo before running analysis.';
+        } else {
+          return `Multiple repos available. Please specify which repo to analyze: ${repos.map((r) => r.name || r.path).join(', ')}.`;
+        }
+      }
+
+      try {
+        const specs = await invoke<OrchestratorTicketSpec[]>('analyze_and_plan', {
+          objective,
+          repoPaths,
+          maxTurns: 25,
+        });
+
+        if (specs.length === 0) {
+          return 'Analysis complete but no work items were generated.';
+        }
+
+        // Feed the specs into the existing create_tickets flow
+        const repoChoices = buildRepoChoices(repos, recentRepos);
+        const pendingSelection = preparePendingRepoSelection(specs, repoChoices);
+
+        if (pendingSelection) {
+          setPendingRepoSelection(pendingSelection);
+          return `Analysis found ${specs.length} work items. Choose a repository for: ${pendingSelection.unresolvedTitles.join(', ')}.`;
+        }
+
+        const resolvedSpecs = applyRepoSelections(specs, repoChoices, {});
+        const result = await executeCreateTickets({
+          specs: resolvedSpecs,
+          existingTickets: tickets,
+          createTicket,
+          reopenTicket,
+          transitionTicket,
+          isPro,
+        });
+
+        return `Analysis complete. ${result}`;
+      } catch (error) {
+        return `Analysis failed: ${String(error)}`;
+      }
     }
   }
 }

@@ -118,6 +118,24 @@ export interface TicketAttempt {
   created_at: string;
 }
 
+export interface Conversation {
+  id: string;
+  workspace_id: string;
+  title: string | null;
+  pinned: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationMessage {
+  id: string;
+  conversation_id: string;
+  role: 'user' | 'orchestrator';
+  text: string;
+  metadata: string | null;
+  created_at: string;
+}
+
 export interface AgentConfig {
   id: string;
   display_name: string;

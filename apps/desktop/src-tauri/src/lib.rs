@@ -55,6 +55,12 @@ pub fn run() {
             sql: include_str!("../migrations/008_attempt_history.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 9,
+            description: "create_conversations",
+            sql: include_str!("../migrations/009_conversations.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -240,6 +246,11 @@ pub fn run() {
                     .execute(&pool)
                     .await?;
 
+                // Create conversations + conversation_messages tables (no-op if already exists).
+                sqlx::raw_sql(include_str!("../migrations/009_conversations.sql"))
+                    .execute(&pool)
+                    .await?;
+
                 // On every startup, reset tickets that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
                 // restarts, so queued/running tickets would be stuck indefinitely.
@@ -297,6 +308,7 @@ pub fn run() {
             commands::worktree::list_repo_branches,
             // Orchestrator LLM
             commands::orchestrator::plan_orchestrator_actions,
+            commands::orchestrator::analyze_and_plan,
             // Agents (Task D / ACP)
             commands::agents::list_agent_configs,
             commands::agents::save_agent_config,
@@ -330,6 +342,13 @@ pub fn run() {
             // Notes
             commands::notes::get_workspace_notes,
             commands::notes::save_workspace_notes,
+            // Conversations
+            commands::conversations::list_conversations,
+            commands::conversations::get_conversation,
+            commands::conversations::create_conversation,
+            commands::conversations::delete_conversation,
+            commands::conversations::list_conversation_messages,
+            commands::conversations::append_conversation_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
