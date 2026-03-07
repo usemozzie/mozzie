@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Plus, Trash2, FolderOpen, GitBranch } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useRepos, useAddRepo, useRemoveRepo } from '../../hooks/useRepos';
+import { useRepos, useAddRepo, useRemoveRepo, usePrepareRepo } from '../../hooks/useRepos';
 import { Button } from '../ui/button';
 import type { Repo } from '@mozzie/db';
 
@@ -9,6 +9,7 @@ export function RepoPanel() {
   const { data: repos, isLoading } = useRepos();
   const addRepo = useAddRepo();
   const removeRepo = useRemoveRepo();
+  const prepareRepo = usePrepareRepo();
   const [error, setError] = useState<string | null>(null);
 
   async function handleAddRepo() {
@@ -56,14 +57,36 @@ export function RepoPanel() {
             <p className="text-[11px] text-text-dim">Add a repo so agents can work on it</p>
           </div>
         ) : (
-          repos.map((repo) => <RepoCard key={repo.id} repo={repo} onRemove={() => removeRepo.mutate(repo.id)} />)
+          repos.map((repo) => (
+            <RepoCard
+              key={repo.id}
+              repo={repo}
+              onPrepare={async () => {
+                try {
+                  setError(null);
+                  await prepareRepo.mutateAsync(repo.id);
+                } catch (e: any) {
+                  setError(e?.toString() ?? 'Failed to prepare repository');
+                }
+              }}
+              onRemove={() => removeRepo.mutate(repo.id)}
+            />
+          ))
         )}
       </div>
     </div>
   );
 }
 
-function RepoCard({ repo, onRemove }: { repo: Repo; onRemove: () => void }) {
+function RepoCard({
+  repo,
+  onPrepare,
+  onRemove,
+}: {
+  repo: Repo;
+  onPrepare: () => void;
+  onRemove: () => void;
+}) {
   const pathParts = repo.path.replace(/\\/g, '/').split('/');
   const shortPath = pathParts.length > 3
     ? '.../' + pathParts.slice(-3).join('/')
@@ -83,6 +106,15 @@ function RepoCard({ repo, onRemove }: { repo: Repo; onRemove: () => void }) {
           </div>
         )}
       </div>
+      {repo.needs_prepare && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onPrepare(); }}
+          className="opacity-0 group-hover:opacity-100 px-2 h-6 flex items-center justify-center rounded-md text-[10px] text-text-dim hover:text-text hover:bg-white/[0.06] transition-all"
+          title="Prepare repository by creating an initial commit if needed"
+        >
+          Prepare
+        </button>
+      )}
       <button
         onClick={(e) => { e.stopPropagation(); onRemove(); }}
         className="opacity-0 group-hover:opacity-100 w-6 h-6 flex items-center justify-center rounded-md text-text-dim hover:text-state-danger hover:bg-state-danger/10 transition-all"

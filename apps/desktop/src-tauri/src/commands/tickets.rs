@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, State};
 use ulid::Ulid;
 
+use crate::commands::agents::{shutdown_ticket_session, ActiveSessions};
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Ticket {
     pub id: String,
@@ -96,6 +98,11 @@ fn is_valid_transition(from: &str, to: &str) -> bool {
             | ("review", "ready")
             | ("done", "archived")
     )
+}
+
+fn should_shutdown_session_for_transition(from: &str, to: &str) -> bool {
+    matches!((from, to), ("running", "ready") | ("review", "ready"))
+        || matches!(to, "done" | "archived")
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -516,6 +523,7 @@ pub async fn get_ticket(db: State<'_, SqlitePool>, id: String) -> Result<Ticket,
 pub async fn transition_ticket(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
     id: String,
     to_status: String,
 ) -> Result<Ticket, String> {
@@ -611,6 +619,10 @@ pub async fn transition_ticket(
 
     let now = now_iso();
 
+    if should_shutdown_session_for_transition(&from_status, &to_status) {
+        let _ = shutdown_ticket_session(active_sessions.inner(), &id).await;
+    }
+
     match (from_status.as_str(), to_status.as_str()) {
         ("queued", "running") | ("ready", "running") | ("review", "running") => {
             sqlx::query(
@@ -693,6 +705,7 @@ pub async fn transition_ticket(
 pub async fn archive_ticket(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
     id: String,
 ) -> Result<Ticket, String> {
     let ticket = fetch_ticket(db.inner(), &id).await?;
@@ -702,13 +715,14 @@ pub async fn archive_ticket(
             ticket.status
         ));
     }
-    transition_ticket(app, db, id, "archived".to_string()).await
+    transition_ticket(app, db, active_sessions, id, "archived".to_string()).await
 }
 
 #[tauri::command]
 pub async fn close_ticket(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
     id: String,
 ) -> Result<Ticket, String> {
     let ticket = fetch_ticket(db.inner(), &id).await?;
@@ -716,6 +730,8 @@ pub async fn close_ticket(
     if ticket.status == "archived" {
         return Ok(ticket);
     }
+
+    let _ = shutdown_ticket_session(active_sessions.inner(), &id).await;
 
     let now = now_iso();
     sqlx::query(
@@ -747,6 +763,7 @@ pub async fn close_ticket(
 pub async fn delete_ticket(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
     id: String,
 ) -> Result<(), String> {
     let ticket = fetch_ticket(db.inner(), &id).await?;
@@ -759,7 +776,15 @@ pub async fn delete_ticket(
         return Err("Cannot delete a ticket with an attached worktree. Reject it first.".to_string());
     }
 
+    let _ = shutdown_ticket_session(active_sessions.inner(), &id).await;
+
     sqlx::query("DELETE FROM agent_logs WHERE ticket_id = ?")
+        .bind(&id)
+        .execute(db.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM ticket_attempts WHERE ticket_id = ?")
         .bind(&id)
         .execute(db.inner())
         .await
@@ -823,6 +848,121 @@ pub async fn search_repo_files(
     matches.truncate(12);
 
     Ok(matches)
+}
+
+// ─── Attempt History ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TicketAttempt {
+    pub id: String,
+    pub ticket_id: String,
+    pub attempt_number: i64,
+    pub agent_id: String,
+    pub agent_log_id: Option<String>,
+    pub outcome: String,
+    pub rejection_reason: Option<String>,
+    pub files_changed: Option<String>,
+    pub diff_summary: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub created_at: String,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for TicketAttempt {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        Ok(TicketAttempt {
+            id: row.try_get("id")?,
+            ticket_id: row.try_get("ticket_id")?,
+            attempt_number: row.try_get("attempt_number")?,
+            agent_id: row.try_get("agent_id")?,
+            agent_log_id: row.try_get("agent_log_id")?,
+            outcome: row.try_get("outcome")?,
+            rejection_reason: row.try_get("rejection_reason")?,
+            files_changed: row.try_get("files_changed")?,
+            diff_summary: row.try_get("diff_summary")?,
+            duration_ms: row.try_get("duration_ms")?,
+            exit_code: row.try_get("exit_code")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+#[tauri::command]
+pub async fn get_ticket_attempts(
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+) -> Result<Vec<TicketAttempt>, String> {
+    sqlx::query_as::<_, TicketAttempt>(
+        "SELECT id, ticket_id, attempt_number, agent_id, agent_log_id, outcome, \
+         rejection_reason, files_changed, diff_summary, duration_ms, exit_code, created_at \
+         FROM ticket_attempts WHERE ticket_id = ? ORDER BY attempt_number ASC",
+    )
+    .bind(&ticket_id)
+    .fetch_all(db.inner())
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn record_ticket_attempt(
+    db: State<'_, SqlitePool>,
+    ticket_id: String,
+    agent_id: String,
+    agent_log_id: Option<String>,
+    outcome: String,
+    rejection_reason: Option<String>,
+    files_changed: Option<String>,
+    diff_summary: Option<String>,
+    duration_ms: Option<i64>,
+    exit_code: Option<i64>,
+) -> Result<TicketAttempt, String> {
+    let next_number: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM ticket_attempts WHERE ticket_id = ?",
+    )
+    .bind(&ticket_id)
+    .fetch_one(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let id = Ulid::new().to_string();
+    let now = now_iso();
+
+    sqlx::query(
+        "INSERT INTO ticket_attempts \
+         (id, ticket_id, attempt_number, agent_id, agent_log_id, outcome, \
+          rejection_reason, files_changed, diff_summary, duration_ms, exit_code, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&ticket_id)
+    .bind(next_number.0)
+    .bind(&agent_id)
+    .bind(&agent_log_id)
+    .bind(&outcome)
+    .bind(&rejection_reason)
+    .bind(&files_changed)
+    .bind(&diff_summary)
+    .bind(duration_ms)
+    .bind(exit_code)
+    .bind(&now)
+    .execute(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(TicketAttempt {
+        id,
+        ticket_id,
+        attempt_number: next_number.0,
+        agent_id,
+        agent_log_id,
+        outcome,
+        rejection_reason,
+        files_changed,
+        diff_summary,
+        duration_ms,
+        exit_code,
+        created_at: now,
+    })
 }
 
 // ─── Dependency types ─────────────────────────────────────────────────────────

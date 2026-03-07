@@ -23,3 +23,5 @@ packages/*/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+target-codex-check

@@ -1,8 +1,8 @@
 use agent_client_protocol::{
-    Agent, Client, ClientCapabilities, ClientSideConnection, ContentBlock, Error as AcpError,
-    FileSystemCapability, Implementation, InitializeRequest, NewSessionRequest, PromptRequest,
-    ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionRequest,
-    RequestPermissionResponse, RequestPermissionOutcome, Result as AcpResult,
+    Agent, CancelNotification, Client, ClientCapabilities, ClientSideConnection, ContentBlock,
+    Error as AcpError, FileSystemCapability, Implementation, InitializeRequest, NewSessionRequest,
+    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, RequestPermissionOutcome, Result as AcpResult,
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, WriteTextFileRequest,
     WriteTextFileResponse,
 };
@@ -18,7 +18,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    sync::watch,
+    sync::{mpsc, oneshot},
     time::{timeout, Duration},
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -115,19 +115,218 @@ pub struct AcpEventItem {
     pub ts: String,
 }
 
-#[derive(Clone)]
-pub(crate) struct ActiveRunHandle {
-    pub(crate) slot: u8,
-    cancel: watch::Sender<bool>,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPermissionPolicy {
+    Ask,
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentPermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentPermissionRequestState {
+    pub request_id: String,
+    pub tool_title: Option<String>,
+    pub tool_kind: Option<String>,
+    pub tool_input: Option<String>,
+    pub options: Vec<AgentPermissionOption>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AgentSessionState {
+    pub ticket_id: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub is_running: bool,
+    pub opened_at: String,
+    pub last_activity_at: String,
+    pub idle_deadline_at: String,
+    pub permission_policy: AgentPermissionPolicy,
+    pub pending_permission: Option<AgentPermissionRequestState>,
+}
+
+struct PendingPermissionDecision {
+    request_id: String,
+    reply: oneshot::Sender<Option<String>>,
 }
 
 #[derive(Clone)]
-pub struct ActiveRuns(pub Arc<Mutex<HashMap<String, ActiveRunHandle>>>);
+struct SessionShared {
+    app: AppHandle,
+    ticket_id: String,
+    agent_id: String,
+    worktree_root: PathBuf,
+    snapshot: Arc<Mutex<AgentSessionState>>,
+    current_log_id: Arc<Mutex<Option<String>>>,
+    turn_events: Arc<Mutex<Vec<AcpEventItem>>>,
+    pending_permission: Arc<Mutex<Option<PendingPermissionDecision>>>,
+}
 
-impl Default for ActiveRuns {
+impl SessionShared {
+    fn snapshot(&self) -> AgentSessionState {
+        self.snapshot
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| AgentSessionState {
+                ticket_id: self.ticket_id.clone(),
+                agent_id: self.agent_id.clone(),
+                session_id: String::new(),
+                is_running: false,
+                opened_at: now_iso(),
+                last_activity_at: now_iso(),
+                idle_deadline_at: idle_deadline_iso(),
+                permission_policy: AgentPermissionPolicy::AllowOnce,
+                pending_permission: None,
+            })
+    }
+
+    fn update_snapshot<F>(&self, update: F) -> AgentSessionState
+    where
+        F: FnOnce(&mut AgentSessionState),
+    {
+        let mut state = self
+            .snapshot
+            .lock()
+            .expect("session snapshot lock poisoned");
+        update(&mut state);
+        state.clone()
+    }
+
+    fn emit_state(&self) {
+        let state = self.snapshot();
+        emit_session_state(&self.app, &self.ticket_id, Some(&state));
+    }
+
+    fn mark_activity(&self) {
+        let now = now_iso();
+        let deadline = idle_deadline_iso();
+        let _ = self.update_snapshot(|state| {
+            state.last_activity_at = now.clone();
+            state.idle_deadline_at = deadline.clone();
+        });
+        self.emit_state();
+    }
+
+    fn current_log_id(&self) -> Option<String> {
+        self.current_log_id
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+    }
+
+    fn set_current_log_id(&self, log_id: Option<String>) {
+        if let Ok(mut value) = self.current_log_id.lock() {
+            *value = log_id;
+        }
+    }
+
+    fn clear_turn_events(&self) {
+        if let Ok(mut events) = self.turn_events.lock() {
+            events.clear();
+        }
+    }
+
+    fn take_turn_events(&self) -> Vec<AcpEventItem> {
+        self.turn_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default()
+    }
+
+    fn push_turn_event(&self, item: AcpEventItem) {
+        if let Ok(mut events) = self.turn_events.lock() {
+            events.push(item.clone());
+        }
+        if let Some(log_id) = self.current_log_id() {
+            emit_acp_event(&self.app, &self.ticket_id, &log_id, &item);
+        }
+    }
+
+    fn clear_pending_permission(&self) {
+        if let Ok(mut pending) = self.pending_permission.lock() {
+            if let Some(decision) = pending.take() {
+                let _ = decision.reply.send(None);
+            }
+        }
+        let _ = self.update_snapshot(|state| state.pending_permission = None);
+        self.emit_state();
+    }
+
+    fn respond_to_permission(
+        &self,
+        request_id: &str,
+        option_id: Option<String>,
+    ) -> Result<(), String> {
+        let mut pending = self
+            .pending_permission
+            .lock()
+            .map_err(|_| "Permission prompt is unavailable".to_string())?;
+        let decision = pending
+            .take()
+            .ok_or_else(|| "No pending permission request".to_string())?;
+        if decision.request_id != request_id {
+            *pending = Some(decision);
+            return Err("Permission request no longer matches the active prompt".to_string());
+        }
+        let _ = decision.reply.send(option_id);
+        drop(pending);
+        let _ = self.update_snapshot(|state| state.pending_permission = None);
+        self.emit_state();
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ActiveSessionHandle {
+    pub(crate) slot: Arc<Mutex<u8>>,
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
+    shared: SessionShared,
+}
+
+impl ActiveSessionHandle {
+    pub(crate) fn current_slot(&self) -> Option<u8> {
+        self.slot.lock().ok().map(|slot| *slot)
+    }
+
+    fn set_slot(&self, next_slot: u8) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = next_slot;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ActiveSessions(pub Arc<Mutex<HashMap<String, ActiveSessionHandle>>>);
+
+impl Default for ActiveSessions {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(HashMap::new())))
     }
+}
+
+enum SessionCommand {
+    StartTurn {
+        log_id: String,
+        prompt: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    CancelTurn {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Shutdown {
+        reply: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    Touch,
 }
 
 fn now_iso() -> String {
@@ -136,25 +335,20 @@ fn now_iso() -> String {
         .to_string()
 }
 
+fn idle_deadline_iso() -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds((15 * 60) as i64))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
 #[derive(Clone)]
 struct AcpClientHandler {
-    app: AppHandle,
-    ticket_id: String,
-    log_id: String,
-    worktree_root: PathBuf,
-    events: Arc<Mutex<Vec<AcpEventItem>>>,
+    shared: SessionShared,
 }
 
 impl AcpClientHandler {
     fn push_item(&self, item: AcpEventItem) {
-        if let Ok(mut events) = self.events.lock() {
-            events.push(item.clone());
-        }
-        emit_acp_event(&self.app, &self.ticket_id, &self.log_id, &item);
-    }
-
-    fn event_len(&self) -> usize {
-        self.events.lock().map(|events| events.len()).unwrap_or(0)
+        self.shared.push_turn_event(item);
     }
 
     fn validate_path(&self, path: &Path) -> AcpResult<()> {
@@ -162,7 +356,7 @@ impl AcpClientHandler {
             return Err(AcpError::invalid_params().data("Path must be absolute"));
         }
 
-        if !path.starts_with(&self.worktree_root) {
+        if !path.starts_with(&self.shared.worktree_root) {
             return Err(AcpError::invalid_params().data("Path is outside the worktree"));
         }
 
@@ -176,16 +370,100 @@ impl Client for AcpClientHandler {
         &self,
         args: RequestPermissionRequest,
     ) -> AcpResult<RequestPermissionResponse> {
-        let option = args
+        let policy = self.shared.snapshot().permission_policy;
+        let options = args
             .options
-            .first()
-            .ok_or_else(|| AcpError::invalid_params().data("No permission options provided"))?;
+            .iter()
+            .map(|option| AgentPermissionOption {
+                option_id: option.option_id.to_string(),
+                name: option.name.clone(),
+                kind: format!("{:?}", option.kind),
+            })
+            .collect::<Vec<_>>();
 
-        Ok(RequestPermissionResponse::new(
-            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-                option.option_id.clone(),
+        let option_id = match policy {
+            AgentPermissionPolicy::Ask => None,
+            AgentPermissionPolicy::AllowOnce => args
+                .options
+                .iter()
+                .find(|option| {
+                    let kind = format!("{:?}", option.kind).to_lowercase();
+                    kind.contains("allow_once") || kind.contains("allowonce")
+                })
+                .map(|option| option.option_id.clone()),
+            AgentPermissionPolicy::AllowAlways => args
+                .options
+                .iter()
+                .find(|option| {
+                    let kind = format!("{:?}", option.kind).to_lowercase();
+                    kind.contains("allow_always") || kind.contains("allowalways")
+                })
+                .map(|option| option.option_id.clone()),
+            AgentPermissionPolicy::RejectOnce => args
+                .options
+                .iter()
+                .find(|option| {
+                    let kind = format!("{:?}", option.kind).to_lowercase();
+                    kind.contains("reject_once") || kind.contains("rejectonce")
+                })
+                .map(|option| option.option_id.clone()),
+            AgentPermissionPolicy::RejectAlways => args
+                .options
+                .iter()
+                .find(|option| {
+                    let kind = format!("{:?}", option.kind).to_lowercase();
+                    kind.contains("reject_always") || kind.contains("rejectalways")
+                })
+                .map(|option| option.option_id.clone()),
+        };
+
+        if let Some(option_id) = option_id {
+            return Ok(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
+            ));
+        }
+
+        let request_id = Ulid::new().to_string();
+        let request = AgentPermissionRequestState {
+            request_id: request_id.clone(),
+            tool_title: args.tool_call.fields.title.clone(),
+            tool_kind: args
+                .tool_call
+                .fields
+                .kind
+                .as_ref()
+                .map(|kind| format!("{kind:?}")),
+            tool_input: args
+                .tool_call
+                .fields
+                .raw_input
+                .as_ref()
+                .map(|value| value.to_string()),
+            options,
+            created_at: now_iso(),
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        if let Ok(mut pending) = self.shared.pending_permission.lock() {
+            *pending = Some(PendingPermissionDecision {
+                request_id: request_id.clone(),
+                reply: reply_tx,
+            });
+        }
+
+        let _ = self.shared.update_snapshot(|state| {
+            state.pending_permission = Some(request.clone());
+        });
+        self.shared.emit_state();
+
+        match reply_rx.await {
+            Ok(Some(option_id)) => Ok(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
             )),
-        ))
+            _ => Ok(RequestPermissionResponse::new(
+                RequestPermissionOutcome::Cancelled,
+            )),
+        }
     }
 
     async fn session_notification(&self, args: SessionNotification) -> AcpResult<()> {
@@ -471,6 +749,77 @@ fn build_command(command_line: &str, cwd: &str, api_key_ref: Option<&str>, api_k
     Ok(command)
 }
 
+// ─── Attempt History Injection ─────────────────────────────────────────────────
+
+async fn build_attempt_history_section(pool: &SqlitePool, ticket_id: &str) -> String {
+    let attempts: Vec<(i64, String, String, Option<String>, Option<String>, Option<i64>)> =
+        match sqlx::query_as(
+            "SELECT attempt_number, agent_id, outcome, rejection_reason, files_changed, duration_ms \
+             FROM ticket_attempts WHERE ticket_id = ? ORDER BY attempt_number ASC",
+        )
+        .bind(ticket_id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return String::new(),
+        };
+
+    if attempts.is_empty() {
+        return String::new();
+    }
+
+    const MAX_HISTORY_BYTES: usize = 8000;
+
+    let mut out = String::from(
+        "## Previous Attempts\n\n\
+         IMPORTANT: Review the feedback from previous attempts below. \
+         Do NOT repeat the same mistakes.\n\n",
+    );
+
+    // If too many attempts, summarize older ones and keep recent 3 in detail.
+    let (summary_count, detailed) = if attempts.len() > 3 {
+        (attempts.len() - 3, &attempts[attempts.len() - 3..])
+    } else {
+        (0, attempts.as_slice())
+    };
+
+    if summary_count > 0 {
+        out.push_str(&format!(
+            "{} earlier attempt(s) also failed. Showing the most recent 3:\n\n",
+            summary_count,
+        ));
+    }
+
+    for (attempt_number, agent_id, outcome, rejection_reason, files_changed, duration_ms) in
+        detailed
+    {
+        out.push_str(&format!(
+            "### Attempt {} ({}, {})\n",
+            attempt_number, agent_id, outcome
+        ));
+        if let Some(reason) = rejection_reason {
+            out.push_str(&format!("**Rejection reason:** {}\n", reason));
+        }
+        if let Some(files) = files_changed {
+            out.push_str(&format!("**Files changed:** {}\n", files));
+        }
+        if let Some(ms) = duration_ms {
+            let secs = *ms as f64 / 1000.0;
+            out.push_str(&format!("**Duration:** {:.1}s\n", secs));
+        }
+        out.push('\n');
+
+        if out.len() > MAX_HISTORY_BYTES {
+            out.truncate(MAX_HISTORY_BYTES);
+            out.push_str("\n[attempt history truncated]\n");
+            break;
+        }
+    }
+
+    out
+}
+
 // ─── Agent Config Commands ────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -561,18 +910,26 @@ pub async fn delete_agent_config(db: State<'_, SqlitePool>, id: String) -> Resul
 
 // ─── Agent Launch (ACP) ───────────────────────────────────────────────────────
 
-async fn start_agent_run(
-    app: AppHandle,
-    pool: &SqlitePool,
+struct AgentTurnRequest {
     ticket_id: String,
-    slot: u8,
-    active_runs: State<'_, ActiveRuns>,
+    agent_id: String,
+    acp_target: String,
+    prompt: String,
+    worktree_path: String,
+    api_key_ref: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+}
+
+async fn build_turn_request(
+    pool: &SqlitePool,
+    ticket_id: &str,
     extra_instruction: Option<String>,
-) -> Result<String, String> {
+) -> Result<AgentTurnRequest, String> {
     let row = sqlx::query(
         "SELECT context, execution_context, worktree_path, assigned_agent FROM tickets WHERE id = ?",
     )
-    .bind(&ticket_id)
+    .bind(ticket_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
@@ -583,12 +940,11 @@ async fn start_agent_run(
     let worktree_path: Option<String> = row.try_get("worktree_path").ok().flatten();
     let assigned_agent: Option<String> = row.try_get("assigned_agent").ok().flatten();
 
-    let worktree_path =
-        worktree_path.ok_or("Ticket has no worktree_path; run create_worktree first")?;
+    let worktree_path = worktree_path.ok_or("Ticket has no worktree_path; run create_worktree first")?;
     let agent_id = assigned_agent.ok_or("Ticket has no assigned_agent")?;
 
     let agent = sqlx::query_as::<_, AgentConfig>(
-        "SELECT id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled \
+        "SELECT id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled, strengths, weaknesses, best_for, reasoning_class, speed_class, edit_reliability \
          FROM agent_config WHERE id = ?",
     )
     .bind(&agent_id)
@@ -602,6 +958,15 @@ async fn start_agent_run(
         .or(context.filter(|s| !s.trim().is_empty()))
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "Ticket is missing executable context".to_string())?;
+
+    // Inject attempt history so agents learn from prior rejections.
+    let attempt_history = build_attempt_history_section(pool, &ticket_id).await;
+    let base_prompt = if attempt_history.is_empty() {
+        base_prompt
+    } else {
+        format!("{base_prompt}\n\n{attempt_history}")
+    };
+
     let full_prompt = match extra_instruction {
         Some(message) if !message.trim().is_empty() => format!(
             "{base_prompt}\n\nContinue from the current worktree state.\n\nFollow-up user message:\n{}",
@@ -611,483 +976,778 @@ async fn start_agent_run(
     };
     let full_prompt = expand_prompt_with_file_refs(&full_prompt, &worktree_path)?;
 
-    let log_id = Ulid::new().to_string();
-    let now = now_iso();
-    sqlx::query(
-        "INSERT INTO agent_logs (id, ticket_id, agent_id, created_at) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&log_id)
-    .bind(&ticket_id)
-    .bind(&agent_id)
-    .bind(&now)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
     let api_key = agent
         .api_key_ref
         .as_deref()
         .and_then(|var| std::env::var(var).ok());
-    let api_key_ref = agent.api_key_ref.clone();
 
-    let pool_bg = pool.clone();
-    let ticket_id_bg = ticket_id.clone();
-    let log_id_bg = log_id.clone();
-    let agent_name = agent_id.clone();
-    let (cancel_tx, cancel_rx) = watch::channel(false);
+    Ok(AgentTurnRequest {
+        ticket_id: ticket_id.to_string(),
+        agent_id,
+        acp_target: agent.acp_url,
+        prompt: full_prompt,
+        worktree_path,
+        api_key_ref: agent.api_key_ref.clone(),
+        api_key,
+        model: agent.model,
+    })
+}
 
+async fn insert_agent_log(pool: &SqlitePool, ticket_id: &str, agent_id: &str) -> Result<String, String> {
+    let log_id = Ulid::new().to_string();
+    sqlx::query("INSERT INTO agent_logs (id, ticket_id, agent_id, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&log_id)
+        .bind(ticket_id)
+        .bind(agent_id)
+        .bind(now_iso())
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(log_id)
+}
+
+async fn finalize_start_failure(
+    app: AppHandle,
+    ticket_id: String,
+    pool: &SqlitePool,
+    log_id: &str,
+    message: String,
+) {
+    emit_error_event(&app, &ticket_id, log_id, &message);
+    finalize(
+        &app,
+        pool,
+        &ticket_id,
+        log_id,
+        None,
+        &[],
+        None,
+        None,
+        1,
+        0,
+        Some(message),
+        false,
+        None,
+    )
+    .await;
+}
+
+async fn start_agent_run(
+    app: AppHandle,
+    pool: &SqlitePool,
+    ticket_id: String,
+    slot: u8,
+    active_sessions: State<'_, ActiveSessions>,
+    extra_instruction: Option<String>,
+    permission_policy: Option<AgentPermissionPolicy>,
+) -> Result<String, String> {
+    let request = build_turn_request(pool, &ticket_id, extra_instruction).await?;
+    let log_id = insert_agent_log(pool, &request.ticket_id, &request.agent_id).await?;
+
+    let handle = match get_or_create_session_handle(
+        &app,
+        pool,
+        active_sessions.inner(),
+        &request,
+        slot,
+        permission_policy,
+    )
+    .await
     {
-        let mut runs = active_runs
-            .0
-            .lock()
-            .map_err(|_| "Active run state is unavailable".to_string())?;
-        runs.insert(
-            ticket_id.clone(),
-            ActiveRunHandle {
-                slot,
-                cancel: cancel_tx,
-            },
-        );
+        Ok(handle) => handle,
+        Err(err) => {
+            finalize_start_failure(app, ticket_id, pool, &log_id, err.clone()).await;
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = start_turn(&handle, log_id.clone(), request.prompt).await {
+        finalize_start_failure(app, ticket_id, pool, &log_id, err.clone()).await;
+        return Err(err);
     }
-
-    let active_runs_bg = active_runs.inner().clone();
-
-    std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                if let Ok(mut runs) = active_runs_bg.0.lock() {
-                    runs.remove(ticket_id_bg.as_str());
-                }
-                let message = format!("Failed to create ACP runtime: {err}");
-                emit_error_event(&app, &ticket_id_bg, &log_id_bg, &message);
-                return;
-            }
-        };
-
-        runtime.block_on(run_acp_agent(
-            app,
-            pool_bg,
-            ticket_id_bg,
-            log_id_bg,
-            slot,
-            active_runs_bg,
-            cancel_rx,
-            agent.acp_url,
-            agent_name,
-            full_prompt,
-            worktree_path,
-            api_key_ref,
-            api_key,
-            agent.model,
-        ));
-    });
 
     Ok(log_id)
 }
 
-/// Launch an ACP agent run for a ticket.
-/// Creates a placeholder log entry, then spawns a background task that opens
-/// an ACP stdio session. Returns the log_id immediately.
 #[tauri::command]
 pub async fn launch_agent(
     app: AppHandle,
     db: State<'_, SqlitePool>,
-    active_runs: State<'_, ActiveRuns>,
+    active_sessions: State<'_, ActiveSessions>,
     ticket_id: String,
     slot: u8,
+    permission_policy: Option<AgentPermissionPolicy>,
 ) -> Result<String, String> {
-    start_agent_run(app, db.inner(), ticket_id, slot, active_runs, None).await
+    start_agent_run(
+        app,
+        db.inner(),
+        ticket_id,
+        slot,
+        active_sessions,
+        None,
+        permission_policy,
+    )
+    .await
 }
 
-/// Continue an ACP agent run for a ticket with a follow-up user message.
 #[tauri::command]
 pub async fn continue_agent(
     app: AppHandle,
     db: State<'_, SqlitePool>,
-    active_runs: State<'_, ActiveRuns>,
+    active_sessions: State<'_, ActiveSessions>,
     ticket_id: String,
     slot: u8,
     message: String,
+    permission_policy: Option<AgentPermissionPolicy>,
 ) -> Result<String, String> {
-    interrupt_run(&ticket_id, active_runs.inner())
-        .await
-        .map_err(|err| format!("Could not interrupt current run: {err}"))?;
-    start_agent_run(app, db.inner(), ticket_id, slot, active_runs, Some(message)).await
+    if let Some(handle) = get_session_handle(active_sessions.inner(), &ticket_id)? {
+        handle.set_slot(slot);
+        if handle.shared.snapshot().is_running {
+            cancel_turn(&handle).await?;
+        }
+    }
+
+    start_agent_run(
+        app,
+        db.inner(),
+        ticket_id,
+        slot,
+        active_sessions,
+        Some(message),
+        permission_policy,
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn interrupt_agent(
-    active_runs: State<'_, ActiveRuns>,
+    active_sessions: State<'_, ActiveSessions>,
     ticket_id: String,
 ) -> Result<(), String> {
-    interrupt_run(&ticket_id, active_runs.inner()).await
+    shutdown_ticket_session(active_sessions.inner(), &ticket_id).await
 }
 
-// ─── ACP Streaming Run ────────────────────────────────────────────────────────
+#[tauri::command]
+pub async fn cancel_agent_turn(
+    active_sessions: State<'_, ActiveSessions>,
+    ticket_id: String,
+) -> Result<(), String> {
+    if let Some(handle) = get_session_handle(active_sessions.inner(), &ticket_id)? {
+        return cancel_turn(&handle).await;
+    }
+    Ok(())
+}
 
-async fn run_acp_agent(
+#[tauri::command]
+pub async fn stop_agent_session(
+    active_sessions: State<'_, ActiveSessions>,
+    ticket_id: String,
+) -> Result<(), String> {
+    shutdown_ticket_session(active_sessions.inner(), &ticket_id).await
+}
+
+#[tauri::command]
+pub async fn shutdown_all_agent_sessions(
+    active_sessions: State<'_, ActiveSessions>,
+) -> Result<(), String> {
+    shutdown_all_sessions(active_sessions.inner()).await
+}
+
+#[tauri::command]
+pub async fn get_agent_session(
+    active_sessions: State<'_, ActiveSessions>,
+    ticket_id: String,
+) -> Result<Option<AgentSessionState>, String> {
+    let Some(handle) = get_session_handle(active_sessions.inner(), &ticket_id)? else {
+        return Ok(None);
+    };
+    let state = handle.shared.snapshot();
+    if state.session_id.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+#[tauri::command]
+pub async fn set_agent_permission_policy(
+    active_sessions: State<'_, ActiveSessions>,
+    ticket_id: String,
+    policy: AgentPermissionPolicy,
+) -> Result<AgentSessionState, String> {
+    let handle = get_session_handle(active_sessions.inner(), &ticket_id)?
+        .ok_or_else(|| "No active agent session for this ticket".to_string())?;
+    let updated = handle.shared.update_snapshot(|state| {
+        state.permission_policy = policy.clone();
+        state.last_activity_at = now_iso();
+        state.idle_deadline_at = idle_deadline_iso();
+    });
+    handle.shared.emit_state();
+    let _ = touch_session(&handle).await;
+    Ok(updated)
+}
+
+#[tauri::command]
+pub async fn respond_to_agent_permission(
+    active_sessions: State<'_, ActiveSessions>,
+    ticket_id: String,
+    request_id: String,
+    option_id: Option<String>,
+) -> Result<(), String> {
+    let handle = get_session_handle(active_sessions.inner(), &ticket_id)?
+        .ok_or_else(|| "No active agent session for this ticket".to_string())?;
+    handle.shared.respond_to_permission(&request_id, option_id)?;
+    handle.shared.mark_activity();
+    Ok(())
+}
+
+async fn get_or_create_session_handle(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    active_sessions: &ActiveSessions,
+    request: &AgentTurnRequest,
+    slot: u8,
+    initial_policy: Option<AgentPermissionPolicy>,
+) -> Result<ActiveSessionHandle, String> {
+    if let Some(handle) = get_session_handle(active_sessions, &request.ticket_id)? {
+        if handle.shared.snapshot().agent_id != request.agent_id {
+            shutdown_ticket_session(active_sessions, &request.ticket_id).await?;
+        } else {
+            handle.set_slot(slot);
+            if let Some(policy) = initial_policy {
+                let _ = handle.shared.update_snapshot(|state| {
+                    state.permission_policy = policy.clone();
+                    state.last_activity_at = now_iso();
+                    state.idle_deadline_at = idle_deadline_iso();
+                });
+                handle.shared.emit_state();
+                let _ = touch_session(&handle).await;
+            }
+            return Ok(handle);
+        }
+    }
+
+    let permission_policy = initial_policy.unwrap_or(AgentPermissionPolicy::AllowOnce);
+    let shared = SessionShared {
+        app: app.clone(),
+        ticket_id: request.ticket_id.clone(),
+        agent_id: request.agent_id.clone(),
+        worktree_root: PathBuf::from(&request.worktree_path),
+        snapshot: Arc::new(Mutex::new(AgentSessionState {
+            ticket_id: request.ticket_id.clone(),
+            agent_id: request.agent_id.clone(),
+            session_id: String::new(),
+            is_running: false,
+            opened_at: now_iso(),
+            last_activity_at: now_iso(),
+            idle_deadline_at: idle_deadline_iso(),
+            permission_policy,
+            pending_permission: None,
+        })),
+        current_log_id: Arc::new(Mutex::new(None)),
+        turn_events: Arc::new(Mutex::new(Vec::new())),
+        pending_permission: Arc::new(Mutex::new(None)),
+    };
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let handle = ActiveSessionHandle {
+        slot: Arc::new(Mutex::new(slot)),
+        command_tx,
+        shared: shared.clone(),
+    };
+
+    {
+        let mut sessions = active_sessions
+            .0
+            .lock()
+            .map_err(|_| "Active session state is unavailable".to_string())?;
+        sessions.insert(request.ticket_id.clone(), handle.clone());
+    }
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let pool_bg = pool.clone();
+    let active_sessions_bg = active_sessions.clone();
+    let request_bg = AgentTurnRequest {
+        ticket_id: request.ticket_id.clone(),
+        agent_id: request.agent_id.clone(),
+        acp_target: request.acp_target.clone(),
+        prompt: String::new(),
+        worktree_path: request.worktree_path.clone(),
+        api_key_ref: request.api_key_ref.clone(),
+        api_key: request.api_key.clone(),
+        model: request.model.clone(),
+    };
+
+    std::thread::spawn({
+        let app = app.clone();
+        move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(format!("Failed to create ACP runtime: {err}")));
+                    if let Ok(mut sessions) = active_sessions_bg.0.lock() {
+                        sessions.remove(request_bg.ticket_id.as_str());
+                    }
+                    emit_session_state(&app, &request_bg.ticket_id, None);
+                    return;
+                }
+            };
+
+            runtime.block_on(run_session_worker(
+                app,
+                pool_bg,
+                active_sessions_bg,
+                request_bg,
+                shared,
+                command_rx,
+                ready_tx,
+            ));
+        }
+    });
+
+    match ready_rx.await {
+        Ok(Ok(())) => Ok(handle),
+        Ok(Err(err)) => {
+            if let Ok(mut sessions) = active_sessions.0.lock() {
+                sessions.remove(request.ticket_id.as_str());
+            }
+            emit_session_state(app, &request.ticket_id, None);
+            Err(err)
+        }
+        Err(_) => {
+            if let Ok(mut sessions) = active_sessions.0.lock() {
+                sessions.remove(request.ticket_id.as_str());
+            }
+            emit_session_state(app, &request.ticket_id, None);
+            Err("ACP session setup terminated unexpectedly".to_string())
+        }
+    }
+}
+
+async fn run_session_worker(
     app: AppHandle,
     pool: SqlitePool,
-    ticket_id: String,
-    log_id: String,
-    slot: u8,
-    active_runs: ActiveRuns,
-    mut cancel_rx: watch::Receiver<bool>,
-    acp_target: String,
-    agent_name: String,
-    prompt: String,
-    worktree_path: String,
-    api_key_ref: Option<String>,
-    api_key: Option<String>,
-    model: Option<String>,
+    active_sessions: ActiveSessions,
+    request: AgentTurnRequest,
+    shared: SessionShared,
+    mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+    ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
-    let start = Instant::now();
-    let _ = model;
-
-    let target = match resolve_transport_target(&agent_name, &acp_target) {
+    let _ = request.model.as_deref();
+    let target = match resolve_transport_target(&request.agent_id, &request.acp_target) {
         Ok(target) => target,
         Err(err) => {
-            emit_error_event(&app, &ticket_id, &log_id, &err);
-            finalize(
-                &app,
-                &pool,
-                &ticket_id,
-                &log_id,
-                None,
-                &[],
-                None,
-                None,
-                1,
-                start.elapsed().as_millis() as i64,
-                Some(err),
-                false,
-                None,
-            )
-            .await;
+            let _ = ready_tx.send(Err(err));
+            if let Ok(mut sessions) = active_sessions.0.lock() {
+                sessions.remove(request.ticket_id.as_str());
+            }
+            emit_session_state(&app, &request.ticket_id, None);
             return;
         }
     };
+    let ticket_id_after = request.ticket_id.clone();
+    let app_after = app.clone();
 
-    let worktree_root = PathBuf::from(&worktree_path);
-    let handler = AcpClientHandler {
-        app: app.clone(),
-        ticket_id: ticket_id.clone(),
-        log_id: log_id.clone(),
-        worktree_root,
-        events: Arc::new(Mutex::new(Vec::new())),
-    };
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let mut command = match build_command(
+                &target,
+                &request.worktree_path,
+                request.api_key_ref.as_deref(),
+                request.api_key.as_deref(),
+            ) {
+                Ok(command) => command,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
 
-    let (
-        run_id,
-        tokens_in,
-        tokens_out,
-        exit_code,
-        error_summary,
-        cleanup_warning,
-        cleanup_warning_message,
-    ) =
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let mut command = match build_command(
-                    &target,
-                    &worktree_path,
-                    api_key_ref.as_deref(),
-                    api_key.as_deref(),
-                ) {
-                    Ok(command) => command,
-                    Err(err) => return (None, None, None, 1, Some(err), false, None),
-                };
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(format!("Failed to start ACP agent '{target}': {err}")));
+                    return;
+                }
+            };
 
-                let mut child = match command.spawn() {
-                    Ok(child) => child,
-                    Err(err) => {
-                        return (
-                            None,
-                            None,
-                            None,
-                            1,
-                            Some(format!("Failed to start ACP agent '{target}': {err}")),
-                            false,
-                            None,
+            let child_stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    let _ = ready_tx.send(Err("ACP agent stdin unavailable".to_string()));
+                    return;
+                }
+            };
+            let child_stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    let _ = ready_tx.send(Err("ACP agent stdout unavailable".to_string()));
+                    return;
+                }
+            };
+            let mut child_stderr = child.stderr.take();
+
+            let stderr_task = tokio::task::spawn_local(async move {
+                let mut stderr = Vec::new();
+                if let Some(mut stream) = child_stderr.take() {
+                    let _ = stream.read_to_end(&mut stderr).await;
+                }
+                String::from_utf8_lossy(&stderr).trim().to_string()
+            });
+
+            let handler = AcpClientHandler { shared: shared.clone() };
+            let (connection, io_task) = ClientSideConnection::new(
+                handler.clone(),
+                child_stdin.compat_write(),
+                child_stdout.compat(),
+                |fut| {
+                    tokio::task::spawn_local(fut);
+                },
+            );
+            let io_task = tokio::task::spawn_local(async move {
+                let _ = io_task.await;
+            });
+
+            let init = connection
+                .initialize(
+                    InitializeRequest::new(ProtocolVersion::LATEST)
+                        .client_capabilities(
+                            ClientCapabilities::new().fs(
+                                FileSystemCapability::new()
+                                    .read_text_file(true)
+                                    .write_text_file(true),
+                            ),
                         )
-                    }
-                };
+                        .client_info(Implementation::new("mozzie", "0.1.0")),
+                )
+                .await;
 
-                let child_stdin = match child.stdin.take() {
-                    Some(stdin) => stdin,
-                    None => return (None, None, None, 1, Some("ACP agent stdin unavailable".to_string()), false, None),
-                };
-                let child_stdout = match child.stdout.take() {
-                    Some(stdout) => stdout,
-                    None => return (None, None, None, 1, Some("ACP agent stdout unavailable".to_string()), false, None),
-                };
-                let mut child_stderr = child.stderr.take();
+            if let Err(err) = init {
+                let _ = ready_tx.send(Err(format!("ACP initialize failed: {}", err.message)));
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return;
+            }
 
-                let stderr_task = tokio::task::spawn_local(async move {
-                    let mut stderr = Vec::new();
-                    if let Some(mut stream) = child_stderr.take() {
-                        let _ = stream.read_to_end(&mut stderr).await;
-                    }
-                    String::from_utf8_lossy(&stderr).trim().to_string()
-                });
-
-                let (connection, io_task) = ClientSideConnection::new(
-                    handler.clone(),
-                    child_stdin.compat_write(),
-                    child_stdout.compat(),
-                    |fut| {
-                        tokio::task::spawn_local(fut);
-                    },
-                );
-                tokio::task::spawn_local(async move {
-                    let _ = io_task.await;
-                });
-
-                let init = connection
-                    .initialize(
-                        InitializeRequest::new(ProtocolVersion::LATEST)
-                            .client_capabilities(
-                                ClientCapabilities::new().fs(
-                                    FileSystemCapability::new()
-                                        .read_text_file(true)
-                                        .write_text_file(true),
-                                ),
-                            )
-                            .client_info(Implementation::new("mozzie", "0.1.0")),
-                    )
-                    .await;
-
-                if let Err(err) = init {
+            let session = match connection
+                .new_session(NewSessionRequest::new(request.worktree_path.clone()))
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(format!("ACP session creation failed: {}", err.message)));
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    let stderr = stderr_task.await.unwrap_or_default();
-                    return (
-                        None,
-                        None,
-                        None,
-                        1,
-                        Some(if stderr.is_empty() {
-                            format!("ACP initialize failed: {}", err.message)
-                        } else {
-                            format!("ACP initialize failed: {} ({stderr})", err.message)
-                        }),
-                        false,
-                        None,
-                    );
+                    return;
                 }
+            };
+            let session_id = session.session_id.to_string();
 
-                let session = match connection
-                    .new_session(NewSessionRequest::new(worktree_path.clone()))
-                    .await
-                {
-                    Ok(session) => session,
-                    Err(err) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                        let stderr = stderr_task.await.unwrap_or_default();
-                        return (
-                            None,
-                            None,
-                            None,
-                            1,
-                            Some(if stderr.is_empty() {
-                                format!("ACP session creation failed: {}", err.message)
-                            } else {
-                                format!("ACP session creation failed: {} ({stderr})", err.message)
-                            }),
-                            false,
-                            None,
-                        );
-                    }
-                };
+            let now = now_iso();
+            let deadline = idle_deadline_iso();
+            let _ = shared.update_snapshot(|state| {
+                state.session_id = session_id.clone();
+                state.opened_at = now.clone();
+                state.last_activity_at = now.clone();
+                state.idle_deadline_at = deadline.clone();
+            });
+            shared.emit_state();
+            let _ = ready_tx.send(Ok(()));
 
-                let prompt_result = {
-                    let prompt_future = connection.prompt(PromptRequest::new(
-                        session.session_id.clone(),
-                        vec![ContentBlock::from(prompt.clone())],
-                    ));
-                    tokio::pin!(prompt_future);
+            let mut should_shutdown = false;
 
-                    tokio::select! {
-                        result = &mut prompt_future => result,
-                        changed = cancel_rx.changed() => {
-                            let _ = changed;
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            let stderr = stderr_task.await.unwrap_or_default();
-                            return (
-                                Some(session.session_id.to_string()),
-                                None,
-                                None,
-                                130,
-                                Some(if stderr.is_empty() {
-                                    "Interrupted by user".to_string()
-                                } else {
-                                    format!("Interrupted by user ({stderr})")
-                                }),
-                                false,
-                                None,
-                            );
-                        }
-                    }
-                };
-                drop(connection);
-                let status = match timeout(Duration::from_secs(5), child.wait()).await {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(err)) => {
-                        return (
-                            Some(session.session_id.to_string()),
-                            None,
-                            None,
-                            1,
-                            Some(format!("ACP agent wait failed: {err}")),
-                            false,
-                            None,
-                        )
-                    }
-                    Err(_) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                        let warning = "ACP agent did not exit after prompt completion".to_string();
-                        match &prompt_result {
-                            Ok(response) if response.stop_reason == StopReason::EndTurn => {
-                                return (
-                                    Some(session.session_id.to_string()),
+            while !should_shutdown {
+                let idle_sleep = tokio::time::sleep(Duration::from_secs(15 * 60));
+                tokio::pin!(idle_sleep);
+
+                tokio::select! {
+                    maybe_command = command_rx.recv() => {
+                        let Some(command) = maybe_command else {
+                            should_shutdown = true;
+                            continue;
+                        };
+
+                        match command {
+                            SessionCommand::StartTurn { log_id, prompt, reply } => {
+                                shared.clear_turn_events();
+                                shared.set_current_log_id(Some(log_id.clone()));
+                                let _ = shared.update_snapshot(|state| {
+                                    state.is_running = true;
+                                    state.pending_permission = None;
+                                    state.last_activity_at = now_iso();
+                                    state.idle_deadline_at = idle_deadline_iso();
+                                });
+                                shared.emit_state();
+                                let _ = reply.send(Ok(()));
+
+                                let turn = run_prompt_turn(
+                                    &connection,
+                                    &session_id,
+                                    &prompt,
+                                    &shared,
+                                    &mut command_rx,
+                                )
+                                .await;
+
+                                let events = shared.take_turn_events();
+                                if turn.exit_code == 0 && events.is_empty() {
+                                    emit_error_event(&app, &request.ticket_id, &log_id, "ACP run completed without output");
+                                } else if let Some(message) = turn.error_summary.as_deref() {
+                                    emit_error_event(&app, &request.ticket_id, &log_id, message);
+                                }
+
+                                finalize(
+                                    &app,
+                                    &pool,
+                                    &request.ticket_id,
+                                    &log_id,
+                                    Some(session_id.as_str()),
+                                    &events,
                                     None,
                                     None,
-                                    0,
-                                    None,
-                                    true,
-                                    Some(warning),
-                                );
-                            }
-                            _ => {
-                                return (
-                                    Some(session.session_id.to_string()),
-                                    None,
-                                    None,
-                                    1,
-                                    Some(warning),
+                                    turn.exit_code,
+                                    turn.duration_ms,
+                                    turn.error_summary,
                                     false,
                                     None,
-                                );
+                                )
+                                .await;
+
+                                shared.set_current_log_id(None);
+                                shared.clear_pending_permission();
+                                let _ = shared.update_snapshot(|state| {
+                                    state.is_running = false;
+                                    state.last_activity_at = now_iso();
+                                    state.idle_deadline_at = idle_deadline_iso();
+                                });
+                                shared.emit_state();
+
+                                if turn.shutdown_after {
+                                    should_shutdown = true;
+                                }
+                            }
+                            SessionCommand::CancelTurn { reply } => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            SessionCommand::Shutdown { reply } => {
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                should_shutdown = true;
+                            }
+                            SessionCommand::Touch => {
+                                shared.mark_activity();
                             }
                         }
                     }
-                };
-                let stderr = stderr_task.await.unwrap_or_default();
-
-                match prompt_result {
-                    Ok(response) => {
-                        let mut exit_code = if status.success() { 0 } else { 1 };
-                        let mut summary = if stderr.is_empty() { None } else { Some(stderr) };
-
-                        if response.stop_reason != StopReason::EndTurn {
-                            exit_code = 1;
-                            let reason = format!("Agent stopped with {:?}", response.stop_reason);
-                            summary = Some(match summary {
-                                Some(stderr) => format!("{reason}. {stderr}"),
-                                None => reason,
-                            });
-                        }
-
-                        (
-                            Some(session.session_id.to_string()),
-                            None,
-                            None,
-                            exit_code,
-                            summary,
-                            false,
-                            None,
-                        )
-                    }
-                    Err(err) => {
-                        let msg = if stderr.is_empty() {
-                            format!("ACP prompt failed: {}", err.message)
-                        } else {
-                            format!("ACP prompt failed: {} ({stderr})", err.message)
-                        };
-                        (
-                            Some(session.session_id.to_string()),
-                            None,
-                            None,
-                            1,
-                            Some(msg),
-                            false,
-                            None,
-                        )
+                    _ = &mut idle_sleep => {
+                        should_shutdown = true;
                     }
                 }
-            })
-            .await;
+            }
 
-    let events = handler
-        .events
-        .lock()
-        .map(|events| events.clone())
-        .unwrap_or_default();
+            shared.clear_pending_permission();
+            shared.set_current_log_id(None);
+            drop(connection);
+            let mut io_task = io_task;
+            if timeout(Duration::from_secs(2), &mut io_task).await.is_err() {
+                io_task.abort();
+            }
+            if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+            let _ = stderr_task.await.unwrap_or_default();
+        })
+        .await;
 
-    if exit_code == 0 && events.is_empty() && handler.event_len() == 0 {
-        emit_error_event(&app, &ticket_id, &log_id, "ACP run completed without output");
-    } else if let Some(message) = error_summary.as_deref() {
-        emit_error_event(&app, &ticket_id, &log_id, message);
+    if let Ok(mut sessions) = active_sessions.0.lock() {
+        sessions.remove(ticket_id_after.as_str());
     }
+    emit_session_state(&app_after, &ticket_id_after, None);
+}
 
-    finalize(
-        &app,
-        &pool,
-        &ticket_id,
-        &log_id,
-        run_id.as_deref(),
-        &events,
-        tokens_in,
-        tokens_out,
-        exit_code,
-        start.elapsed().as_millis() as i64,
-        error_summary,
-        cleanup_warning,
-        cleanup_warning_message,
-    )
-    .await;
+struct PromptTurnResult {
+    duration_ms: i64,
+    exit_code: i64,
+    error_summary: Option<String>,
+    shutdown_after: bool,
+}
 
-    if let Ok(mut runs) = active_runs.0.lock() {
-        let should_remove = runs
-            .get(ticket_id.as_str())
-            .map(|handle| handle.slot == slot)
-            .unwrap_or(false);
-        if should_remove {
-            runs.remove(ticket_id.as_str());
+async fn run_prompt_turn(
+    connection: &ClientSideConnection,
+    session_id: &str,
+    prompt: &str,
+    shared: &SessionShared,
+    command_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
+) -> PromptTurnResult {
+    let start = Instant::now();
+    let prompt_future = connection.prompt(PromptRequest::new(
+        session_id.to_string(),
+        vec![ContentBlock::from(prompt.to_string())],
+    ));
+    tokio::pin!(prompt_future);
+
+    let mut shutdown_after = false;
+    let mut cancel_waiters: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+
+    loop {
+        tokio::select! {
+            result = &mut prompt_future => {
+                for reply in cancel_waiters {
+                    let _ = reply.send(Ok(()));
+                }
+
+                let (exit_code, error_summary) = match result {
+                    Ok(response) if response.stop_reason == StopReason::EndTurn => (0, None),
+                    Ok(response) => (
+                        130,
+                        Some(format!("Agent stopped with {:?}", response.stop_reason)),
+                    ),
+                    Err(err) => (
+                        1,
+                        Some(format!("ACP prompt failed: {}", err.message)),
+                    ),
+                };
+
+                let duration_ms = start.elapsed().as_millis() as i64;
+
+                return PromptTurnResult {
+                    duration_ms,
+                    exit_code,
+                    error_summary,
+                    shutdown_after,
+                };
+            }
+            maybe_command = command_rx.recv() => {
+                let Some(command) = maybe_command else {
+                    shutdown_after = true;
+                    let _ = connection
+                        .cancel(CancelNotification::new(session_id.to_string()))
+                        .await;
+                    continue;
+                };
+
+                match command {
+                    SessionCommand::StartTurn { reply, .. } => {
+                        let _ = reply.send(Err("A prompt is already running for this ticket".to_string()));
+                    }
+                    SessionCommand::CancelTurn { reply } => {
+                        match connection
+                            .cancel(CancelNotification::new(session_id.to_string()))
+                            .await
+                        {
+                            Ok(()) => cancel_waiters.push(reply),
+                            Err(err) => {
+                                let _ = reply.send(Err(format!("Failed to cancel prompt: {}", err.message)));
+                            }
+                        }
+                    }
+                    SessionCommand::Shutdown { reply } => {
+                        shutdown_after = true;
+                        let _ = connection
+                            .cancel(CancelNotification::new(session_id.to_string()))
+                            .await;
+                        if let Some(reply) = reply {
+                            cancel_waiters.push(reply);
+                        }
+                        shared.clear_pending_permission();
+                    }
+                    SessionCommand::Touch => {
+                        shared.mark_activity();
+                    }
+                }
+            }
         }
     }
 }
 
-async fn interrupt_run(ticket_id: &str, active_runs: &ActiveRuns) -> Result<(), String> {
-    let sender = {
-        let runs = active_runs
+fn get_session_handle(
+    active_sessions: &ActiveSessions,
+    ticket_id: &str,
+) -> Result<Option<ActiveSessionHandle>, String> {
+    let sessions = active_sessions
+        .0
+        .lock()
+        .map_err(|_| "Active session state is unavailable".to_string())?;
+    Ok(sessions.get(ticket_id).cloned())
+}
+
+async fn start_turn(
+    handle: &ActiveSessionHandle,
+    log_id: String,
+    prompt: String,
+) -> Result<(), String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .command_tx
+        .send(SessionCommand::StartTurn {
+            log_id,
+            prompt,
+            reply: reply_tx,
+        })
+        .map_err(|_| "Agent session is unavailable".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "Agent session did not acknowledge the prompt".to_string())?
+}
+
+async fn cancel_turn(handle: &ActiveSessionHandle) -> Result<(), String> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .command_tx
+        .send(SessionCommand::CancelTurn { reply: reply_tx })
+        .map_err(|_| "Agent session is unavailable".to_string())?;
+    reply_rx
+        .await
+        .map_err(|_| "Agent session did not confirm the cancellation".to_string())?
+}
+
+async fn touch_session(handle: &ActiveSessionHandle) -> Result<(), String> {
+    handle
+        .command_tx
+        .send(SessionCommand::Touch)
+        .map_err(|_| "Agent session is unavailable".to_string())
+}
+
+pub(crate) async fn shutdown_ticket_session(
+    active_sessions: &ActiveSessions,
+    ticket_id: &str,
+) -> Result<(), String> {
+    let Some(handle) = get_session_handle(active_sessions, ticket_id)? else {
+        return Ok(());
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .command_tx
+        .send(SessionCommand::Shutdown { reply: Some(reply_tx) })
+        .map_err(|_| "Agent session is unavailable".to_string())?;
+    let _ = reply_rx
+        .await
+        .map_err(|_| "Agent session did not acknowledge shutdown".to_string())?;
+
+    for _ in 0..60 {
+        if get_session_handle(active_sessions, ticket_id)?.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    Err("Agent session did not shut down cleanly".to_string())
+}
+
+async fn shutdown_all_sessions(active_sessions: &ActiveSessions) -> Result<(), String> {
+    let ticket_ids = {
+        let sessions = active_sessions
             .0
             .lock()
-            .map_err(|_| "Active run state is unavailable".to_string())?;
-        runs.get(ticket_id).map(|handle| handle.cancel.clone())
+            .map_err(|_| "Active session state is unavailable".to_string())?;
+        sessions.keys().cloned().collect::<Vec<_>>()
     };
 
-    if let Some(cancel) = sender {
-        let _ = cancel.send(true);
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let still_running = active_runs
-                .0
-                .lock()
-                .map_err(|_| "Active run state is unavailable".to_string())?
-                .contains_key(ticket_id);
-            if !still_running {
-                return Ok(());
-            }
-        }
-        return Err("Timed out waiting for the agent to stop".to_string());
+    for ticket_id in ticket_ids {
+        let _ = shutdown_ticket_session(active_sessions, &ticket_id).await;
     }
 
     Ok(())
@@ -1113,6 +1773,26 @@ fn emit_acp_event(app: &AppHandle, ticket_id: &str, log_id: &str, item: &AcpEven
             "ticketId": ticket_id,
             "logId": log_id,
             "item": item,
+        }),
+    );
+}
+
+fn emit_session_state(app: &AppHandle, ticket_id: &str, state: Option<&AgentSessionState>) {
+    let _ = app.emit(
+        "agent:session-state",
+        serde_json::json!({
+            "ticketId": ticket_id,
+            "state": state,
+        }),
+    );
+}
+
+fn emit_log_change(app: &AppHandle, ticket_id: &str, log_id: &str) {
+    let _ = app.emit(
+        "agent:log-change",
+        serde_json::json!({
+            "ticketId": ticket_id,
+            "logId": log_id,
         }),
     );
 }
@@ -1187,6 +1867,7 @@ async fn finalize(
             "to": to_status,
         }),
     );
+    emit_log_change(app, ticket_id, log_id);
 }
 
 // ─── Agent Log Commands ───────────────────────────────────────────────────────

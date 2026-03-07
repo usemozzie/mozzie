@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use tauri::{AppHandle, Emitter, State};
+
+use crate::commands::agents::{shutdown_ticket_session, ActiveSessions};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorktreeInfo {
@@ -118,6 +120,28 @@ fn run_git_in_repo_output(repo_path: &str, args: &[&str]) -> Result<Output, Stri
     run_git_output(&full_args)
 }
 
+fn repo_has_commits(repo_path: &str) -> bool {
+    run_git_in_repo_output(repo_path, &["rev-parse", "--verify", "HEAD"])
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn current_branch_name(repo_path: &str) -> Result<RepoBranchInfo, String> {
+    if repo_has_commits(repo_path) {
+        let branch_name = run_git(&["-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD"])?;
+        return Ok(RepoBranchInfo {
+            detached: branch_name == "HEAD",
+            branch_name,
+        });
+    }
+
+    let branch_name = run_git(&["-C", repo_path, "symbolic-ref", "--short", "HEAD"])?;
+    Ok(RepoBranchInfo {
+        branch_name,
+        detached: false,
+    })
+}
+
 fn now_iso() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -216,15 +240,61 @@ fn get_diff_internal(worktree_path: &str, source_branch: Option<&str>) -> Result
         if !diff.is_empty() {
             diff.push_str("\n\n");
         }
-        diff.push_str("Untracked files pending commit:\n");
-        for path in untracked.lines() {
-            diff.push_str("  + ");
-            diff.push_str(path);
-            diff.push('\n');
+        let mut rendered_untracked = Vec::new();
+
+        for path in untracked.lines().filter(|line| !line.trim().is_empty()) {
+            rendered_untracked.push(render_untracked_file_diff(worktree_path, path)?);
         }
+
+        diff.push_str(&rendered_untracked.join("\n\n"));
     }
 
     Ok(diff)
+}
+
+fn render_untracked_file_diff(worktree_path: &str, relative_path: &str) -> Result<String, String> {
+    let file_path = Path::new(worktree_path).join(relative_path);
+    let output = std::process::Command::new("git")
+        .current_dir(worktree_path)
+        .args(["diff", "--no-index", "--no-ext-diff", "--find-renames", "--", "/dev/null"])
+        .arg(&file_path)
+        .output()
+        .map_err(|err| format!("Failed to render diff for untracked file {relative_path}: {err}"))?;
+
+    match output.status.code() {
+        Some(0) | Some(1) => {}
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!(
+                "git error while rendering diff for untracked file {relative_path}: {stderr}"
+            ));
+        }
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(normalize_no_index_diff_paths(&stdout, relative_path))
+}
+
+fn normalize_no_index_diff_paths(diff: &str, relative_path: &str) -> String {
+    let normalized = relative_path.replace('\\', "/");
+    let full_new_path = format!("b/{normalized}");
+
+    diff.lines()
+        .map(|line| {
+            if line.starts_with("diff --git ") {
+                format!("diff --git a/{normalized} {full_new_path}")
+            } else if line.starts_with("--- ") {
+                format!("--- /dev/null")
+            } else if line.starts_with("+++ ") {
+                format!("+++ {full_new_path}")
+            } else if line.starts_with("Binary files ") {
+                format!("Binary files /dev/null and {full_new_path} differ")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn commit_pending_changes(worktree_path: &str, branch_name: &str) -> Result<bool, String> {
@@ -406,6 +476,13 @@ pub async fn create_worktree(
     source_branch: Option<String>,
     branch_name: Option<String>,
 ) -> Result<WorktreeInfo, String> {
+    if !repo_has_commits(&repo_path) {
+        return Err(
+            "Repository has no commits yet. Create an initial commit in that repo, then run the ticket again."
+                .to_string(),
+        );
+    }
+
     let branch_name = match branch_name {
         Some(b) if !b.trim().is_empty() => {
             let name = b.trim().to_string();
@@ -493,6 +570,7 @@ pub async fn get_ticket_review_state(
 pub async fn approve_ticket_review(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
     ticket_id: String,
 ) -> Result<(), String> {
     let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
@@ -501,6 +579,8 @@ pub async fn approve_ticket_review(
     let worktree_path = ticket.worktree_path.as_deref().ok_or("Ticket has no worktree_path")?;
     let source_branch = ticket.source_branch.as_deref().ok_or("Ticket has no source_branch")?;
     let branch_name = ticket.branch_name.as_deref().ok_or("Ticket has no branch_name")?;
+
+    let _ = shutdown_ticket_session(active_sessions.inner(), &ticket_id).await;
 
     if !source_branch_exists(repo_path, source_branch) {
         return Err(format!(
@@ -567,10 +647,13 @@ pub async fn approve_ticket_review(
 pub async fn reject_ticket_review(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
     ticket_id: String,
 ) -> Result<(), String> {
     let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
     let from_status = ticket.status.clone();
+
+    let _ = shutdown_ticket_session(active_sessions.inner(), &ticket_id).await;
 
     if let (Some(repo_path), Some(worktree_path), Some(branch_name)) = (
         ticket.repo_path.as_deref(),
@@ -612,11 +695,14 @@ pub async fn reject_ticket_review(
 pub async fn close_ticket_review(
     app: AppHandle,
     db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
     ticket_id: String,
 ) -> Result<(), String> {
     let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
     let from_status = ticket.status.clone();
     let now = now_iso();
+
+    let _ = shutdown_ticket_session(active_sessions.inner(), &ticket_id).await;
 
     sqlx::query(
         r#"UPDATE tickets SET
@@ -646,13 +732,7 @@ pub async fn close_ticket_review(
 
 #[tauri::command]
 pub async fn get_repo_branch(repo_path: String) -> Result<RepoBranchInfo, String> {
-    let branch_name = run_git(&["-C", &repo_path, "rev-parse", "--abbrev-ref", "HEAD"])?;
-    let detached = branch_name == "HEAD";
-
-    Ok(RepoBranchInfo {
-        branch_name,
-        detached,
-    })
+    current_branch_name(&repo_path)
 }
 
 #[tauri::command]

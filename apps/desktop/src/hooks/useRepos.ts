@@ -28,3 +28,11 @@ export function useRemoveRepo() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['repos'] }),
   });
 }
+
+export function usePrepareRepo() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => invoke<Repo>('prepare_repo', { id }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['repos'] }),
+  });
+}

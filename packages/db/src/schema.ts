@@ -74,6 +74,7 @@ export interface Repo {
   name: string;
   path: string;
   default_branch: string | null;
+  needs_prepare: boolean;
   last_used_at: string | null;
   workspace_id: string;
   created_at: string;
@@ -100,6 +101,23 @@ export interface TicketDependency {
   created_at: string;
 }
 
+export type AttemptOutcome = 'approved' | 'rejected' | 'error' | 'timeout';
+
+export interface TicketAttempt {
+  id: string;
+  ticket_id: string;
+  attempt_number: number;
+  agent_id: string;
+  agent_log_id: string | null;
+  outcome: AttemptOutcome;
+  rejection_reason: string | null;
+  files_changed: string | null;
+  diff_summary: string | null;
+  duration_ms: number | null;
+  exit_code: number | null;
+  created_at: string;
+}
+
 export interface AgentConfig {
   id: string;
   display_name: string;
@@ -116,4 +134,38 @@ export interface AgentConfig {
   reasoning_class: string | null;
   speed_class: string | null;
   edit_reliability: string | null;
+}
+
+export type AgentPermissionPolicy =
+  | 'ask'
+  | 'allow_once'
+  | 'allow_always'
+  | 'reject_once'
+  | 'reject_always';
+
+export interface AgentPermissionOption {
+  option_id: string;
+  name: string;
+  kind: string;
+}
+
+export interface AgentPermissionRequest {
+  request_id: string;
+  tool_title: string | null;
+  tool_kind: string | null;
+  tool_input: string | null;
+  options: AgentPermissionOption[];
+  created_at: string;
+}
+
+export interface AgentSessionState {
+  ticket_id: string;
+  agent_id: string;
+  session_id: string;
+  is_running: boolean;
+  opened_at: string;
+  last_activity_at: string;
+  idle_deadline_at: string;
+  permission_policy: AgentPermissionPolicy;
+  pending_permission: AgentPermissionRequest | null;
 }

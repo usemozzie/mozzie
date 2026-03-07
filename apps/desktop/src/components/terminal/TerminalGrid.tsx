@@ -1,23 +1,34 @@
-import { useEffect, useState } from 'react';
-import { Loader2, X, Check, ChevronRight, Maximize2, Minimize2, Copy, Bot, Clock } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { useEffect, useMemo, useState } from 'react';
+import { Loader2, X, ChevronRight, Maximize2, Minimize2, Plus, ArrowUp, ChevronDown, Square } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { AcpEventItem, Ticket } from '@mozzie/db';
+import type { AcpEventItem, AgentPermissionPolicy, Ticket } from '@mozzie/db';
 import { useTerminalStore } from '../../stores/terminalStore';
 import { useTicketStore } from '../../stores/ticketStore';
 import { useTicket } from '../../hooks/useTickets';
 import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutation';
 import { useAcpRun } from '../../hooks/useAcpRun';
-import { useAgentLogs, useContinueAgent, useInterruptAgent } from '../../hooks/useAgents';
+import {
+  useAgentLogs,
+  useAgentSession,
+  useCancelAgentTurn,
+  useContinueAgent,
+  useRespondToAgentPermission,
+  useSetAgentPermissionPolicy,
+  useStopAgentSession,
+} from '../../hooks/useAgents';
+import { useTicketAttempts } from '../../hooks/useAttemptHistory';
 import { useReview } from '../../hooks/useReview';
 import { useApproveTicketReview, useRejectTicketReview, useCloseTicketReview } from '../../hooks/useWorktree';
+import { useRecordAttempt } from '../../hooks/useAttemptHistory';
+import { getAgentCliCommands } from '../../lib/agentCliCommands';
 import { AGENT_OPTIONS } from '../../lib/agentOptions';
 import { getTicketColor } from '../../lib/ticketColors';
 import { StatusBadge } from '../ui/badge';
-import { Button } from '../ui/button';
-import { Select } from '../ui/select';
 import { ReviewPanel } from '../review/ReviewPanel';
+import { AtReferenceTextarea, type SlashCommandOption } from '../tickets/AtReferenceTextarea';
+
+type PanelTab = 'agent' | 'changes' | 'description';
 
 function getColCount(count: number): number {
   if (count <= 1) return 1;
@@ -31,20 +42,29 @@ export function TerminalGrid() {
   const activeSlots = useTerminalStore((s) => s.activeSlots);
   const selectedTicketIds = useTicketStore((s) => s.selectedTicketIds);
   const [focusedTicketId, setFocusedTicketId] = useState<string | null>(null);
+  const [panelTabs, setPanelTabs] = useState<Record<string, PanelTab>>({});
 
-  const activeEntries = Array.from(activeSlots.entries());
-  const selectedEntries = selectedTicketIds.map((ticketId, index) => ({
-    ticketId,
-    colorIndex: index,
-    slot: activeEntries.find(([, activeTicketId]) => activeTicketId === ticketId)?.[0],
-  }));
-  const fallbackEntries = activeEntries
-    .filter(([, ticketId]) => !selectedTicketIds.includes(ticketId))
-    .map(([slot, ticketId], index) => ({
-      slot,
-      ticketId,
-      colorIndex: selectedEntries.length + index,
-    }));
+  const activeEntries = useMemo(() => Array.from(activeSlots.entries()), [activeSlots]);
+  const selectedEntries = useMemo(
+    () =>
+      selectedTicketIds.map((ticketId, index) => ({
+        ticketId,
+        colorIndex: index,
+        slot: activeEntries.find(([, activeTicketId]) => activeTicketId === ticketId)?.[0],
+      })),
+    [activeEntries, selectedTicketIds],
+  );
+  const fallbackEntries = useMemo(
+    () =>
+      activeEntries
+        .filter(([, ticketId]) => !selectedTicketIds.includes(ticketId))
+        .map(([slot, ticketId], index) => ({
+          slot,
+          ticketId,
+          colorIndex: selectedEntries.length + index,
+        })),
+    [activeEntries, selectedEntries.length, selectedTicketIds],
+  );
   const panelEntries = selectedEntries.length > 0 ? selectedEntries : fallbackEntries;
   const count = panelEntries.length;
 
@@ -80,6 +100,12 @@ export function TerminalGrid() {
           ticketId={focused.ticketId}
           slot={focused.slot}
           colorIndex={focused.colorIndex}
+          activeTab={panelTabs[focused.ticketId] ?? 'agent'}
+          onActiveTabChange={(tab) =>
+            setPanelTabs((current) =>
+              current[focused.ticketId] === tab ? current : { ...current, [focused.ticketId]: tab },
+            )
+          }
           isFocused={true}
           hotkeyEnabled
           onToggleFocus={() => setFocusedTicketId(null)}
@@ -118,6 +144,12 @@ export function TerminalGrid() {
           ticketId={ticketId}
           slot={slot}
           colorIndex={colorIndex}
+          activeTab={panelTabs[ticketId] ?? 'agent'}
+          onActiveTabChange={(tab) =>
+            setPanelTabs((current) =>
+              current[ticketId] === tab ? current : { ...current, [ticketId]: tab },
+            )
+          }
           isFocused={false}
           hotkeyEnabled={count === 1}
           onToggleFocus={() => setFocusedTicketId(count > 1 ? ticketId : null)}
@@ -220,18 +252,68 @@ function ActivityBar({ items, isRunning }: { items: AcpEventItem[]; isRunning: b
   );
 }
 
+function extractReferencedFiles(text: string): string[] {
+  const matches = text.matchAll(/(^|[\s([{\n])@([A-Za-z0-9_./\\-]+)/g);
+  const seen = new Set<string>();
+  const files: string[] = [];
+
+  for (const match of matches) {
+    const value = match[2];
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    files.push(value);
+  }
+
+  return files;
+}
+
+function extractSlashCommand(text: string, commands: SlashCommandOption[]): string | null {
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith('/')) {
+    return null;
+  }
+
+  const firstLine = trimmed.slice(1).split('\n')[0]?.trim() ?? '';
+  if (!firstLine) {
+    return null;
+  }
+
+  const normalized = firstLine.toLowerCase();
+  const command = [...commands]
+    .sort((left, right) => right.command.length - left.command.length)
+    .find(({ command }) => {
+      const candidate = command.toLowerCase();
+      return normalized === candidate || normalized.startsWith(`${candidate} `);
+    });
+
+  return command?.command ?? null;
+}
+
 // ---- Main interaction panel ----
 
 interface TicketInteractionPanelProps {
   ticketId: string;
   slot?: number;
   colorIndex: number;
+  activeTab: PanelTab;
+  onActiveTabChange: (tab: PanelTab) => void;
   isFocused: boolean;
   hotkeyEnabled: boolean;
   onToggleFocus: () => void;
 }
 
-function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyEnabled, onToggleFocus }: TicketInteractionPanelProps) {
+function TicketInteractionPanel({
+  ticketId,
+  slot,
+  colorIndex,
+  activeTab,
+  onActiveTabChange,
+  isFocused,
+  hotkeyEnabled,
+  onToggleFocus,
+}: TicketInteractionPanelProps) {
   const releaseSlot = useTerminalStore((s) => s.releaseSlot);
   const getNextAvailableSlot = useTerminalStore((s) => s.getNextAvailableSlot);
   const transitionTicket = useTransitionTicket();
@@ -239,45 +321,86 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
   const approveReview = useApproveTicketReview();
   const rejectReview = useRejectTicketReview();
   const closeReview = useCloseTicketReview();
+  const recordAttempt = useRecordAttempt();
   const continueAgent = useContinueAgent();
-  const interruptAgent = useInterruptAgent();
+  const cancelAgentTurn = useCancelAgentTurn();
+  const stopAgentSession = useStopAgentSession();
+  const setAgentPermissionPolicy = useSetAgentPermissionPolicy();
+  const respondToAgentPermission = useRespondToAgentPermission();
   const { data: ticket, isLoading } = useTicket(ticketId);
   const [isMutating, setIsMutating] = useState(false);
-  const [activeTab, setActiveTab] = useState<'ticket' | 'agent' | 'review'>('agent');
   const [chatMessage, setChatMessage] = useState('');
   const [chatError, setChatError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
   const [isUpdatingAgent, setIsUpdatingAgent] = useState(false);
+  const [permissionPolicy, setPermissionPolicy] = useState<AgentPermissionPolicy>('allow_once');
   const liveItems = useAcpRun(ticketId);
+  const { data: session } = useAgentSession(ticketId);
   const { data: logs } = useAgentLogs(ticketId);
   const latestLog = logs?.[0] ?? null;
 
-  const persistedItems: AcpEventItem[] = latestLog?.messages
-    ? tryParse<AcpEventItem[]>(latestLog.messages, [])
-    : [];
-  const seenIds = new Set(liveItems.map((i) => i.id));
-  const mergedItems = [
-    ...persistedItems.filter((i) => !seenIds.has(i.id)),
-    ...liveItems,
-  ];
+  const persistedItems = useMemo<AcpEventItem[]>(
+    () =>
+      [...(logs ?? [])]
+        .sort((left, right) => left.created_at.localeCompare(right.created_at))
+        .flatMap((log) => (log.messages ? tryParse<AcpEventItem[]>(log.messages, []) : [])),
+    [logs],
+  );
+  const mergedItems = useMemo(() => {
+    const seenIds = new Set<string>();
+    const merged: AcpEventItem[] = [];
+    for (const item of [...persistedItems, ...liveItems]) {
+      if (seenIds.has(item.id)) {
+        continue;
+      }
+      seenIds.add(item.id);
+      merged.push(item);
+    }
+    return merged;
+  }, [liveItems, persistedItems]);
+  const segments = useMemo(() => groupIntoSegments(mergedItems), [mergedItems]);
 
-  const review = useReview(ticket);
+  const review = useReview(ticket, activeTab === 'changes' || ticket?.status === 'review');
+  const { data: attempts } = useTicketAttempts(ticketId);
+  const attemptCount = attempts?.length ?? 0;
   const accent = getTicketColor(colorIndex);
-  const canShowReview = !!ticket;
-  const canContinueConversation = !!(
+  const sessionIsRunning = session?.is_running ?? ticket?.status === 'running';
+  const hasOpenSession = !!session;
+  const pendingPermission = session?.pending_permission ?? null;
+  const slashCommands = useMemo(
+    () => getAgentCliCommands(ticket?.assigned_agent),
+    [ticket?.assigned_agent],
+  );
+  const referencedFiles = useMemo(() => extractReferencedFiles(chatMessage), [chatMessage]);
+  const activeSlashCommand = useMemo(
+    () => extractSlashCommand(chatMessage, slashCommands),
+    [chatMessage, slashCommands],
+  );
+  const visibleReferencedFiles = referencedFiles.slice(0, 3);
+  const hiddenReferenceCount = referencedFiles.length - visibleReferencedFiles.length;
+  const canChat = !!(
     ticket &&
     ticket.assigned_agent &&
-    review.review?.can_continue &&
+    ticket.worktree_path &&
     ticket.status !== 'done' &&
     ticket.status !== 'archived'
   );
+  const composerDisabled = isMutating || !canChat || !!pendingPermission;
+  const canSendMessage = !!chatMessage.trim() && !composerDisabled;
+  const showStopTurnButton = sessionIsRunning && !chatMessage.trim();
 
   useEffect(() => {
-    if (review.review?.has_changes) {
-      setActiveTab('review');
+    if (session?.permission_policy) {
+      setPermissionPolicy(session.permission_policy);
     }
-  }, [review.review?.has_changes]);
+  }, [session?.permission_policy]);
+
+  useEffect(() => {
+    if (review.review?.has_changes && activeTab === 'agent') {
+      onActiveTabChange('changes');
+    }
+  }, [activeTab, onActiveTabChange, review.review?.has_changes]);
 
   useEffect(() => {
     if (!ticket || !hotkeyEnabled || ticket.status !== 'running') return;
@@ -300,18 +423,73 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
     setIsMutating(true);
     setActionError(null);
     try {
-      await interruptAgent.mutateAsync(ticket.id);
+      await stopAgentSession.mutateAsync(ticket.id);
       if (slot != null) {
         releaseSlot(slot);
       }
-      await updateTicket.mutateAsync({ id: ticketId, fields: { terminal_slot: null } });
+      if (ticket.terminal_slot != null) {
+        await updateTicket.mutateAsync({ id: ticketId, fields: { terminal_slot: null } });
+      }
       if (ticket.status === 'running') {
-        await transitionTicket.mutateAsync({ id: ticketId, toStatus: 'ready' });
+        try {
+          await transitionTicket.mutateAsync({ id: ticketId, toStatus: 'ready' });
+        } catch (error) {
+          if (!String(error).includes('Invalid transition: ready')) {
+            throw error;
+          }
+        }
       }
     } catch (error) {
       setActionError(String(error));
     } finally {
       setIsMutating(false);
+    }
+  }
+
+  async function handleStopTurn() {
+    if (!ticket) return;
+    setIsMutating(true);
+    setActionError(null);
+    try {
+      await cancelAgentTurn.mutateAsync(ticket.id);
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handlePermissionPolicyChange(nextPolicy: AgentPermissionPolicy) {
+    const previousPolicy = session?.permission_policy ?? permissionPolicy;
+    setPermissionPolicy(nextPolicy);
+
+    if (!ticket || !session) {
+      return;
+    }
+
+    setActionError(null);
+    try {
+      await setAgentPermissionPolicy.mutateAsync({
+        ticketId: ticket.id,
+        policy: nextPolicy,
+      });
+    } catch (error) {
+      setPermissionPolicy(previousPolicy);
+      setActionError(String(error));
+    }
+  }
+
+  async function handlePermissionDecision(optionId: string | null) {
+    if (!ticket || !pendingPermission) return;
+    setActionError(null);
+    try {
+      await respondToAgentPermission.mutateAsync({
+        ticketId: ticket.id,
+        requestId: pendingPermission.request_id,
+        optionId,
+      });
+    } catch (error) {
+      setActionError(String(error));
     }
   }
 
@@ -320,6 +498,14 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
     setIsMutating(true);
     setActionError(null);
     try {
+      await recordAttempt.mutateAsync({
+        ticketId: ticket.id,
+        agentId: ticket.assigned_agent ?? 'unknown',
+        agentLogId: latestLog?.id ?? null,
+        outcome: 'approved',
+        durationMs: latestLog?.duration_ms ?? null,
+        exitCode: latestLog?.exit_code ?? null,
+      });
       await approveReview.mutateAsync(ticket.id);
     } catch (error) {
       setActionError(String(error));
@@ -328,11 +514,20 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
     }
   }
 
-  async function handleReject() {
+  async function handleReject(rejectionReason?: string) {
     if (!ticket) return;
     setIsMutating(true);
     setActionError(null);
     try {
+      await recordAttempt.mutateAsync({
+        ticketId: ticket.id,
+        agentId: ticket.assigned_agent ?? 'unknown',
+        agentLogId: latestLog?.id ?? null,
+        outcome: 'rejected',
+        rejectionReason: rejectionReason || null,
+        durationMs: latestLog?.duration_ms ?? null,
+        exitCode: latestLog?.exit_code ?? null,
+      });
       await rejectReview.mutateAsync(ticket.id);
     } catch (error) {
       setActionError(String(error));
@@ -355,9 +550,27 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
   }
 
   async function handleSendMessage() {
-    if (!ticket || !canContinueConversation) return;
+    if (!ticket) return;
     const message = chatMessage.trim();
-    if (!message) { setChatError('Enter a follow-up message.'); return; }
+    if (!message) {
+      setChatError('Enter a follow-up message.');
+      return;
+    }
+
+    if (!ticket.assigned_agent) {
+      setChatError('Assign an agent first.');
+      return;
+    }
+
+    if (!ticket.worktree_path) {
+      setChatError('Create a worktree before continuing this ticket.');
+      return;
+    }
+
+    if (ticket.status === 'done' || ticket.status === 'archived') {
+      setChatError('Closed tickets cannot accept more agent turns.');
+      return;
+    }
 
     const nextSlot = slot ?? getNextAvailableSlot();
     if (nextSlot == null) {
@@ -377,9 +590,14 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
       if (ticket.status !== 'running') {
         await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'running' });
       }
-      await continueAgent.mutateAsync({ ticketId: ticket.id, slot: nextSlot, message });
+      await continueAgent.mutateAsync({
+        ticketId: ticket.id,
+        slot: nextSlot,
+        message,
+        permissionPolicy,
+      });
       setChatMessage('');
-      setActiveTab('agent');
+      onActiveTabChange('agent');
     } catch (error) {
       if (ticket.terminal_slot == null) {
         releaseSlot(nextSlot);
@@ -397,7 +615,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
   }
 
   async function handleAgentChange(nextAgent: string) {
-    if (!ticket || ticket.status === 'running') return;
+    if (!ticket) return;
     setAgentError(null);
     setIsUpdatingAgent(true);
     try {
@@ -434,10 +652,14 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
           className="w-2 h-2 rounded-full shrink-0"
           style={{ backgroundColor: accent }}
         />
-        <StatusBadge status={ticket.status} />
         {/* Title — bold, high contrast */}
         <span className="text-[13px] text-text truncate flex-1 font-semibold">{ticket.title}</span>
         {/* Meta — dimmed */}
+        {attemptCount > 0 && (
+          <span className="text-[10px] font-mono text-amber-400/80 shrink-0 bg-amber-500/[0.08] px-1.5 py-0.5 rounded-md border border-amber-500/[0.12]">
+            Attempt {attemptCount + 1}
+          </span>
+        )}
         {ticket.assigned_agent && (
           <span className="text-[10px] font-mono text-text-dim shrink-0 bg-white/[0.04] px-1.5 py-0.5 rounded-md border border-white/[0.05]">
             {ticket.assigned_agent}
@@ -454,11 +676,11 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
         >
           {isFocused ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
         </button>
-        {ticket.status === 'running' && slot != null && (
+        {hasOpenSession && (
           <button
             onClick={handleAbort}
             disabled={isMutating}
-            title="Abort and return to ready"
+            title={sessionIsRunning ? 'Stop session and return ticket to ready' : 'Close agent session'}
             className="shrink-0 w-5 h-5 flex items-center justify-center rounded text-text-dim hover:text-state-danger hover:bg-state-danger/10 transition-all duration-150 disabled:opacity-40"
           >
             {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
@@ -469,7 +691,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
       {/* Activity bar — sparkline compressed view of tool usage */}
       {mergedItems.length > 0 && (
         <div className="shrink-0 px-3 py-1.5 bg-surface border-b border-border">
-          <ActivityBar items={mergedItems} isRunning={ticket.status === 'running'} />
+          <ActivityBar items={mergedItems} isRunning={sessionIsRunning} />
         </div>
       )}
 
@@ -479,13 +701,13 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
         </div>
       )}
 
-      {/* Tab bar */}
-      <div className="shrink-0 px-3 border-b border-border bg-surface flex gap-0">
+      {/* Tab bar + inline meta badges */}
+      <div className="shrink-0 px-3 border-b border-border bg-surface flex items-center gap-0">
         {(
           [
-            { id: 'ticket', label: 'Ticket', disabled: false },
-            { id: 'agent',  label: 'Agent',  disabled: false },
-            { id: 'review', label: 'Review', disabled: false },
+            { id: 'agent',       label: 'Agent',       disabled: false },
+            { id: 'changes',     label: 'Changes',     disabled: false },
+            { id: 'description', label: 'Description', disabled: false },
           ] as const
         ).map(({ id, label, disabled }) => {
           const active = activeTab === id;
@@ -493,7 +715,7 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
             <button
               key={id}
               type="button"
-              onClick={() => !disabled && setActiveTab(id)}
+              onClick={() => !disabled && onActiveTabChange(id)}
               disabled={disabled}
               className={`relative px-3 py-2 text-[12px] font-medium transition-colors duration-150
                 ${active ? 'text-text' : 'text-text-dim hover:text-text-muted'}
@@ -509,78 +731,201 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
             </button>
           );
         })}
+        {/* Right-aligned inline badges */}
+        <div className="ml-auto flex items-center gap-2">
+          <StatusBadge status={ticket.status} />
+          {hasOpenSession && (
+            <span className="text-[10px] font-mono text-[#d4a087] bg-[#d4a087]/10 px-1.5 py-0.5 rounded-md border border-[#d4a087]/20">
+              {sessionIsRunning ? 'session: active' : 'session: open'}
+            </span>
+          )}
+          {ticket.repo_path && (
+            <span className="text-[10px] font-mono text-text-dim bg-white/[0.04] px-1.5 py-0.5 rounded-md border border-white/[0.05] truncate max-w-[140px]" title={ticket.repo_path}>
+              {ticket.repo_path.split(/[/\\]/).pop() ?? ticket.repo_path}
+            </span>
+          )}
+        </div>
       </div>
 
-      {activeTab === 'ticket' ? (
-        <TicketInfoTab
-          ticket={ticket}
-          onAgentChange={handleAgentChange}
-          onTransition={async (toStatus) => {
-            setIsMutating(true);
-            setActionError(null);
-            try {
-              await transitionTicket.mutateAsync({ id: ticket.id, toStatus: toStatus as any });
-            } catch (error) {
-              setActionError(String(error));
-            } finally {
-              setIsMutating(false);
-            }
-          }}
-          isMutating={isMutating}
-          agentError={agentError}
-          isUpdatingAgent={isUpdatingAgent}
-        />
-      ) : activeTab === 'agent' ? (
+      {activeTab === 'agent' ? (
         <>
           {/* Agent output */}
           <div className="flex-1 min-h-0 overflow-auto p-3 font-mono text-[12px] leading-[1.6]">
             {mergedItems.length === 0 ? (
               <div className="text-text-dim italic mt-1 text-[12px]">
-                {ticket.status === 'running' ? 'Waiting for agent response...' : 'No output recorded.'}
+                {sessionIsRunning ? 'Waiting for agent response...' : 'No output recorded.'}
               </div>
             ) : (
-              groupIntoSegments(mergedItems).map((seg) =>
+              segments.map((seg) =>
                 seg.kind === 'tools'
                   ? <ToolGroupRow key={seg.id} items={seg.items} />
                   : <TextSegmentRow key={seg.id} items={seg.items} />
               )
             )}
-            {ticket.status === 'running' && mergedItems.length > 0 && (
+            {sessionIsRunning && mergedItems.length > 0 && (
               <span className="text-text-dim cursor-blink ml-0.5">|</span>
             )}
           </div>
 
           {/* Chat input */}
-          <div className="shrink-0 border-t border-border bg-surface p-3">
+          <div className="shrink-0 px-3 pb-3">
             {chatError && (
-              <div className="mb-2 text-[11px] text-red-400">{chatError}</div>
+              <div className="pb-2 text-[11px] text-red-400">{chatError}</div>
             )}
-            <textarea
-              value={chatMessage}
-              onChange={(e) => { setChatMessage(e.target.value); setChatError(null); }}
-              placeholder={
-                canContinueConversation
-                  ? ticket.status === 'running'
-                    ? 'Send a follow-up. The current run will be interrupted first...'
-                    : 'Ask the agent to refine, fix, or continue...'
-                  : ticket.status === 'running'
-                    ? 'Interrupt the run to send a follow-up...'
-                    : 'This ticket cannot accept follow-up messages.'
-              }
-              disabled={!canContinueConversation || isMutating}
-              rows={3}
-              className="w-full resize-none rounded-lg border border-border bg-bg px-3 py-2 text-[13px] text-text
-                placeholder:text-text-dim focus:outline-none focus:border-accent/50
-                disabled:opacity-40 transition-colors duration-150 leading-relaxed"
-            />
-            <div className="mt-2 flex justify-end">
-              <Button size="sm" onClick={handleSendMessage} disabled={!canContinueConversation || isMutating}>
-                {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : ticket.status === 'running' ? 'Interrupt & Send' : 'Send'}
-              </Button>
-            </div>
+            {pendingPermission && (
+              <div className="mb-2 rounded-xl border border-[#d4a087]/20 bg-[#d4a087]/8 px-3 py-3">
+                <div className="text-[11px] font-medium text-[#f2c6b1]">Permission required</div>
+                <div className="mt-1 text-[12px] text-text">
+                  {pendingPermission.tool_title ?? pendingPermission.tool_kind ?? 'Tool request'}
+                </div>
+                {pendingPermission.tool_input && (
+                  <pre className="mt-2 max-h-32 overflow-auto rounded-lg bg-black/20 px-2 py-2 text-[10px] text-text-dim whitespace-pre-wrap break-all">
+                    {pendingPermission.tool_input}
+                  </pre>
+                )}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {pendingPermission.options.map((option) => (
+                    <button
+                      key={option.option_id}
+                      type="button"
+                      onClick={() => void handlePermissionDecision(option.option_id)}
+                      className="rounded-lg border border-white/[0.08] bg-white/[0.05] px-2.5 py-1.5 text-[11px] text-text hover:bg-white/[0.08] transition-colors"
+                    >
+                      {option.name}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => void handlePermissionDecision(null)}
+                    className="rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-300 hover:bg-red-500/15 transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+            {agentError && (
+              <div className="pb-2 text-[11px] text-red-400">{agentError}</div>
+            )}
+              {/* Active references / slash command pills */}
+              {(activeSlashCommand || referencedFiles.length > 0) && (
+                <div className="flex flex-wrap items-center gap-1.5 pb-2">
+                  {activeSlashCommand && (
+                    <span className="rounded-full border border-[#d4a087]/25 bg-[#d4a087]/10 px-2.5 py-0.5 text-[10px] font-medium text-[#f2c6b1]">
+                      /{activeSlashCommand}
+                    </span>
+                  )}
+                  {visibleReferencedFiles.map((file) => (
+                    <span
+                      key={file}
+                      className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2.5 py-0.5 text-[10px] font-mono text-sky-200"
+                      title={file}
+                    >
+                      @{file}
+                    </span>
+                  ))}
+                  {hiddenReferenceCount > 0 && (
+                    <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-2.5 py-0.5 text-[10px] text-text-dim">
+                      +{hiddenReferenceCount} more
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Input container — matches FloatingCommandBar style */}
+              <div className="bg-surface border border-border rounded-2xl">
+                <AtReferenceTextarea
+                  value={chatMessage}
+                  onChange={(nextValue) => {
+                    setChatMessage(nextValue);
+                    setChatError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      void handleSendMessage();
+                    }
+                  }}
+                  repoPath={ticket.worktree_path ?? ticket.repo_path ?? ''}
+                  slashCommands={slashCommands}
+                  placeholder={
+                    pendingPermission
+                      ? 'Resolve the permission request to continue...'
+                      : sessionIsRunning
+                        ? 'Reply...'
+                        : canChat
+                          ? 'Reply...'
+                          : 'Assign an agent and create a worktree to continue...'
+                  }
+                  disabled={composerDisabled}
+                  rows={2}
+                  autosize
+                  maxRows={6}
+                  className="min-h-[60px] w-full resize-none border-0 bg-transparent px-5 pt-4 pb-0 text-[15px] text-text
+                    placeholder:text-text-dim/30 focus:border-transparent focus:outline-none focus:ring-0
+                    disabled:opacity-40 transition-colors leading-normal shadow-none"
+                />
+
+                {/* Bottom row — 3 elements: +, agent selector, send */}
+                <div className="flex items-center px-4 pb-3 pt-1">
+                  <button
+                    className="text-text-dim/40 hover:text-text-dim transition-colors"
+                    title="Attach context (@files, /commands)"
+                  >
+                    <Plus className="w-5 h-5" />
+                  </button>
+
+                  <div className="flex-1" />
+
+                  <div className="flex items-center gap-1">
+                    <PermissionPolicyDropdown
+                      currentPolicy={permissionPolicy}
+                      onPolicyChange={handlePermissionPolicyChange}
+                      disabled={isMutating}
+                    />
+                    <AgentSelectorDropdown
+                      currentAgent={ticket.assigned_agent ?? ''}
+                      onAgentChange={handleAgentChange}
+                      disabled={isUpdatingAgent}
+                    />
+                  </div>
+
+                  {showStopTurnButton ? (
+                    <button
+                      onClick={() => void handleStopTurn()}
+                      disabled={isMutating}
+                      className="ml-3 w-8 h-8 flex items-center justify-center rounded-full
+                        border border-red-500/30 bg-red-500/15 text-red-300
+                        hover:bg-red-500/25 hover:text-red-200
+                        disabled:cursor-not-allowed disabled:opacity-30 transition-all"
+                      title="Cancel current turn"
+                    >
+                      {isMutating ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Square className="h-3.5 w-3.5 fill-current" />
+                      )}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => void handleSendMessage()}
+                      disabled={!canSendMessage}
+                      className="ml-3 w-8 h-8 flex items-center justify-center rounded-full
+                        bg-accent text-white
+                        hover:bg-accent/80 disabled:opacity-20 disabled:cursor-not-allowed transition-all"
+                    >
+                      {isMutating ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <ArrowUp className="h-4 w-4 stroke-[2.5]" />
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
           </div>
         </>
-      ) : (
+      ) : activeTab === 'changes' ? (
         <ReviewPanel
           ticket={ticket}
           review={review.review}
@@ -593,12 +938,137 @@ function TicketInteractionPanel({ ticketId, slot, colorIndex, isFocused, hotkeyE
           isMutating={isMutating}
           actionError={actionError}
         />
+      ) : (
+        <DescriptionTab ticket={ticket} />
       )}
     </div>
   );
 }
 
-// ---- Ticket info tab ----
+// ---- Agent selector dropdown (orchestrator-style) ----
+
+function AgentSelectorDropdown({
+  currentAgent,
+  onAgentChange,
+  disabled,
+}: {
+  currentAgent: string;
+  onAgentChange: (agent: string) => void;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const activeOption = AGENT_OPTIONS.find((a) => a.value === currentAgent);
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => !disabled && setOpen((v) => !v)}
+        disabled={disabled}
+        className="flex items-center gap-1 px-2 py-1 rounded-lg text-text-dim hover:text-text hover:bg-white/[0.06] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        <span className="max-w-[180px] truncate text-[12px] font-medium text-text">
+          {activeOption?.label ?? 'Select agent...'}
+        </span>
+        <ChevronDown className="w-3 h-3 text-text-dim" />
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="absolute bottom-full right-0 mb-1 w-48 bg-surface border border-border rounded-lg shadow-xl shadow-black/40 py-1 z-20">
+            {AGENT_OPTIONS.map((opt) => {
+              const isActive = opt.value === currentAgent;
+              const color = AGENT_COLORS[opt.value] ?? '#64748B';
+              return (
+                <button
+                  key={opt.value}
+                  onClick={() => {
+                    onAgentChange(opt.value);
+                    setOpen(false);
+                  }}
+                  className={`w-full text-left px-3 py-2 text-[12px] transition-colors flex items-center gap-2
+                    ${isActive
+                      ? 'text-text bg-white/[0.04]'
+                      : 'text-text-dim hover:text-text hover:bg-white/[0.06]'
+                    }`}
+                >
+                  <span
+                    className="w-1.5 h-1.5 rounded-full shrink-0"
+                    style={{ backgroundColor: isActive ? color : `${color}60` }}
+                  />
+                  <span className="truncate font-medium">{opt.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+const PERMISSION_POLICY_OPTIONS: Array<{ value: AgentPermissionPolicy; label: string }> = [
+  { value: 'ask', label: 'Permissions: Ask' },
+  { value: 'allow_once', label: 'Permissions: Allow Once' },
+  { value: 'allow_always', label: 'Permissions: Allow Always' },
+  { value: 'reject_once', label: 'Permissions: Reject Once' },
+  { value: 'reject_always', label: 'Permissions: Reject Always' },
+];
+
+function PermissionPolicyDropdown({
+  currentPolicy,
+  onPolicyChange,
+  disabled,
+}: {
+  currentPolicy: AgentPermissionPolicy;
+  onPolicyChange: (policy: AgentPermissionPolicy) => void;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const activeOption = PERMISSION_POLICY_OPTIONS.find((option) => option.value === currentPolicy);
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => !disabled && setOpen((value) => !value)}
+        disabled={disabled}
+        className="flex items-center gap-1 px-2 py-1 rounded-lg text-text-dim hover:text-text hover:bg-white/[0.06] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        <span className="max-w-[170px] truncate text-[12px] font-medium text-text">
+          {activeOption?.label ?? 'Permissions'}
+        </span>
+        <ChevronDown className="w-3 h-3 text-text-dim" />
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="absolute bottom-full right-0 mb-1 w-52 bg-surface border border-border rounded-lg shadow-xl shadow-black/40 py-1 z-20">
+            {PERMISSION_POLICY_OPTIONS.map((option) => {
+              const isActive = option.value === currentPolicy;
+              return (
+                <button
+                  key={option.value}
+                  onClick={() => {
+                    onPolicyChange(option.value);
+                    setOpen(false);
+                  }}
+                  className={`w-full text-left px-3 py-2 text-[12px] transition-colors
+                    ${isActive
+                      ? 'text-text bg-white/[0.04]'
+                      : 'text-text-dim hover:text-text hover:bg-white/[0.06]'
+                    }`}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 const AGENT_COLORS: Record<string, string> = {
   'claude-code': '#D97706',
@@ -606,217 +1076,40 @@ const AGENT_COLORS: Record<string, string> = {
   'codex-cli': '#10B981',
 };
 
-function middleTruncate(path: string, maxLen = 40): string {
-  if (path.length <= maxLen) return path;
-  const keep = Math.floor((maxLen - 3) / 2);
-  return path.slice(0, keep) + '...' + path.slice(-keep);
+// ---- Description tab ----
+
+function DescriptionTab({ ticket }: { ticket: Ticket }) {
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
+      {/* Dates */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-text-dim">
+        <TimestampInline label="Created" date={ticket.created_at} />
+        <TimestampInline label="Updated" date={ticket.updated_at} />
+        {ticket.started_at && <TimestampInline label="Started" date={ticket.started_at} />}
+        {ticket.completed_at && <TimestampInline label="Completed" date={ticket.completed_at} />}
+      </div>
+
+      {/* Description */}
+      {ticket.context ? (
+        <div className="text-[13px] leading-[1.7] text-text-muted">
+          <MarkdownText content={ticket.context} />
+        </div>
+      ) : (
+        <p className="text-[12px] text-text-dim italic">No description provided.</p>
+      )}
+    </div>
+  );
 }
 
-function CopyableValue({ value, mono, truncateMiddle }: { value: string; mono?: boolean; truncateMiddle?: boolean }) {
-  const [copied, setCopied] = useState(false);
-
+function TimestampInline({ label, date }: { label: string; date: string }) {
   return (
-    <span className="group/copy inline-flex items-center gap-1 min-w-0">
-      <span
-        className={`${mono ? 'font-mono' : ''} text-text-muted ${truncateMiddle ? 'truncate' : ''}`}
-        title={value}
-      >
-        {truncateMiddle ? middleTruncate(value) : value}
-      </span>
-      <button
-        onClick={() => { navigator.clipboard.writeText(value); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
-        className="shrink-0 opacity-0 group-hover/copy:opacity-100 transition-opacity w-4 h-4 flex items-center justify-center rounded text-text-dim hover:text-text"
-        title="Copy"
-      >
-        {copied ? <Check className="w-2.5 h-2.5 text-state-success" /> : <Copy className="w-2.5 h-2.5" />}
-      </button>
+    <span>
+      <span className="text-text-dim/60">{label}: </span>
+      <span className="text-text-dim">{new Date(date).toLocaleString()}</span>
     </span>
   );
 }
 
-function TicketInfoTab({
-  ticket,
-  onAgentChange,
-  onTransition,
-  isMutating,
-  agentError,
-  isUpdatingAgent,
-}: {
-  ticket: Ticket;
-  onAgentChange: (agent: string) => void;
-  onTransition: (toStatus: string) => void;
-  isMutating: boolean;
-  agentError: string | null;
-  isUpdatingAgent: boolean;
-}) {
-  const agentLabel = AGENT_OPTIONS.find((a) => a.value === ticket.assigned_agent)?.label ?? ticket.assigned_agent;
-  const agentColor = AGENT_COLORS[ticket.assigned_agent ?? ''] ?? '#64748B';
-  const hasTechMeta = !!(ticket.repo_path || ticket.source_branch || ticket.branch_name || ticket.worktree_path || ticket.terminal_slot != null);
-
-  return (
-    <div className="flex-1 min-h-0 overflow-y-auto">
-      {/* Hero Header */}
-      <div className="px-5 pt-4 pb-3 border-b border-border bg-surface/50">
-        <div className="flex items-start justify-between gap-3">
-          <h2 className="text-[15px] font-semibold text-text leading-snug flex-1 min-w-0">
-            {ticket.title || <span className="italic text-text-dim">Untitled</span>}
-          </h2>
-          <div className="flex items-center gap-2 shrink-0 pt-0.5">
-            <StatusBadge status={ticket.status} />
-            {ticket.status === 'draft' && (
-              <Button
-                size="sm"
-                onClick={() => onTransition('ready')}
-                disabled={isMutating}
-                className="bg-indigo-600 hover:bg-indigo-500 text-white border-0"
-              >
-                {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Mark Ready'}
-              </Button>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* 70/30 Split: Content + Sidebar */}
-      <div className="flex min-h-0">
-        {/* Main column — Description + Agent */}
-        <div className="flex-1 min-w-0 px-5 py-4 space-y-4">
-          {/* Agent card */}
-          <div>
-            <p className="text-[10px] font-semibold uppercase tracking-widest text-text-dim/70 mb-2">Agent</p>
-            {ticket.assigned_agent ? (
-              <div
-                className="inline-flex items-center gap-2.5 px-3 py-2 rounded-lg border transition-colors"
-                style={{
-                  backgroundColor: `${agentColor}0A`,
-                  borderColor: `${agentColor}20`,
-                }}
-              >
-                <div
-                  className="w-6 h-6 rounded-md flex items-center justify-center shrink-0"
-                  style={{ backgroundColor: `${agentColor}18` }}
-                >
-                  <Bot className="w-3.5 h-3.5" style={{ color: agentColor }} />
-                </div>
-                <span className="text-[13px] font-medium text-text">{agentLabel}</span>
-              </div>
-            ) : (
-              <Select
-                value=""
-                options={AGENT_OPTIONS.map((option) => ({ ...option }))}
-                placeholder="Assign an agent..."
-                onChange={(event) => onAgentChange(event.target.value)}
-                disabled={isUpdatingAgent}
-              />
-            )}
-            {ticket.assigned_agent && (
-              <div className="mt-2">
-                <Select
-                  value={ticket.assigned_agent}
-                  options={AGENT_OPTIONS.map((option) => ({ ...option }))}
-                  onChange={(event) => onAgentChange(event.target.value)}
-                  disabled={isUpdatingAgent}
-                />
-              </div>
-            )}
-            {agentError && (
-              <div className="mt-1.5 text-[11px] text-red-400">{agentError}</div>
-            )}
-          </div>
-
-          {/* Description */}
-          <div>
-            <p className="text-[10px] font-semibold uppercase tracking-widest text-text-dim/70 mb-2">Description</p>
-            {ticket.context ? (
-              <div className="text-[12.5px] leading-[1.625] text-text-muted">
-                <MarkdownText content={ticket.context} />
-              </div>
-            ) : (
-              <p className="italic text-text-dim text-[12px]">No description provided.</p>
-            )}
-          </div>
-        </div>
-
-        {/* Info sidebar — Technical metadata */}
-        {hasTechMeta && (
-          <div className="w-[200px] shrink-0 border-l border-border bg-[#0B1120] px-3.5 py-4 space-y-3.5">
-            {ticket.repo_path && (
-              <MetaField label="Repository">
-                <CopyableValue value={ticket.repo_path} mono truncateMiddle />
-              </MetaField>
-            )}
-            {ticket.source_branch && (
-              <MetaField label="Base Branch">
-                <CopyableValue value={ticket.source_branch} mono />
-              </MetaField>
-            )}
-            {ticket.branch_name && (
-              <MetaField label="Worktree Branch">
-                <CopyableValue value={ticket.branch_name} mono />
-              </MetaField>
-            )}
-            {ticket.worktree_path && (
-              <MetaField label="Worktree Path">
-                <CopyableValue value={ticket.worktree_path} mono truncateMiddle />
-              </MetaField>
-            )}
-            {ticket.terminal_slot != null && (
-              <MetaField label="Slot">
-                <span className="font-mono text-text-muted">#{ticket.terminal_slot}</span>
-              </MetaField>
-            )}
-
-            {/* Timestamps — sidebar footer */}
-            <div className="pt-3 mt-3 border-t border-white/[0.06] space-y-2">
-              <div className="flex items-center gap-1.5 mb-1.5">
-                <Clock className="w-3 h-3 text-text-dim/50" />
-                <span className="text-[9px] font-semibold uppercase tracking-widest text-text-dim/50">Timeline</span>
-              </div>
-              <TimestampRow label="Created" date={ticket.created_at} />
-              <TimestampRow label="Updated" date={ticket.updated_at} />
-              {ticket.started_at && <TimestampRow label="Started" date={ticket.started_at} />}
-              {ticket.completed_at && <TimestampRow label="Completed" date={ticket.completed_at} />}
-            </div>
-          </div>
-        )}
-
-        {/* If no tech meta, just show timestamps inline */}
-        {!hasTechMeta && (
-          <div className="w-[180px] shrink-0 border-l border-border bg-[#0B1120] px-3.5 py-4">
-            <div className="flex items-center gap-1.5 mb-2.5">
-              <Clock className="w-3 h-3 text-text-dim/50" />
-              <span className="text-[9px] font-semibold uppercase tracking-widest text-text-dim/50">Timeline</span>
-            </div>
-            <div className="space-y-2">
-              <TimestampRow label="Created" date={ticket.created_at} />
-              <TimestampRow label="Updated" date={ticket.updated_at} />
-              {ticket.started_at && <TimestampRow label="Started" date={ticket.started_at} />}
-              {ticket.completed_at && <TimestampRow label="Completed" date={ticket.completed_at} />}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function MetaField({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="space-y-1">
-      <span className="text-[9px] font-semibold uppercase tracking-widest text-text-dim/50 block">{label}</span>
-      <div className="text-[11px]">{children}</div>
-    </div>
-  );
-}
-
-function TimestampRow({ label, date }: { label: string; date: string }) {
-  return (
-    <div className="text-[10px]">
-      <span className="text-text-dim/60 block">{label}</span>
-      <span className="text-text-dim">{new Date(date).toLocaleString()}</span>
-    </div>
-  );
-}
 
 // ---- Segment grouping ----
 

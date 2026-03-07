@@ -49,6 +49,12 @@ pub fn run() {
             sql: include_str!("../migrations/007_orchestrator_v3.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 8,
+            description: "create_ticket_attempts",
+            sql: include_str!("../migrations/008_attempt_history.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -229,6 +235,11 @@ pub fn run() {
                 .execute(&pool)
                 .await;
 
+                // Create ticket_attempts table (no-op if already exists).
+                sqlx::raw_sql(include_str!("../migrations/008_attempt_history.sql"))
+                    .execute(&pool)
+                    .await?;
+
                 // On every startup, reset tickets that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
                 // restarts, so queued/running tickets would be stuck indefinitely.
@@ -248,7 +259,7 @@ pub fn run() {
             })?;
 
             app.manage(pool);
-            app.manage(commands::agents::ActiveRuns::default());
+            app.manage(commands::agents::ActiveSessions::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -271,6 +282,8 @@ pub fn run() {
             commands::tickets::get_ticket_dependencies,
             commands::tickets::get_ticket_dependents,
             commands::tickets::has_unmet_dependencies,
+            commands::tickets::get_ticket_attempts,
+            commands::tickets::record_ticket_attempt,
             // Worktree (Task D)
             commands::worktree::create_worktree,
             commands::worktree::remove_worktree,
@@ -291,11 +304,18 @@ pub fn run() {
             commands::agents::launch_agent,
             commands::agents::continue_agent,
             commands::agents::interrupt_agent,
+            commands::agents::cancel_agent_turn,
+            commands::agents::stop_agent_session,
+            commands::agents::shutdown_all_agent_sessions,
+            commands::agents::get_agent_session,
+            commands::agents::set_agent_permission_policy,
+            commands::agents::respond_to_agent_permission,
             commands::agents::get_agent_logs,
             commands::agents::get_acp_messages,
             // Repos
             commands::repos::list_repos,
             commands::repos::add_repo,
+            commands::repos::prepare_repo,
             commands::repos::remove_repo,
             commands::repos::update_repo_last_used,
             // Workspaces

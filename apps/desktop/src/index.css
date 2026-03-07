@@ -75,6 +75,27 @@ body,
   animation: activity-shimmer 2s ease-in-out infinite;
 }
 
+/* ---- Agent running ring (spinning border on stop button) ---- */
+@keyframes spin-ring {
+  to { rotate: 360deg; }
+}
+
+.agent-running-ring {
+  position: relative;
+  overflow: visible;
+}
+
+.agent-running-ring::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 14px;
+  border: 1.5px solid transparent;
+  border-top-color: #ef4444;
+  animation: spin-ring 1s linear infinite;
+  pointer-events: none;
+}
+
 /* ---- Floating command bar backdrop ---- */
 @keyframes command-bar-in {
   from { opacity: 0; translate: -50% -8px; }

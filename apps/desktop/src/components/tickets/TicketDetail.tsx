@@ -6,8 +6,10 @@ import type { Ticket, TicketStatus } from '@mozzie/db';
 import { useTicket, useTickets } from '../../hooks/useTickets';
 import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutation';
 import { useCreateWorktree, useApproveTicketReview, useRejectTicketReview, useCloseTicketReview, useRepoBranch, useRepoBranches } from '../../hooks/useWorktree';
-import { useLaunchAgent } from '../../hooks/useAgents';
+import { useLaunchAgent, useAgentLogs } from '../../hooks/useAgents';
+import { useRecordAttempt } from '../../hooks/useAttemptHistory';
 import { useTicketDependencies, useTicketDependents, useAddDependency, useRemoveDependency } from '../../hooks/useDependencies';
+import { useTicketAttempts } from '../../hooks/useAttemptHistory';
 import { useLicense } from '../../hooks/useLicense';
 import { useReview } from '../../hooks/useReview';
 import { AGENT_OPTIONS } from '../../lib/agentOptions';
@@ -66,6 +68,9 @@ export function TicketDetail() {
   const rejectReview = useRejectTicketReview();
   const closeReview = useCloseTicketReview();
   const launchAgent = useLaunchAgent();
+  const recordAttempt = useRecordAttempt();
+  const { data: agentLogs } = useAgentLogs(activeTicketId);
+  const latestLog = agentLogs?.[0] ?? null;
   const getNextAvailableSlot = useTerminalStore((s) => s.getNextAvailableSlot);
   const releaseSlot = useTerminalStore((s) => s.releaseSlot);
 
@@ -84,6 +89,8 @@ export function TicketDetail() {
   const addDependency = useAddDependency();
   const removeDependency = useRemoveDependency();
   const [depSearch, setDepSearch] = useState('');
+  const { data: attempts } = useTicketAttempts(activeTicketId);
+  const [attemptsExpanded, setAttemptsExpanded] = useState(false);
   const reviewState = useReview(ticket);
 
   // Sync form when ticket loads
@@ -160,16 +167,33 @@ export function TicketDetail() {
     if (!ticket) return;
     setSaveError(null);
     try {
+      await recordAttempt.mutateAsync({
+        ticketId: ticket.id,
+        agentId: ticket.assigned_agent ?? 'unknown',
+        agentLogId: latestLog?.id ?? null,
+        outcome: 'approved',
+        durationMs: latestLog?.duration_ms ?? null,
+        exitCode: latestLog?.exit_code ?? null,
+      });
       await approveReview.mutateAsync(ticket.id);
     } catch (e) {
       setSaveError(String(e));
     }
   }
 
-  async function handleRejectReview() {
+  async function handleRejectReview(rejectionReason?: string) {
     if (!ticket) return;
     setSaveError(null);
     try {
+      await recordAttempt.mutateAsync({
+        ticketId: ticket.id,
+        agentId: ticket.assigned_agent ?? 'unknown',
+        agentLogId: latestLog?.id ?? null,
+        outcome: 'rejected',
+        rejectionReason: rejectionReason || null,
+        durationMs: latestLog?.duration_ms ?? null,
+        exitCode: latestLog?.exit_code ?? null,
+      });
       await rejectReview.mutateAsync(ticket.id);
     } catch (e) {
       setSaveError(String(e));
@@ -264,7 +288,8 @@ export function TicketDetail() {
     rejectReview.isPending ||
     closeReview.isPending ||
     launchAgent.isPending ||
-    updateTicket.isPending;
+    updateTicket.isPending ||
+    recordAttempt.isPending;
 
   return (
     <div className="flex flex-col h-full">
@@ -524,6 +549,61 @@ export function TicketDetail() {
               const t = allTickets?.find((t) => t.id === d.depends_on_id);
               return t && t.status !== 'done' && t.status !== 'archived';
             }).length} dependency ticket{deps.length > 1 ? 's' : ''} to be approved.
+          </div>
+        )}
+
+        {/* Attempt History */}
+        {attempts && attempts.length > 0 && (
+          <div className="space-y-2 pt-2 border-t border-border">
+            <button
+              type="button"
+              onClick={() => setAttemptsExpanded((v) => !v)}
+              className="flex items-center gap-1.5 text-xs text-text-muted font-medium hover:text-text transition-colors w-full text-left"
+            >
+              <ChevronLeft className={`w-3 h-3 transition-transform ${attemptsExpanded ? '-rotate-90' : ''}`} />
+              Attempt History ({attempts.length})
+            </button>
+            {attemptsExpanded && (
+              <div className="space-y-1.5">
+                {attempts.map((attempt) => (
+                  <div
+                    key={attempt.id}
+                    className="rounded border border-border bg-surface/50 px-2.5 py-2 space-y-1"
+                  >
+                    <div className="flex items-center gap-2 text-[11px]">
+                      <span className="font-medium text-text">#{attempt.attempt_number}</span>
+                      <span className="font-mono text-text-dim">{attempt.agent_id}</span>
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                          attempt.outcome === 'approved'
+                            ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                            : attempt.outcome === 'rejected'
+                              ? 'bg-red-500/10 text-red-400 border border-red-500/20'
+                              : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                        }`}
+                      >
+                        {attempt.outcome}
+                      </span>
+                      {attempt.duration_ms != null && (
+                        <span className="text-text-dim ml-auto">
+                          {(attempt.duration_ms / 1000).toFixed(1)}s
+                        </span>
+                      )}
+                    </div>
+                    {attempt.rejection_reason && (
+                      <p className="text-[11px] text-text-muted leading-relaxed">
+                        {attempt.rejection_reason}
+                      </p>
+                    )}
+                    {attempt.files_changed && (
+                      <div className="text-[10px] font-mono text-text-dim">
+                        {attempt.files_changed}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

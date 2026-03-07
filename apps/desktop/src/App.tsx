@@ -1,15 +1,18 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import logo from './assets/icon.svg';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
-import { NotebookPen, Settings, PanelLeftClose, PanelLeftOpen, Command, Minus, Square, X } from 'lucide-react';
+import { NotebookPen, Settings, GitFork, PanelLeftClose, PanelLeftOpen, Command, Minus, Square, X } from 'lucide-react';
 import { TerminalGrid } from './components/terminal/TerminalGrid';
 import { SettingsPanel } from './components/settings/SettingsPanel';
 import { NotesPanel } from './components/notes/NotesPanel';
+import { ReposPanel } from './components/repos/ReposPanel';
 import { FloatingCommandBar } from './components/tickets/FloatingCommandBar';
 import { NewTicketModal } from './components/tickets/NewTicketModal';
 import { AppSidebar } from './components/sidebar/AppSidebar';
+import { WorkspaceSwitcher } from './components/sidebar/WorkspaceSwitcher';
 import { useTerminalStore } from './stores/terminalStore';
 import { useTicketStore } from './stores/ticketStore';
 import { useAutoLaunchUnblocked } from './hooks/useAutoLaunchUnblocked';
@@ -46,9 +49,11 @@ function StatusBar() {
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notesOpen, setNotesOpen] = useState(false);
+  const [reposOpen, setReposOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [commandBarOpen, setCommandBarOpen] = useState(false);
   const appWindow = getCurrentWindow();
+  const allowCloseRef = useRef(false);
   const releaseSlotForTicket = useTerminalStore((s) => s.releaseSlotForTicket);
   const removeSelectedTicket = useTicketStore((s) => s.removeSelectedTicket);
   const { isNewTicketModalOpen, newTicketContextSeed, closeNewTicketModal } = useTicketStore();
@@ -96,6 +101,29 @@ export default function App() {
     };
   }, [releaseSlotForTicket, removeSelectedTicket]);
 
+  useEffect(() => {
+    const unlisten = appWindow.onCloseRequested(async (event) => {
+      if (allowCloseRef.current) {
+        return;
+      }
+
+      event.preventDefault();
+      allowCloseRef.current = true;
+
+      try {
+        await invoke('shutdown_all_agent_sessions');
+      } catch {
+        // Best-effort cleanup before destroying the window.
+      }
+
+      await appWindow.destroy();
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [appWindow]);
+
   return (
     <div className="flex flex-col h-screen bg-bg text-text overflow-hidden">
       {/* Toolbar */}
@@ -114,6 +142,9 @@ export default function App() {
           </button>
           <img src={logo} alt="Mozzie" className="w-5 h-5" />
           <span className="text-[13px] font-semibold text-text tracking-tight">Mozzie</span>
+          <div data-no-drag className="ml-1">
+            <WorkspaceSwitcher />
+          </div>
         </div>
 
         {/* Command bar trigger — centered */}
@@ -127,21 +158,21 @@ export default function App() {
           <kbd className="text-[10px] text-text-dim bg-white/[0.04] px-1 py-0.5 rounded ml-1">Ctrl+K</kbd>
         </button>
 
-        <div className="flex items-center ml-auto">
+        <div className="flex items-center ml-auto gap-0.5">
           <button
-            onClick={() => setSettingsOpen((v) => !v)}
-            className={`w-7 h-7 mr-0.5 flex items-center justify-center rounded-lg transition-all duration-150
-              ${settingsOpen
+            onClick={() => setReposOpen((v) => !v)}
+            className={`w-7 h-7 flex items-center justify-center rounded-lg transition-all duration-150
+              ${reposOpen
                 ? 'text-text bg-white/[0.10] ring-1 ring-accent/40'
                 : 'text-text-dim hover:text-text hover:bg-white/[0.06]'
               }`}
-            title="Settings"
+            title="Repositories"
           >
-            <Settings className="w-3.5 h-3.5" />
+            <GitFork className="w-3.5 h-3.5" />
           </button>
           <button
-            onClick={() => setNotesOpen((value) => !value)}
-            className={`w-7 h-7 mr-1 flex items-center justify-center rounded-lg transition-all duration-150
+            onClick={() => setNotesOpen((v) => !v)}
+            className={`w-7 h-7 flex items-center justify-center rounded-lg transition-all duration-150
               ${notesOpen
                 ? 'text-text bg-white/[0.10] ring-1 ring-accent/40'
                 : 'text-text-dim hover:text-text hover:bg-white/[0.06]'
@@ -149,6 +180,17 @@ export default function App() {
             title="Notes"
           >
             <NotebookPen className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => setSettingsOpen((v) => !v)}
+            className={`w-7 h-7 flex items-center justify-center rounded-lg transition-all duration-150
+              ${settingsOpen
+                ? 'text-text bg-white/[0.10] ring-1 ring-accent/40'
+                : 'text-text-dim hover:text-text hover:bg-white/[0.06]'
+              }`}
+            title="Settings"
+          >
+            <Settings className="w-3.5 h-3.5" />
           </button>
           {/* Window controls */}
           <div className="flex items-center ml-2 -mr-2">
@@ -177,11 +219,7 @@ export default function App() {
       {/* Main layout */}
       <div className="flex-1 flex overflow-hidden">
         {/* Sidebar — always rendered, toggles between icon-only and full */}
-        <AppSidebar
-          collapsed={sidebarCollapsed}
-          onSettingsClick={() => setSettingsOpen(true)}
-          onCommandBarOpen={() => setCommandBarOpen(true)}
-        />
+        <AppSidebar collapsed={sidebarCollapsed} />
 
         {/* Resize handle — only visible when sidebar is expanded */}
         {!sidebarCollapsed && (
@@ -204,12 +242,28 @@ export default function App() {
               <TerminalGrid />
             </Panel>
 
+            {reposOpen && (
+              <>
+                <PanelResizeHandle className="w-px bg-border hover:bg-accent/50 transition-colors cursor-col-resize" />
+                <Panel
+                  id="repos"
+                  order={2}
+                  minSize={15}
+                  maxSize={30}
+                  defaultSize={18}
+                  className="flex flex-col h-full min-w-0"
+                >
+                  <ReposPanel onClose={() => setReposOpen(false)} />
+                </Panel>
+              </>
+            )}
+
             {notesOpen && (
               <>
                 <PanelResizeHandle className="w-px bg-border hover:bg-accent/50 transition-colors cursor-col-resize" />
                 <Panel
                   id="notes"
-                  order={2}
+                  order={3}
                   minSize={15}
                   maxSize={40}
                   defaultSize={22}
@@ -225,7 +279,7 @@ export default function App() {
                 <PanelResizeHandle className="w-px bg-border hover:bg-accent/50 transition-colors cursor-col-resize" />
                 <Panel
                   id="settings"
-                  order={3}
+                  order={4}
                   minSize={20}
                   maxSize={45}
                   defaultSize={28}

@@ -1,11 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Check, GitBranch, Loader2, RotateCcw, ChevronLeft, CheckCheck } from 'lucide-react';
+import { Check, Loader2, RotateCcw, X } from 'lucide-react';
 import type { AgentLog, Ticket, TicketReviewState } from '@mozzie/db';
-import { useTicketStore } from '../../stores/ticketStore';
 import { DiffViewer, formatFileLabel, getFileStatus, parseDiff } from './DiffViewer';
+import { RejectionModal } from './RejectionModal';
 import { Button } from '../ui/button';
-import { StatusBadge } from '../ui/badge';
-import { formatDistanceToNow } from '../../lib/time';
 
 interface ReviewPanelProps {
   ticket: Ticket;
@@ -15,10 +13,41 @@ interface ReviewPanelProps {
   latestLog?: AgentLog | null;
   isMutating?: boolean;
   onApprove?: () => void;
-  onReject?: () => void;
+  onReject?: (rejectionReason?: string) => void;
   onClose?: () => void;
   showBackButton?: boolean;
   actionError?: string | null;
+}
+
+const parsedDiffCache = new Map<string, {
+  files: ReturnType<typeof parseDiff>;
+  totalAdditions: number;
+  totalDeletions: number;
+}>();
+const MAX_PARSED_DIFF_CACHE_ENTRIES = 24;
+
+function getParsedDiffSummary(diff: string) {
+  const cached = parsedDiffCache.get(diff);
+  if (cached) {
+    return cached;
+  }
+
+  const files = parseDiff(diff);
+  const summary = {
+    files,
+    totalAdditions: files.reduce((sum, file) => sum + file.additions, 0),
+    totalDeletions: files.reduce((sum, file) => sum + file.deletions, 0),
+  };
+
+  if (parsedDiffCache.size >= MAX_PARSED_DIFF_CACHE_ENTRIES) {
+    const oldestKey = parsedDiffCache.keys().next().value;
+    if (oldestKey) {
+      parsedDiffCache.delete(oldestKey);
+    }
+  }
+
+  parsedDiffCache.set(diff, summary);
+  return summary;
 }
 
 export function ReviewPanel({
@@ -31,19 +60,16 @@ export function ReviewPanel({
   onApprove,
   onReject,
   onClose,
-  showBackButton,
   actionError,
 }: ReviewPanelProps) {
-  const { backToList } = useTicketStore();
   const [selectedFileKey, setSelectedFileKey] = useState<string | null>(null);
+  const [showRejectionModal, setShowRejectionModal] = useState(false);
 
-  const durationSec = latestLog?.duration_ms != null
-    ? (latestLog.duration_ms / 1000).toFixed(1)
-    : null;
-
-  const files = useMemo(() => parseDiff(review?.diff ?? ''), [review?.diff]);
-  const totalAdditions = files.reduce((sum, file) => sum + file.additions, 0);
-  const totalDeletions = files.reduce((sum, file) => sum + file.deletions, 0);
+  const diff = review?.diff ?? '';
+  const { files, totalAdditions, totalDeletions } = useMemo(
+    () => getParsedDiffSummary(diff),
+    [diff],
+  );
 
   useEffect(() => {
     if (files.length === 0) {
@@ -57,65 +83,26 @@ export function ReviewPanel({
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-bg overflow-hidden">
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 bg-surface">
-        {showBackButton && (
-          <Button variant="ghost" size="icon" onClick={backToList} title="Back to list">
-            <ChevronLeft className="w-4 h-4" />
-          </Button>
-        )}
-        <StatusBadge status={ticket.status} />
-        <span className="truncate text-xs text-text-dim ml-auto">{ticket.title}</span>
-      </div>
-
-      <div className="shrink-0 px-3 py-2 border-b border-border bg-surface/80">
-        {actionError && (
-          <div className="mb-2 rounded border border-red-800 bg-red-900/20 px-2 py-1.5 text-xs text-red-400">
-            {actionError}
-          </div>
-        )}
-        <div className="flex flex-wrap items-center gap-3 text-xs text-text-dim">
-          <span className="font-medium text-text-muted">{review?.summary ?? 'Loading review state...'}</span>
-          {review?.source_branch && review?.branch_name && (
-            <span className="inline-flex items-center gap-1 font-mono text-[11px]">
-              <GitBranch className="w-3 h-3" />
-              {review.source_branch}
-              <span className="text-text-dim">←</span>
-              {review.branch_name}
-            </span>
-          )}
-          {files.length > 0 && (
-            <span className="font-mono text-[11px] text-text-muted">
-              {files.length} file{files.length === 1 ? '' : 's'} changed, +{totalAdditions} -{totalDeletions}
-            </span>
-          )}
+      {actionError && (
+        <div className="shrink-0 px-3 py-2 border-b border-red-800 bg-red-900/20 text-xs text-red-400">
+          {actionError}
         </div>
-        <div className="mt-2 grid grid-cols-3 gap-3 text-xs">
-          <div>
-            <div className="text-text-dim mb-0.5">Duration</div>
-            <div className="font-mono text-text">{durationSec ? `${durationSec}s` : '—'}</div>
-          </div>
-          <div>
-            <div className="text-text-dim mb-0.5">Exit Code</div>
-            <div className={`font-mono ${latestLog?.exit_code === 0 ? 'text-state-success' : latestLog?.exit_code != null ? 'text-red-400' : 'text-text-muted'}`}>
-              {latestLog?.exit_code ?? '—'}
-            </div>
-          </div>
-          <div>
-            <div className="text-text-dim mb-0.5">Completed</div>
-            <div className="text-text">{ticket.completed_at ? formatDistanceToNow(ticket.completed_at) : '—'}</div>
-          </div>
+      )}
+      {latestLog?.cleanup_warning_message && (
+        <div className="shrink-0 px-3 py-2 border-b border-amber-500/20 text-xs text-amber-300 bg-amber-500/10">
+          {latestLog.cleanup_warning_message}
         </div>
-        {latestLog?.cleanup_warning_message && (
-          <div className="mt-2 text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded px-2 py-1.5">
-            {latestLog.cleanup_warning_message}
-          </div>
-        )}
-      </div>
+      )}
 
       <div className="flex-1 min-h-0 flex overflow-hidden">
         <aside className="w-64 shrink-0 border-r border-border bg-surface/40 overflow-y-auto min-h-0">
-          <div className="px-3 py-2 text-[11px] uppercase tracking-wider text-text-dim border-b border-border">
-            Changed Files
+          <div className="px-3 py-2 text-[11px] uppercase tracking-wider text-text-dim border-b border-border flex items-center justify-between">
+            <span>Changed Files</span>
+            {files.length > 0 && (
+              <span className="font-mono text-[10px] text-text-dim/70">
+                +{totalAdditions} -{totalDeletions}
+              </span>
+            )}
           </div>
           {reviewLoading ? (
             <div className="p-3 text-sm text-text-dim flex items-center gap-2">
@@ -152,7 +139,7 @@ export function ReviewPanel({
           )}
         </aside>
 
-        <div className="flex-1 min-w-0 min-h-0 overflow-auto">
+        <div className="flex-1 min-w-0 min-h-0 overflow-hidden">
           {reviewLoading ? (
             <div className="h-full flex items-center justify-center gap-2 text-text-dim text-sm">
               <Loader2 className="w-4 h-4 animate-spin" />
@@ -168,7 +155,7 @@ export function ReviewPanel({
               This branch is already merged. There are no remaining changes to review.
             </div>
           ) : review?.has_changes ? (
-            <DiffViewer diff={review.diff} selectedFileKey={selectedFileKey} />
+            <DiffViewer diff={diff} selectedFileKey={selectedFileKey} files={files} />
           ) : (
             <div className="px-6 py-10 text-sm text-text-dim">
               {review?.summary ?? 'No changes to review.'}
@@ -181,20 +168,33 @@ export function ReviewPanel({
         <div className="shrink-0 sticky bottom-0 z-10 px-3 py-3 border-t border-border flex gap-2 bg-surface">
           {onApprove && (
             <Button size="sm" className="flex-1" onClick={onApprove} disabled={isMutating || !review || (!review.has_changes && !review.is_merged)}>
-              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Check className="w-3 h-3" />Approve & Merge</>}
+              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Check className="w-3 h-3" />Keep All</>}
             </Button>
           )}
           {onReject && (
-            <Button variant="destructive" size="sm" className="flex-1" onClick={onReject} disabled={isMutating || !review?.worktree_present}>
-              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><RotateCcw className="w-3 h-3" />Discard Changes</>}
+            <Button variant="destructive" size="sm" className="flex-1" onClick={() => setShowRejectionModal(true)} disabled={isMutating || !review?.worktree_present}>
+              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><RotateCcw className="w-3 h-3" />Discard</>}
             </Button>
           )}
           {onClose && (
             <Button variant="outline" size="sm" className="flex-1" onClick={onClose} disabled={isMutating}>
-              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><CheckCheck className="w-3 h-3" />Close</>}
+              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><X className="w-3 h-3" />Close</>}
             </Button>
           )}
         </div>
+      )}
+
+      {showRejectionModal && onReject && (
+        <RejectionModal
+          ticketTitle={ticket.title}
+          filesChanged={files.map((f) => formatFileLabel(f.oldPath, f.newPath))}
+          onConfirm={(reason) => {
+            setShowRejectionModal(false);
+            onReject(reason);
+          }}
+          onCancel={() => setShowRejectionModal(false)}
+          isSubmitting={isMutating}
+        />
       )}
     </div>
   );
