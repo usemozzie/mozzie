@@ -2,9 +2,9 @@ import { useEffect } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { TicketReviewState } from '@mozzie/db';
-import type { TicketStateChangeEvent } from '../types/events';
-import { TICKET_KEY, TICKETS_KEY } from './useTickets';
+import type { WorkItemReviewState } from '@mozzie/db';
+import type { WorkItemGitStateChangeEvent, WorkItemStateChangeEvent } from '../types/events';
+import { WORK_ITEM_KEY, WORK_ITEMS_KEY } from './useWorkItems';
 
 export interface WorktreeInfo {
   worktree_path: string;
@@ -17,23 +17,23 @@ export interface RepoBranchInfo {
   detached: boolean;
 }
 
-const TICKET_REVIEW_KEY = 'ticket_review';
+const WORK_ITEM_REVIEW_KEY = 'work_item_review';
 
 export function useCreateWorktree() {
   return useMutation({
     mutationFn: ({
-      ticketId,
+      workItemId,
       repoPath,
       sourceBranch,
       branchName,
     }: {
-      ticketId: string;
+      workItemId: string;
       repoPath: string;
       sourceBranch?: string;
       branchName?: string;
     }) =>
       invoke<WorktreeInfo>('create_worktree', {
-        ticketId,
+        workItemId,
         repoPath,
         sourceBranch: sourceBranch ?? null,
         branchName: branchName ?? null,
@@ -98,59 +98,65 @@ export function useMergeBranch() {
   });
 }
 
-export function useTicketReviewState(ticketId: string | null | undefined) {
+export function useWorkItemReviewState(workItemId: string | null | undefined) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    if (!ticketId) return;
-    const unlisten = listen<TicketStateChangeEvent>('ticket:state-change', (event) => {
-      if (event.payload.ticketId === ticketId) {
-        queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+    if (!workItemId) return;
+    const unlistenState = listen<WorkItemStateChangeEvent>('work-item:state-change', (event) => {
+      if (event.payload.workItemId === workItemId) {
+        queryClient.invalidateQueries({ queryKey: [WORK_ITEM_REVIEW_KEY, workItemId] });
+      }
+    });
+    const unlistenGit = listen<WorkItemGitStateChangeEvent>('work-item:git-state-change', (event) => {
+      if (event.payload.workItemId === workItemId) {
+        queryClient.invalidateQueries({ queryKey: [WORK_ITEM_REVIEW_KEY, workItemId] });
       }
     });
     return () => {
-      unlisten.then((fn) => fn());
+      unlistenState.then((fn) => fn());
+      unlistenGit.then((fn) => fn());
     };
-  }, [ticketId, queryClient]);
+  }, [workItemId, queryClient]);
 
-  return useQuery<TicketReviewState>({
-    queryKey: [TICKET_REVIEW_KEY, ticketId],
-    queryFn: () => invoke('get_ticket_review_state', { ticketId }),
-    enabled: !!ticketId,
+  return useQuery<WorkItemReviewState>({
+    queryKey: [WORK_ITEM_REVIEW_KEY, workItemId],
+    queryFn: () => invoke('get_work_item_review_state', { workItemId }),
+    enabled: !!workItemId,
     staleTime: 5_000,
   });
 }
 
-export function useApproveTicketReview() {
+export function useApproveWorkItemReview() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (ticketId: string) => invoke('approve_ticket_review', { ticketId }),
-    onSuccess: (_value, ticketId) => {
-      queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
-      queryClient.invalidateQueries({ queryKey: [TICKETS_KEY] });
-      queryClient.invalidateQueries({ queryKey: [TICKET_KEY, ticketId] });
+    mutationFn: (workItemId: string) => invoke('approve_work_item_review', { workItemId }),
+    onSuccess: (_value, workItemId) => {
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEM_REVIEW_KEY, workItemId] });
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEMS_KEY] });
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEM_KEY, workItemId] });
       queryClient.invalidateQueries({ queryKey: ['repo_branch'] });
       queryClient.invalidateQueries({ queryKey: ['repo_branches'] });
     },
   });
 }
 
-export function useRejectTicketReview() {
+export function useRejectWorkItemReview() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (ticketId: string) => invoke('reject_ticket_review', { ticketId }),
-    onSuccess: (_value, ticketId) => {
-      queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+    mutationFn: (workItemId: string) => invoke('reject_work_item_review', { workItemId }),
+    onSuccess: (_value, workItemId) => {
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEM_REVIEW_KEY, workItemId] });
     },
   });
 }
 
-export function useCloseTicketReview() {
+export function useCloseWorkItemReview() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (ticketId: string) => invoke('close_ticket_review', { ticketId }),
-    onSuccess: (_value, ticketId) => {
-      queryClient.invalidateQueries({ queryKey: [TICKET_REVIEW_KEY, ticketId] });
+    mutationFn: (workItemId: string) => invoke('close_work_item_review', { workItemId }),
+    onSuccess: (_value, workItemId) => {
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEM_REVIEW_KEY, workItemId] });
     },
   });
 }

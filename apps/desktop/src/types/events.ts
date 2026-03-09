@@ -6,21 +6,25 @@ export interface PtyOutputEvent {
 
 export interface PtyExitEvent {
   code: number;
-  ticketId: string;
+  workItemId: string;
 }
 
-export interface TicketStateChangeEvent {
-  ticketId: string;
+export interface WorkItemStateChangeEvent {
+  workItemId: string;
   from: string;
   to: string;
 }
 
+export interface WorkItemGitStateChangeEvent {
+  workItemId: string;
+}
+
 export interface AgentLogChangeEvent {
-  ticketId: string;
+  workItemId: string;
   logId: string;
 }
 
 export interface AgentSessionStateEvent {
-  ticketId: string;
+  workItemId: string;
   state: AgentSessionState | null;
 }

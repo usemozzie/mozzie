@@ -1,4 +1,4 @@
-import type { SlashCommandOption } from '../components/tickets/AtReferenceTextarea';
+import type { SlashCommandOption } from '../components/work-items/AtReferenceTextarea';
 
 const CLAUDE_CODE_COMMANDS: SlashCommandOption[] = [
   { command: 'add-dir', description: 'Add another working directory to the session.' },

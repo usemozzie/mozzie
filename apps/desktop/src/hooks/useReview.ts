@@ -1,11 +1,11 @@
-import type { Ticket } from '@mozzie/db';
+import type { WorkItem } from '@mozzie/db';
 import { useAgentLogs } from './useAgents';
-import { useTicketReviewState } from './useWorktree';
+import { useWorkItemReviewState } from './useWorktree';
 
-export function useReview(ticket: Ticket | null | undefined, enabled = true) {
-  const shouldLoad = !!ticket && enabled;
-  const reviewQuery = useTicketReviewState(shouldLoad ? ticket?.id ?? null : null);
-  const logsQuery = useAgentLogs(shouldLoad ? ticket?.id ?? null : null);
+export function useReview(workItem: WorkItem | null | undefined, enabled = true) {
+  const shouldLoad = !!workItem && enabled;
+  const reviewQuery = useWorkItemReviewState(shouldLoad ? workItem?.id ?? null : null);
+  const logsQuery = useAgentLogs(shouldLoad ? workItem?.id ?? null : null);
 
   return {
     review: reviewQuery.data ?? null,

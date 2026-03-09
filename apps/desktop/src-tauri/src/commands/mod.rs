@@ -1,10 +1,9 @@
 pub mod pty;
-pub mod tickets;
+pub mod work_items;
 pub mod agents;
 pub mod worktree;
 pub mod orchestrator;
 pub mod repos;
 pub mod workspaces;
-pub mod license;
 pub mod notes;
 pub mod conversations;

@@ -1,17 +1,17 @@
 import { useState } from 'react';
 import { X, Loader2, FolderOpen } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useCreateTicket } from '../../hooks/useTicketMutation';
+import { useCreateWorkItem } from '../../hooks/useWorkItemMutation';
 import { useRepoBranch, useRepoBranches } from '../../hooks/useWorktree';
 import { getRecentRepos, getRepoDisplayName, saveRecentRepo } from '../../lib/recentRepos';
 import { AGENT_OPTIONS, DEFAULT_AGENT } from '../../lib/agentOptions';
-import { useTicketStore } from '../../stores/ticketStore';
+import { useWorkItemStore } from '../../stores/workItemStore';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Select } from '../ui/select';
 import { AtReferenceTextarea } from './AtReferenceTextarea';
 
-interface NewTicketModalProps {
+interface NewWorkItemModalProps {
   onClose: () => void;
   initialContext?: string;
 }
@@ -32,7 +32,7 @@ function suggestBranchName(title: string): string {
   return `feat/${slug}`;
 }
 
-export function NewTicketModal({ onClose, initialContext }: NewTicketModalProps) {
+export function NewWorkItemModal({ onClose, initialContext }: NewWorkItemModalProps) {
   const [title, setTitle] = useState('');
   const [context, setContext] = useState(initialContext ?? '');
   const [repoPath, setRepoPath] = useState('');
@@ -45,8 +45,8 @@ export function NewTicketModal({ onClose, initialContext }: NewTicketModalProps)
   const repoBranch = useRepoBranch(repoPath);
   const repoBranches = useRepoBranches(repoPath);
 
-  const createTicket = useCreateTicket();
-  const { openTicketDetail } = useTicketStore();
+  const createWorkItem = useCreateWorkItem();
+  const selectWorkItem = useWorkItemStore((s) => s.selectWorkItem);
 
   async function handlePickFolder() {
     const selected = await open({ directory: true, multiple: false });
@@ -67,7 +67,7 @@ export function NewTicketModal({ onClose, initialContext }: NewTicketModalProps)
       if (trimmedRepoPath) {
         setRecentRepos(saveRecentRepo(trimmedRepoPath));
       }
-      const ticket = await createTicket.mutateAsync({
+      const workItem = await createWorkItem.mutateAsync({
         title: title.trim(),
         context: context.trim() || undefined,
         repo_path: trimmedRepoPath || undefined,
@@ -76,7 +76,7 @@ export function NewTicketModal({ onClose, initialContext }: NewTicketModalProps)
         source_branch: sourceBranch.trim() || undefined,
       });
       onClose();
-      openTicketDetail(ticket.id);
+      selectWorkItem(workItem.id);
     } catch (e) {
       setError(String(e));
     }
@@ -87,7 +87,7 @@ export function NewTicketModal({ onClose, initialContext }: NewTicketModalProps)
       <div className="bg-surface border border-border rounded-xl w-[480px] shadow-2xl shadow-black/40">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-          <h2 className="text-sm font-semibold text-text">New Ticket</h2>
+          <h2 className="text-sm font-semibold text-text">New Work Item</h2>
           <Button variant="ghost" size="icon" onClick={onClose}>
             <X className="w-4 h-4" />
           </Button>
@@ -115,7 +115,7 @@ export function NewTicketModal({ onClose, initialContext }: NewTicketModalProps)
                   setBranchName(suggestBranchName(newTitle));
                 }
               }}
-              placeholder="Short ticket title"
+              placeholder="Short work item title"
               autoFocus
               onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
             />
@@ -265,12 +265,12 @@ export function NewTicketModal({ onClose, initialContext }: NewTicketModalProps)
           <Button
             size="sm"
             onClick={handleCreate}
-            disabled={createTicket.isPending}
+            disabled={createWorkItem.isPending}
           >
-            {createTicket.isPending ? (
+            {createWorkItem.isPending ? (
               <Loader2 className="w-3 h-3 animate-spin" />
             ) : (
-              'Create Ticket'
+              'Create Work Item'
             )}
           </Button>
         </div>

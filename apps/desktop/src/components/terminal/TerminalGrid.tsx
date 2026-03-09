@@ -2,11 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { Loader2, X, ChevronRight, Maximize2, Minimize2, Plus, ArrowUp, ChevronDown, Square } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { AcpEventItem, AgentPermissionPolicy, Ticket } from '@mozzie/db';
+import type { AcpEventItem, AgentPermissionPolicy, WorkItem } from '@mozzie/db';
 import { useTerminalStore } from '../../stores/terminalStore';
-import { useTicketStore } from '../../stores/ticketStore';
-import { useTicket } from '../../hooks/useTickets';
-import { useUpdateTicket, useTransitionTicket } from '../../hooks/useTicketMutation';
+import { useWorkItemStore } from '../../stores/workItemStore';
+import { useWorkItem } from '../../hooks/useWorkItems';
+import { useUpdateWorkItem, useTransitionWorkItem } from '../../hooks/useWorkItemMutation';
 import { useAcpRun } from '../../hooks/useAcpRun';
 import {
   useAgentLogs,
@@ -17,16 +17,16 @@ import {
   useSetAgentPermissionPolicy,
   useStopAgentSession,
 } from '../../hooks/useAgents';
-import { useTicketAttempts } from '../../hooks/useAttemptHistory';
+import { useWorkItemAttempts } from '../../hooks/useAttemptHistory';
 import { useReview } from '../../hooks/useReview';
-import { useApproveTicketReview, useRejectTicketReview, useCloseTicketReview } from '../../hooks/useWorktree';
+import { useApproveWorkItemReview, useRejectWorkItemReview, useCloseWorkItemReview } from '../../hooks/useWorktree';
 import { useRecordAttempt } from '../../hooks/useAttemptHistory';
 import { getAgentCliCommands } from '../../lib/agentCliCommands';
 import { AGENT_OPTIONS } from '../../lib/agentOptions';
-import { getTicketColor } from '../../lib/ticketColors';
+import { getWorkItemTag } from '../../lib/workItemColors';
 import { StatusBadge } from '../ui/badge';
 import { ReviewPanel } from '../review/ReviewPanel';
-import { AtReferenceTextarea, type SlashCommandOption } from '../tickets/AtReferenceTextarea';
+import { AtReferenceTextarea, type SlashCommandOption } from '../work-items/AtReferenceTextarea';
 
 type PanelTab = 'agent' | 'changes' | 'description';
 
@@ -40,30 +40,30 @@ function getColCount(count: number): number {
 
 export function TerminalGrid() {
   const activeSlots = useTerminalStore((s) => s.activeSlots);
-  const selectedTicketIds = useTicketStore((s) => s.selectedTicketIds);
-  const [focusedTicketId, setFocusedTicketId] = useState<string | null>(null);
+  const selectedWorkItemIds = useWorkItemStore((s) => s.selectedWorkItemIds);
+  const [focusedWorkItemId, setFocusedWorkItemId] = useState<string | null>(null);
   const [panelTabs, setPanelTabs] = useState<Record<string, PanelTab>>({});
 
   const activeEntries = useMemo(() => Array.from(activeSlots.entries()), [activeSlots]);
   const selectedEntries = useMemo(
     () =>
-      selectedTicketIds.map((ticketId, index) => ({
-        ticketId,
+      selectedWorkItemIds.map((workItemId, index) => ({
+        workItemId,
         colorIndex: index,
-        slot: activeEntries.find(([, activeTicketId]) => activeTicketId === ticketId)?.[0],
+        slot: activeEntries.find(([, activeWorkItemId]) => activeWorkItemId === workItemId)?.[0],
       })),
-    [activeEntries, selectedTicketIds],
+    [activeEntries, selectedWorkItemIds],
   );
   const fallbackEntries = useMemo(
     () =>
       activeEntries
-        .filter(([, ticketId]) => !selectedTicketIds.includes(ticketId))
-        .map(([slot, ticketId], index) => ({
+        .filter(([, workItemId]) => !selectedWorkItemIds.includes(workItemId))
+        .map(([slot, workItemId], index) => ({
           slot,
-          ticketId,
+          workItemId,
           colorIndex: selectedEntries.length + index,
         })),
-    [activeEntries, selectedEntries.length, selectedTicketIds],
+    [activeEntries, selectedEntries.length, selectedWorkItemIds],
   );
   const panelEntries = selectedEntries.length > 0 ? selectedEntries : fallbackEntries;
   const count = panelEntries.length;
@@ -77,7 +77,7 @@ export function TerminalGrid() {
           </div>
           <p className="text-[13px] text-text-muted">No active agents</p>
           <p className="text-[11px] text-text-dim leading-relaxed max-w-56">
-            Select a ticket to inspect its run, or press the play button on a ready ticket
+            Select a work item to inspect its run, or press the play button on a ready work item
           </p>
         </div>
       </div>
@@ -85,42 +85,42 @@ export function TerminalGrid() {
   }
 
   // If a panel is focused, show it large + others as tiles
-  const isFocused = focusedTicketId && panelEntries.some((e) => e.ticketId === focusedTicketId);
+  const isFocused = focusedWorkItemId && panelEntries.some((e) => e.workItemId === focusedWorkItemId);
 
   if (isFocused && count > 1) {
-    const focused = panelEntries.find((e) => e.ticketId === focusedTicketId)!;
-    const background = panelEntries.filter((e) => e.ticketId !== focusedTicketId);
+    const focused = panelEntries.find((e) => e.workItemId === focusedWorkItemId)!;
+    const background = panelEntries.filter((e) => e.workItemId !== focusedWorkItemId);
 
     return (
       <div className="h-full flex overflow-hidden">
         {/* Focused panel — takes ~60% */}
         <div className="flex-1 min-w-0 panel-tile panel-tile-focused">
-        <TicketInteractionPanel
-          key={`${focused.ticketId}:${focused.slot ?? 'selected'}`}
-          ticketId={focused.ticketId}
+        <WorkItemInteractionPanel
+          key={`${focused.workItemId}:${focused.slot ?? 'selected'}`}
+          workItemId={focused.workItemId}
           slot={focused.slot}
           colorIndex={focused.colorIndex}
-          activeTab={panelTabs[focused.ticketId] ?? 'agent'}
+          activeTab={panelTabs[focused.workItemId] ?? 'agent'}
           onActiveTabChange={(tab) =>
             setPanelTabs((current) =>
-              current[focused.ticketId] === tab ? current : { ...current, [focused.ticketId]: tab },
+              current[focused.workItemId] === tab ? current : { ...current, [focused.workItemId]: tab },
             )
           }
           isFocused={true}
           hotkeyEnabled
-          onToggleFocus={() => setFocusedTicketId(null)}
+          onToggleFocus={() => setFocusedWorkItemId(null)}
         />
         </div>
 
         {/* Background tiles sidebar */}
         <div className="w-56 shrink-0 border-l border-border overflow-y-auto bg-bg">
-          {background.map(({ ticketId, slot, colorIndex }) => (
+          {background.map(({ workItemId, slot, colorIndex }) => (
             <BackgroundTile
-              key={`${ticketId}:${slot ?? 'bg'}`}
-              ticketId={ticketId}
+              key={`${workItemId}:${slot ?? 'bg'}`}
+              workItemId={workItemId}
               slot={slot}
               colorIndex={colorIndex}
-              onClick={() => setFocusedTicketId(ticketId)}
+              onClick={() => setFocusedWorkItemId(workItemId)}
             />
           ))}
         </div>
@@ -138,21 +138,21 @@ export function TerminalGrid() {
         gridAutoRows: 'minmax(0, 1fr)',
       }}
     >
-      {panelEntries.map(({ ticketId, slot, colorIndex }) => (
-        <TicketInteractionPanel
-          key={`${ticketId}:${slot ?? 'selected'}`}
-          ticketId={ticketId}
+      {panelEntries.map(({ workItemId, slot, colorIndex }) => (
+        <WorkItemInteractionPanel
+          key={`${workItemId}:${slot ?? 'selected'}`}
+          workItemId={workItemId}
           slot={slot}
           colorIndex={colorIndex}
-          activeTab={panelTabs[ticketId] ?? 'agent'}
+          activeTab={panelTabs[workItemId] ?? 'agent'}
           onActiveTabChange={(tab) =>
             setPanelTabs((current) =>
-              current[ticketId] === tab ? current : { ...current, [ticketId]: tab },
+              current[workItemId] === tab ? current : { ...current, [workItemId]: tab },
             )
           }
           isFocused={false}
           hotkeyEnabled={count === 1}
-          onToggleFocus={() => setFocusedTicketId(count > 1 ? ticketId : null)}
+          onToggleFocus={() => setFocusedWorkItemId(count > 1 ? workItemId : null)}
         />
       ))}
     </div>
@@ -162,34 +162,39 @@ export function TerminalGrid() {
 // ---- Background status tile (collapsed view) ----
 
 function BackgroundTile({
-  ticketId,
+  workItemId,
   slot,
   colorIndex,
   onClick,
 }: {
-  ticketId: string;
+  workItemId: string;
   slot?: number;
   colorIndex: number;
   onClick: () => void;
 }) {
-  const { data: ticket } = useTicket(ticketId);
-  const liveItems = useAcpRun(ticketId);
-  const accent = getTicketColor(colorIndex);
+  const { data: workItem } = useWorkItem(workItemId);
+  const liveItems = useAcpRun(workItemId);
+  const tag = getWorkItemTag(colorIndex);
 
   const toolCount = liveItems.filter((i) => i.kind === 'tool_call').length;
   const textCount = liveItems.filter((i) => i.kind === 'text' || i.kind === 'text_delta').length;
-  const isRunning = ticket?.status === 'running';
+  const isRunning = workItem?.status === 'running';
 
   return (
     <button
       onClick={onClick}
       className="w-full text-left p-3 border-b border-border hover:bg-surface transition-colors"
     >
-      {/* Color accent line */}
+      {/* Tag badge + title */}
       <div className="flex items-center gap-2 mb-1.5">
-        <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: accent }} />
+        <span
+          className="w-[18px] h-[18px] rounded-md flex items-center justify-center text-[10px] font-bold shrink-0 text-white/90"
+          style={{ backgroundColor: tag.color }}
+        >
+          {tag.letter}
+        </span>
         <span className="text-[12px] font-medium text-text truncate flex-1">
-          {ticket?.title ?? 'Loading...'}
+          {workItem?.title ?? 'Loading...'}
         </span>
       </div>
 
@@ -208,7 +213,7 @@ function BackgroundTile({
 // ---- Horizontal Activity Bar (Sparkline) ----
 
 const TOOL_COLORS: Record<string, string> = {
-  Read: '#3B82F6',
+  Read: '#6EE7B7',
   Edit: '#10B981',
   Write: '#10B981',
   Bash: '#F59E0B',
@@ -293,8 +298,8 @@ function extractSlashCommand(text: string, commands: SlashCommandOption[]): stri
 
 // ---- Main interaction panel ----
 
-interface TicketInteractionPanelProps {
-  ticketId: string;
+interface WorkItemInteractionPanelProps {
+  workItemId: string;
   slot?: number;
   colorIndex: number;
   activeTab: PanelTab;
@@ -304,8 +309,8 @@ interface TicketInteractionPanelProps {
   onToggleFocus: () => void;
 }
 
-function TicketInteractionPanel({
-  ticketId,
+function WorkItemInteractionPanel({
+  workItemId,
   slot,
   colorIndex,
   activeTab,
@@ -313,21 +318,21 @@ function TicketInteractionPanel({
   isFocused,
   hotkeyEnabled,
   onToggleFocus,
-}: TicketInteractionPanelProps) {
+}: WorkItemInteractionPanelProps) {
   const releaseSlot = useTerminalStore((s) => s.releaseSlot);
   const getNextAvailableSlot = useTerminalStore((s) => s.getNextAvailableSlot);
-  const transitionTicket = useTransitionTicket();
-  const updateTicket = useUpdateTicket();
-  const approveReview = useApproveTicketReview();
-  const rejectReview = useRejectTicketReview();
-  const closeReview = useCloseTicketReview();
+  const transitionWorkItem = useTransitionWorkItem();
+  const updateWorkItem = useUpdateWorkItem();
+  const approveWorkItemReview = useApproveWorkItemReview();
+  const rejectWorkItemReview = useRejectWorkItemReview();
+  const closeWorkItemReview = useCloseWorkItemReview();
   const recordAttempt = useRecordAttempt();
   const continueAgent = useContinueAgent();
   const cancelAgentTurn = useCancelAgentTurn();
   const stopAgentSession = useStopAgentSession();
   const setAgentPermissionPolicy = useSetAgentPermissionPolicy();
   const respondToAgentPermission = useRespondToAgentPermission();
-  const { data: ticket, isLoading } = useTicket(ticketId);
+  const { data: workItem, isLoading } = useWorkItem(workItemId);
   const [isMutating, setIsMutating] = useState(false);
   const [chatMessage, setChatMessage] = useState('');
   const [chatError, setChatError] = useState<string | null>(null);
@@ -335,9 +340,9 @@ function TicketInteractionPanel({
   const [agentError, setAgentError] = useState<string | null>(null);
   const [isUpdatingAgent, setIsUpdatingAgent] = useState(false);
   const [permissionPolicy, setPermissionPolicy] = useState<AgentPermissionPolicy>('allow_once');
-  const liveItems = useAcpRun(ticketId);
-  const { data: session } = useAgentSession(ticketId);
-  const { data: logs } = useAgentLogs(ticketId);
+  const liveItems = useAcpRun(workItemId);
+  const { data: session } = useAgentSession(workItemId);
+  const { data: logs } = useAgentLogs(workItemId);
   const latestLog = logs?.[0] ?? null;
 
   const persistedItems = useMemo<AcpEventItem[]>(
@@ -361,16 +366,17 @@ function TicketInteractionPanel({
   }, [liveItems, persistedItems]);
   const segments = useMemo(() => groupIntoSegments(mergedItems), [mergedItems]);
 
-  const review = useReview(ticket, activeTab === 'changes' || ticket?.status === 'review');
-  const { data: attempts } = useTicketAttempts(ticketId);
+  const review = useReview(workItem, activeTab === 'changes' || workItem?.status === 'review');
+  const { data: attempts } = useWorkItemAttempts(workItemId);
   const attemptCount = attempts?.length ?? 0;
-  const accent = getTicketColor(colorIndex);
-  const sessionIsRunning = session?.is_running ?? ticket?.status === 'running';
+  const tag = getWorkItemTag(colorIndex);
+  const accent = tag.color;
+  const sessionIsRunning = session?.is_running ?? workItem?.status === 'running';
   const hasOpenSession = !!session;
   const pendingPermission = session?.pending_permission ?? null;
   const slashCommands = useMemo(
-    () => getAgentCliCommands(ticket?.assigned_agent),
-    [ticket?.assigned_agent],
+    () => getAgentCliCommands(workItem?.assigned_agent),
+    [workItem?.assigned_agent],
   );
   const referencedFiles = useMemo(() => extractReferencedFiles(chatMessage), [chatMessage]);
   const activeSlashCommand = useMemo(
@@ -380,11 +386,11 @@ function TicketInteractionPanel({
   const visibleReferencedFiles = referencedFiles.slice(0, 3);
   const hiddenReferenceCount = referencedFiles.length - visibleReferencedFiles.length;
   const canChat = !!(
-    ticket &&
-    ticket.assigned_agent &&
-    ticket.worktree_path &&
-    ticket.status !== 'done' &&
-    ticket.status !== 'archived'
+    workItem &&
+    workItem.assigned_agent &&
+    workItem.worktree_path &&
+    workItem.status !== 'done' &&
+    workItem.status !== 'archived'
   );
   const composerDisabled = isMutating || !canChat || !!pendingPermission;
   const canSendMessage = !!chatMessage.trim() && !composerDisabled;
@@ -403,7 +409,7 @@ function TicketInteractionPanel({
   }, [activeTab, onActiveTabChange, review.review?.has_changes]);
 
   useEffect(() => {
-    if (!ticket || !hotkeyEnabled || ticket.status !== 'running') return;
+    if (!workItem || !hotkeyEnabled || workItem.status !== 'running') return;
 
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
@@ -416,23 +422,23 @@ function TicketInteractionPanel({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [ticket?.id, ticket?.status, hotkeyEnabled, slot, isMutating]);
+  }, [workItem?.id, workItem?.status, hotkeyEnabled, slot, isMutating]);
 
   async function handleAbort() {
-    if (!ticket) return;
+    if (!workItem) return;
     setIsMutating(true);
     setActionError(null);
     try {
-      await stopAgentSession.mutateAsync(ticket.id);
+      await stopAgentSession.mutateAsync(workItem.id);
       if (slot != null) {
         releaseSlot(slot);
       }
-      if (ticket.terminal_slot != null) {
-        await updateTicket.mutateAsync({ id: ticketId, fields: { terminal_slot: null } });
+      if (workItem.terminal_slot != null) {
+        await updateWorkItem.mutateAsync({ id: workItemId, fields: { terminal_slot: null } });
       }
-      if (ticket.status === 'running') {
+      if (workItem.status === 'running') {
         try {
-          await transitionTicket.mutateAsync({ id: ticketId, toStatus: 'ready' });
+          await transitionWorkItem.mutateAsync({ id: workItemId, toStatus: 'ready' });
         } catch (error) {
           if (!String(error).includes('Invalid transition: ready')) {
             throw error;
@@ -447,11 +453,11 @@ function TicketInteractionPanel({
   }
 
   async function handleStopTurn() {
-    if (!ticket) return;
+    if (!workItem) return;
     setIsMutating(true);
     setActionError(null);
     try {
-      await cancelAgentTurn.mutateAsync(ticket.id);
+      await cancelAgentTurn.mutateAsync(workItem.id);
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -463,14 +469,14 @@ function TicketInteractionPanel({
     const previousPolicy = session?.permission_policy ?? permissionPolicy;
     setPermissionPolicy(nextPolicy);
 
-    if (!ticket || !session) {
+    if (!workItem || !session) {
       return;
     }
 
     setActionError(null);
     try {
       await setAgentPermissionPolicy.mutateAsync({
-        ticketId: ticket.id,
+        workItemId: workItem.id,
         policy: nextPolicy,
       });
     } catch (error) {
@@ -480,11 +486,11 @@ function TicketInteractionPanel({
   }
 
   async function handlePermissionDecision(optionId: string | null) {
-    if (!ticket || !pendingPermission) return;
+    if (!workItem || !pendingPermission) return;
     setActionError(null);
     try {
       await respondToAgentPermission.mutateAsync({
-        ticketId: ticket.id,
+        workItemId: workItem.id,
         requestId: pendingPermission.request_id,
         optionId,
       });
@@ -494,19 +500,21 @@ function TicketInteractionPanel({
   }
 
   async function handleApprove() {
-    if (!ticket) return;
+    if (!workItem) return;
     setIsMutating(true);
     setActionError(null);
     try {
-      await recordAttempt.mutateAsync({
-        ticketId: ticket.id,
-        agentId: ticket.assigned_agent ?? 'unknown',
-        agentLogId: latestLog?.id ?? null,
-        outcome: 'approved',
-        durationMs: latestLog?.duration_ms ?? null,
-        exitCode: latestLog?.exit_code ?? null,
-      });
-      await approveReview.mutateAsync(ticket.id);
+      if (workItem.parent_id) {
+        await recordAttempt.mutateAsync({
+          workItemId: workItem.id,
+          agentId: workItem.assigned_agent ?? 'unknown',
+          agentLogId: latestLog?.id ?? null,
+          outcome: 'approved',
+          durationMs: latestLog?.duration_ms ?? null,
+          exitCode: latestLog?.exit_code ?? null,
+        });
+      }
+      await approveWorkItemReview.mutateAsync(workItem.id);
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -515,20 +523,20 @@ function TicketInteractionPanel({
   }
 
   async function handleReject(rejectionReason?: string) {
-    if (!ticket) return;
+    if (!workItem) return;
     setIsMutating(true);
     setActionError(null);
     try {
       await recordAttempt.mutateAsync({
-        ticketId: ticket.id,
-        agentId: ticket.assigned_agent ?? 'unknown',
+        workItemId: workItem.id,
+        agentId: workItem.assigned_agent ?? 'unknown',
         agentLogId: latestLog?.id ?? null,
         outcome: 'rejected',
         rejectionReason: rejectionReason || null,
         durationMs: latestLog?.duration_ms ?? null,
         exitCode: latestLog?.exit_code ?? null,
       });
-      await rejectReview.mutateAsync(ticket.id);
+      await rejectWorkItemReview.mutateAsync(workItem.id);
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -537,11 +545,11 @@ function TicketInteractionPanel({
   }
 
   async function handleClose() {
-    if (!ticket) return;
+    if (!workItem) return;
     setIsMutating(true);
     setActionError(null);
     try {
-      await closeReview.mutateAsync(ticket.id);
+      await closeWorkItemReview.mutateAsync(workItem.id);
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -550,48 +558,48 @@ function TicketInteractionPanel({
   }
 
   async function handleSendMessage() {
-    if (!ticket) return;
+    if (!workItem) return;
     const message = chatMessage.trim();
     if (!message) {
       setChatError('Enter a follow-up message.');
       return;
     }
 
-    if (!ticket.assigned_agent) {
+    if (!workItem.assigned_agent) {
       setChatError('Assign an agent first.');
       return;
     }
 
-    if (!ticket.worktree_path) {
-      setChatError('Create a worktree before continuing this ticket.');
+    if (!workItem.worktree_path) {
+      setChatError('Create a worktree before continuing this work item.');
       return;
     }
 
-    if (ticket.status === 'done' || ticket.status === 'archived') {
-      setChatError('Closed tickets cannot accept more agent turns.');
+    if (workItem.status === 'done' || workItem.status === 'archived') {
+      setChatError('Closed work items cannot accept more agent turns.');
       return;
     }
 
     const nextSlot = slot ?? getNextAvailableSlot();
     if (nextSlot == null) {
-      setChatError('All 8 terminal slots are in use. Finish or abort a running ticket first.');
+      setChatError('All 8 terminal slots are in use. Finish or abort a running work item first.');
       return;
     }
 
-    const previousStatus = ticket.status;
+    const previousStatus = workItem.status;
     setIsMutating(true);
     setChatError(null);
     setActionError(null);
 
     try {
-      if (ticket.terminal_slot == null) {
-        await updateTicket.mutateAsync({ id: ticket.id, fields: { terminal_slot: nextSlot } });
+      if (workItem.terminal_slot == null) {
+        await updateWorkItem.mutateAsync({ id: workItem.id, fields: { terminal_slot: nextSlot } });
       }
-      if (ticket.status !== 'running') {
-        await transitionTicket.mutateAsync({ id: ticket.id, toStatus: 'running' });
+      if (workItem.status !== 'running') {
+        await transitionWorkItem.mutateAsync({ id: workItem.id, toStatus: 'running' });
       }
       await continueAgent.mutateAsync({
-        ticketId: ticket.id,
+        workItemId: workItem.id,
         slot: nextSlot,
         message,
         permissionPolicy,
@@ -599,13 +607,13 @@ function TicketInteractionPanel({
       setChatMessage('');
       onActiveTabChange('agent');
     } catch (error) {
-      if (ticket.terminal_slot == null) {
+      if (workItem.terminal_slot == null) {
         releaseSlot(nextSlot);
-        await updateTicket.mutateAsync({ id: ticket.id, fields: { terminal_slot: null } });
+        await updateWorkItem.mutateAsync({ id: workItem.id, fields: { terminal_slot: null } });
       }
       if (previousStatus !== 'running') {
         try {
-          await transitionTicket.mutateAsync({ id: ticket.id, toStatus: previousStatus });
+          await transitionWorkItem.mutateAsync({ id: workItem.id, toStatus: previousStatus });
         } catch { /* best-effort rollback */ }
       }
       setChatError(String(error));
@@ -615,12 +623,12 @@ function TicketInteractionPanel({
   }
 
   async function handleAgentChange(nextAgent: string) {
-    if (!ticket) return;
+    if (!workItem) return;
     setAgentError(null);
     setIsUpdatingAgent(true);
     try {
-      await updateTicket.mutateAsync({
-        id: ticket.id,
+      await updateWorkItem.mutateAsync({
+        id: workItem.id,
         fields: { assigned_agent: nextAgent || null },
       });
     } catch (error) {
@@ -630,7 +638,7 @@ function TicketInteractionPanel({
     }
   }
 
-  if (isLoading || !ticket) {
+  if (isLoading || !workItem) {
     return (
       <div className="h-full flex items-center justify-center bg-bg">
         <Loader2 className="w-4 h-4 animate-spin text-text-dim" />
@@ -649,20 +657,22 @@ function TicketInteractionPanel({
       {/* Panel header */}
       <div className="flex items-center gap-2 px-3 py-2 shrink-0 border-b border-border bg-surface">
         <span
-          className="w-2 h-2 rounded-full shrink-0"
+          className="w-[18px] h-[18px] rounded-md flex items-center justify-center text-[10px] font-bold shrink-0 text-white/90"
           style={{ backgroundColor: accent }}
-        />
+        >
+          {tag.letter}
+        </span>
         {/* Title — bold, high contrast */}
-        <span className="text-[13px] text-text truncate flex-1 font-semibold">{ticket.title}</span>
+        <span className="text-[13px] text-text truncate flex-1 font-semibold">{workItem.title}</span>
         {/* Meta — dimmed */}
         {attemptCount > 0 && (
           <span className="text-[10px] font-mono text-amber-400/80 shrink-0 bg-amber-500/[0.08] px-1.5 py-0.5 rounded-md border border-amber-500/[0.12]">
             Attempt {attemptCount + 1}
           </span>
         )}
-        {ticket.assigned_agent && (
+        {workItem.assigned_agent && (
           <span className="text-[10px] font-mono text-text-dim shrink-0 bg-white/[0.04] px-1.5 py-0.5 rounded-md border border-white/[0.05]">
-            {ticket.assigned_agent}
+            {workItem.assigned_agent}
           </span>
         )}
         {slot != null && (
@@ -680,7 +690,7 @@ function TicketInteractionPanel({
           <button
             onClick={handleAbort}
             disabled={isMutating}
-            title={sessionIsRunning ? 'Stop session and return ticket to ready' : 'Close agent session'}
+            title={sessionIsRunning ? 'Stop session and return work item to ready' : 'Close agent session'}
             className="shrink-0 w-5 h-5 flex items-center justify-center rounded text-text-dim hover:text-state-danger hover:bg-state-danger/10 transition-all duration-150 disabled:opacity-40"
           >
             {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}
@@ -733,15 +743,15 @@ function TicketInteractionPanel({
         })}
         {/* Right-aligned inline badges */}
         <div className="ml-auto flex items-center gap-2">
-          <StatusBadge status={ticket.status} />
+          <StatusBadge status={workItem.status} />
           {hasOpenSession && (
             <span className="text-[10px] font-mono text-[#d4a087] bg-[#d4a087]/10 px-1.5 py-0.5 rounded-md border border-[#d4a087]/20">
               {sessionIsRunning ? 'session: active' : 'session: open'}
             </span>
           )}
-          {ticket.repo_path && (
-            <span className="text-[10px] font-mono text-text-dim bg-white/[0.04] px-1.5 py-0.5 rounded-md border border-white/[0.05] truncate max-w-[140px]" title={ticket.repo_path}>
-              {ticket.repo_path.split(/[/\\]/).pop() ?? ticket.repo_path}
+          {workItem.repo_path && (
+            <span className="text-[10px] font-mono text-text-dim bg-white/[0.04] px-1.5 py-0.5 rounded-md border border-white/[0.05] truncate max-w-[140px]" title={workItem.repo_path}>
+              {workItem.repo_path.split(/[/\\]/).pop() ?? workItem.repo_path}
             </span>
           )}
         </div>
@@ -846,7 +856,7 @@ function TicketInteractionPanel({
                       void handleSendMessage();
                     }
                   }}
-                  repoPath={ticket.worktree_path ?? ticket.repo_path ?? ''}
+                  repoPath={workItem.worktree_path ?? workItem.repo_path ?? ''}
                   slashCommands={slashCommands}
                   placeholder={
                     pendingPermission
@@ -884,7 +894,7 @@ function TicketInteractionPanel({
                       disabled={isMutating}
                     />
                     <AgentSelectorDropdown
-                      currentAgent={ticket.assigned_agent ?? ''}
+                      currentAgent={workItem.assigned_agent ?? ''}
                       onAgentChange={handleAgentChange}
                       disabled={isUpdatingAgent}
                     />
@@ -927,19 +937,19 @@ function TicketInteractionPanel({
         </>
       ) : activeTab === 'changes' ? (
         <ReviewPanel
-          ticket={ticket}
+          workItem={workItem}
           review={review.review}
           reviewLoading={review.reviewLoading}
           reviewError={review.reviewError}
           latestLog={latestLog}
           onApprove={handleApprove}
-          onReject={handleReject}
-          onClose={handleClose}
+          onReject={workItem.parent_id ? handleReject : undefined}
+          onClose={workItem.parent_id ? undefined : handleClose}
           isMutating={isMutating}
           actionError={actionError}
         />
       ) : (
-        <DescriptionTab ticket={ticket} />
+        <DescriptionTab workItem={workItem} />
       )}
     </div>
   );
@@ -1072,27 +1082,27 @@ function PermissionPolicyDropdown({
 
 const AGENT_COLORS: Record<string, string> = {
   'claude-code': '#D97706',
-  'gemini-cli': '#3B82F6',
+  'gemini-cli': '#60a5fa',
   'codex-cli': '#10B981',
 };
 
 // ---- Description tab ----
 
-function DescriptionTab({ ticket }: { ticket: Ticket }) {
+function DescriptionTab({ workItem }: { workItem: WorkItem }) {
   return (
     <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
       {/* Dates */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px] text-text-dim">
-        <TimestampInline label="Created" date={ticket.created_at} />
-        <TimestampInline label="Updated" date={ticket.updated_at} />
-        {ticket.started_at && <TimestampInline label="Started" date={ticket.started_at} />}
-        {ticket.completed_at && <TimestampInline label="Completed" date={ticket.completed_at} />}
+        <TimestampInline label="Created" date={workItem.created_at} />
+        <TimestampInline label="Updated" date={workItem.updated_at} />
+        {workItem.started_at && <TimestampInline label="Started" date={workItem.started_at} />}
+        {workItem.completed_at && <TimestampInline label="Completed" date={workItem.completed_at} />}
       </div>
 
       {/* Description */}
-      {ticket.context ? (
+      {workItem.context ? (
         <div className="text-[13px] leading-[1.7] text-text-muted">
-          <MarkdownText content={ticket.context} />
+          <MarkdownText content={workItem.context} />
         </div>
       ) : (
         <p className="text-[12px] text-text-dim italic">No description provided.</p>
@@ -1254,7 +1264,7 @@ function MarkdownText({ content }: { content: string }) {
         ),
         hr: () => <hr className="my-2 border-border" />,
         a: ({ children, href }) => (
-          <a href={href} className="text-accent underline underline-offset-2 hover:text-blue-400 transition-colors">
+          <a href={href} className="text-accent underline underline-offset-2 hover:text-emerald-400 transition-colors">
             {children}
           </a>
         ),

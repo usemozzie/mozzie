@@ -24,4 +24,10 @@ packages/*/dist/
 .DS_Store
 Thumbs.db
 
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
 target-codex-check

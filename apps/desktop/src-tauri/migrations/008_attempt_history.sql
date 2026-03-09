@@ -1,6 +1,6 @@
-CREATE TABLE IF NOT EXISTS ticket_attempts (
+CREATE TABLE IF NOT EXISTS work_item_attempts (
   id               TEXT PRIMARY KEY,
-  ticket_id        TEXT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  work_item_id     TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
   attempt_number   INTEGER NOT NULL,
   agent_id         TEXT NOT NULL,
   agent_log_id     TEXT,
@@ -11,8 +11,8 @@ CREATE TABLE IF NOT EXISTS ticket_attempts (
   duration_ms      INTEGER,
   exit_code        INTEGER,
   created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-  UNIQUE (ticket_id, attempt_number)
+  UNIQUE (work_item_id, attempt_number)
 );
 
-CREATE INDEX IF NOT EXISTS idx_attempts_ticket ON ticket_attempts(ticket_id);
-CREATE INDEX IF NOT EXISTS idx_attempts_ticket_number ON ticket_attempts(ticket_id, attempt_number);
+CREATE INDEX IF NOT EXISTS idx_attempts_work_item ON work_item_attempts(work_item_id);
+CREATE INDEX IF NOT EXISTS idx_attempts_work_item_number ON work_item_attempts(work_item_id, attempt_number);

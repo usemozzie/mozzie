@@ -2,64 +2,64 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useEffect } from 'react';
-import type { TicketDependency } from '@mozzie/db';
-import { TICKETS_KEY } from './useTickets';
+import type { WorkItemDependency } from '@mozzie/db';
+import { WORK_ITEMS_KEY } from './useWorkItems';
 
-const DEPS_KEY = 'ticket-dependencies';
-const DEPENDENTS_KEY = 'ticket-dependents';
+const DEPS_KEY = 'work-item-dependencies';
+const DEPENDENTS_KEY = 'work-item-dependents';
 
-export function useTicketDependencies(ticketId: string | null) {
+export function useWorkItemDependencies(workItemId: string | null) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    if (!ticketId) return;
-    const unlisten = listen<{ ticketId: string }>('ticket:deps-changed', (event) => {
-      if (event.payload.ticketId === ticketId) {
-        queryClient.invalidateQueries({ queryKey: [DEPS_KEY, ticketId] });
+    if (!workItemId) return;
+    const unlisten = listen<{ workItemId: string }>('work-item:deps-changed', (event) => {
+      if (event.payload.workItemId === workItemId) {
+        queryClient.invalidateQueries({ queryKey: [DEPS_KEY, workItemId] });
       }
     });
     return () => { unlisten.then((fn) => fn()); };
-  }, [ticketId, queryClient]);
+  }, [workItemId, queryClient]);
 
   return useQuery({
-    queryKey: [DEPS_KEY, ticketId],
-    queryFn: () => invoke<TicketDependency[]>('get_ticket_dependencies', { ticketId }),
-    enabled: !!ticketId,
+    queryKey: [DEPS_KEY, workItemId],
+    queryFn: () => invoke<WorkItemDependency[]>('get_work_item_dependencies', { workItemId }),
+    enabled: !!workItemId,
   });
 }
 
-export function useTicketDependents(ticketId: string | null) {
+export function useWorkItemDependents(workItemId: string | null) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    if (!ticketId) return;
-    const unlisten = listen<{ ticketId: string }>('ticket:deps-changed', () => {
-      queryClient.invalidateQueries({ queryKey: [DEPENDENTS_KEY, ticketId] });
+    if (!workItemId) return;
+    const unlisten = listen<{ workItemId: string }>('work-item:deps-changed', () => {
+      queryClient.invalidateQueries({ queryKey: [DEPENDENTS_KEY, workItemId] });
     });
     return () => { unlisten.then((fn) => fn()); };
-  }, [ticketId, queryClient]);
+  }, [workItemId, queryClient]);
 
   return useQuery({
-    queryKey: [DEPENDENTS_KEY, ticketId],
-    queryFn: () => invoke<TicketDependency[]>('get_ticket_dependents', { ticketId }),
-    enabled: !!ticketId,
+    queryKey: [DEPENDENTS_KEY, workItemId],
+    queryFn: () => invoke<WorkItemDependency[]>('get_work_item_dependents', { workItemId }),
+    enabled: !!workItemId,
   });
 }
 
-export function useHasUnmetDependencies(ticketId: string | null) {
+export function useHasUnmetDependencies(workItemId: string | null) {
   return useQuery({
-    queryKey: ['unmet-deps', ticketId],
-    queryFn: () => invoke<boolean>('has_unmet_dependencies', { ticketId }),
-    enabled: !!ticketId,
+    queryKey: ['unmet-deps', workItemId],
+    queryFn: () => invoke<boolean>('has_unmet_dependencies', { workItemId }),
+    enabled: !!workItemId,
   });
 }
 
 export function useAddDependency() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { ticketId: string; dependsOnId: string }) =>
-      invoke<void>('add_ticket_dependency', {
-        ticketId: params.ticketId,
+    mutationFn: (params: { workItemId: string; dependsOnId: string }) =>
+      invoke<void>('add_work_item_dependency', {
+        workItemId: params.workItemId,
         dependsOnId: params.dependsOnId,
       }),
     onSuccess: () => {
@@ -73,16 +73,16 @@ export function useAddDependency() {
 export function useRemoveDependency() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (params: { ticketId: string; dependsOnId: string }) =>
-      invoke<void>('remove_ticket_dependency', {
-        ticketId: params.ticketId,
+    mutationFn: (params: { workItemId: string; dependsOnId: string }) =>
+      invoke<void>('remove_work_item_dependency', {
+        workItemId: params.workItemId,
         dependsOnId: params.dependsOnId,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [DEPS_KEY] });
       queryClient.invalidateQueries({ queryKey: [DEPENDENTS_KEY] });
       queryClient.invalidateQueries({ queryKey: ['unmet-deps'] });
-      queryClient.invalidateQueries({ queryKey: [TICKETS_KEY] });
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEMS_KEY] });
     },
   });
 }

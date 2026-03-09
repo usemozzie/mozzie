@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { X, Pencil, Eye } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useTicketStore } from '../../stores/ticketStore';
+import { useWorkItemStore } from '../../stores/workItemStore';
 import { useNotes, useSaveNotes } from '../../hooks/useNotes';
 
 interface NotesPanelProps {
@@ -18,7 +18,7 @@ export function NotesPanel({ onClose }: NotesPanelProps) {
   const [mode, setMode] = useState<'edit' | 'preview'>('edit');
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const openNewTicketModal = useTicketStore((s) => s.openNewTicketModal);
+  const openNewWorkItemModal = useWorkItemStore((s) => s.openNewWorkItemModal);
 
   // Load from DB when query resolves or workspace changes
   useEffect(() => {
@@ -60,10 +60,10 @@ export function NotesPanel({ onClose }: NotesPanelProps) {
     setSelectedText(value);
   }
 
-  function handleCreateTicketFromSelection() {
+  function handleCreateWorkItemFromSelection() {
     const value = selectedText.trim();
     if (!value) return;
-    openNewTicketModal(value);
+    openNewWorkItemModal(value);
   }
 
   return (
@@ -157,14 +157,14 @@ export function NotesPanel({ onClose }: NotesPanelProps) {
         {selectedText && mode === 'edit' && (
           <div className="shrink-0 flex items-center justify-between border-t border-border px-4 py-2">
             <span className="text-xs text-text-dim truncate pr-3">
-              Create ticket from selected text
+              Create work item from selected text
             </span>
             <button
               type="button"
-              onClick={handleCreateTicketFromSelection}
+              onClick={handleCreateWorkItemFromSelection}
               className="text-xs px-2.5 py-1 rounded-md border border-border bg-surface hover:bg-surface-raised text-text transition-colors"
             >
-              Create Ticket
+              Create Work Item
             </button>
           </div>
         )}

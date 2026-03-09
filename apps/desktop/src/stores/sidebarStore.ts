@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type SidebarView = 'tickets' | 'repos';
+export type SidebarView = 'work-items' | 'repos';
 
 interface SidebarStore {
   activeView: SidebarView;
@@ -8,6 +8,6 @@ interface SidebarStore {
 }
 
 export const useSidebarStore = create<SidebarStore>((set) => ({
-  activeView: 'tickets',
+  activeView: 'work-items',
   setActiveView: (view) => set({ activeView: view }),
 }));

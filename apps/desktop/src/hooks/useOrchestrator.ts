@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { invoke } from '@tauri-apps/api/core';
-import type { AgentConfig, Repo, Ticket } from '@mozzie/db';
+import type { AgentConfig, Repo, WorkItem } from '@mozzie/db';
 
 export type OrchestratorProvider = 'openai' | 'anthropic' | 'gemini';
 
@@ -26,32 +26,34 @@ export interface OrchestratorKeyStore {
   models: Record<OrchestratorProvider, string>;
 }
 
-export interface OrchestratorTicketSpec {
+export interface OrchestratorWorkItemSpec {
   title: string;
   context: string;
   execution_context?: string | null;
   orchestrator_note?: string | null;
   repo_path?: string | null;
+  branch_name?: string | null;
   assigned_agent?: string | null;
   depends_on_titles?: string[] | null;
-  duplicate_of_ticket_id?: string | null;
+  parent_title?: string | null;
+  duplicate_of_work_item_id?: string | null;
   duplicate_policy?: string | null;
   intent_type?: string | null;
 }
 
 export interface OrchestratorAction {
-  kind: 'summary' | 'create_tickets' | 'start_ticket' | 'run_all_ready' | 'delete_tickets' | 'close_tickets' | 'reopen_tickets' | 'analyze_and_plan';
-  ticket_id?: string | null;
-  ticket_ids?: string[] | null;
-  tickets?: OrchestratorTicketSpec[] | null;
+  kind: 'summary' | 'create_work_items' | 'start_work_item' | 'run_all_ready' | 'delete_work_items' | 'close_work_items' | 'reopen_work_items' | 'explore_repo';
+  work_item_id?: string | null;
+  work_item_ids?: string[] | null;
+  work_items?: OrchestratorWorkItemSpec[] | null;
   repo_path?: string | null;
-  repo_paths?: string[] | null;
-  objective?: string | null;
+  prompt?: string | null;
 }
 
 export interface OrchestratorPlan {
   assistant_message: string;
   actions: OrchestratorAction[];
+  done?: boolean;
 }
 
 const STORAGE_KEY = 'mozzie.orchestratorConfig';
@@ -182,7 +184,7 @@ export function usePlanOrchestratorActions() {
     mutationFn: ({
       config,
       message,
-      tickets,
+      workItems,
       history,
       repos,
       agents,
@@ -191,8 +193,8 @@ export function usePlanOrchestratorActions() {
     }: {
       config: OrchestratorConfig;
       message: string;
-      tickets: Ticket[];
-      history: Array<{ role: 'user' | 'orchestrator'; text: string }>;
+      workItems: WorkItem[];
+      history: Array<{ role: 'user' | 'orchestrator'; text: string; metadata?: string | null }>;
       repos: Repo[];
       agents: AgentConfig[];
       recentRepos: string[];
@@ -204,22 +206,22 @@ export function usePlanOrchestratorActions() {
         model: config.model,
         message,
         workspaceId,
-        ticketsJson: JSON.stringify(
-          tickets.map((ticket) => ({
-            id: ticket.id,
-            title: ticket.title,
-            status: ticket.status,
-            context: ticket.context,
-            execution_context: ticket.execution_context,
-            orchestrator_note: ticket.orchestrator_note,
-            repo_path: ticket.repo_path,
-            assigned_agent: ticket.assigned_agent,
-            worktree_path: ticket.worktree_path,
-            branch_name: ticket.branch_name,
-            duplicate_of_ticket_id: ticket.duplicate_of_ticket_id,
-            duplicate_policy: ticket.duplicate_policy,
-            intent_type: ticket.intent_type,
-            updated_at: ticket.updated_at,
+        workItemsJson: JSON.stringify(
+          workItems.map((workItem) => ({
+            id: workItem.id,
+            title: workItem.title,
+            status: workItem.status,
+            context: workItem.context,
+            execution_context: workItem.execution_context,
+            orchestrator_note: workItem.orchestrator_note,
+            repo_path: workItem.repo_path,
+            assigned_agent: workItem.assigned_agent,
+            worktree_path: workItem.worktree_path,
+            branch_name: workItem.branch_name,
+            duplicate_of_work_item_id: workItem.duplicate_of_work_item_id,
+            duplicate_policy: workItem.duplicate_policy,
+            intent_type: workItem.intent_type,
+            updated_at: workItem.updated_at,
           }))
         ),
         historyJson: JSON.stringify(history),

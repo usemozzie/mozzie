@@ -1,114 +1,69 @@
-# Mozzie — Multi-Agent Build System
+# Mozzie
+
+A local-first desktop app for orchestrating AI coding agents across your codebase. Manage multiple agents working in parallel, each in isolated git worktrees, with dependency tracking and a built-in review workflow.
+
+## Features
+
+- **Multi-agent orchestration** — Run multiple AI agents (Claude Code, Gemini CLI, Codex CLI) simultaneously on different tasks
+- **Git worktree isolation** — Each work item gets its own worktree so agents never conflict
+- **LLM-powered planner** — Describe what you want built and the orchestrator breaks it into work items, assigns agents, and manages dependencies
+- **Review workflow** — Inspect diffs, approve to merge/push, reject to re-run with feedback
+- **Dependency tracking** — Work items can depend on each other; blocked items auto-launch when dependencies are approved
+- **Sub-work-items** — Break features into child tasks that merge into a parent branch before pushing
+- **Live streaming** — Watch agent output in real-time with tool call activity visualization
+- **Conversation history** — Orchestrator conversations persist so you can iterate across sessions
 
 ## Quick Start
 
-```bash
-# 1. Clone and enter the project directory
-git init mozzie && cd mozzie
+### Prerequisites
 
-# 2. Copy this entire directory structure into your project root
-#    (agents/, docs/, scripts/, CLAUDE.md)
+- [Node.js](https://nodejs.org/) >= 20
+- [pnpm](https://pnpm.io/) >= 9
+- [Rust](https://www.rust-lang.org/tools/install) (latest stable)
+- Platform-specific [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
 
-# 3. Run the full build pipeline
-chmod +x scripts/launch-agents.sh
-./scripts/launch-agents.sh
-```
-
-## What This Does
-
-This system uses **4 Claude Code agents** working in parallel to build the Mozzie desktop app. Each agent has a strictly scoped task with defined file ownership to prevent merge conflicts.
-
-```
-Task A (Scaffold)  ──────────────────────┐
-  Creates: monorepo, types, migrations,  │
-  Tauri config, build pipeline           │
-                                         ▼
-                              ┌─── Task B (PTY/Terminals)
-                              │     Creates: Rust PTY pool,
-                              │     xterm.js grid, terminal hooks
-                              │
-                              ├─── Task C (Tickets/UI)
-                              │     Creates: ticket CRUD, state machine,
-                              │     left panel, React components
-                              │
-                              └──────────┬──────────┘
-                                         │
-                                         ▼
-                              Task D (Orchestration)
-                                Creates: agent spawning, git worktree,
-                                review UI, settings, final layout
-```
-
-## Running Individual Tasks
-
-If a task fails or you want to iterate on a specific piece:
+### Install and Run
 
 ```bash
-# Run just the scaffolding
-./scripts/launch-agents.sh --task a
-
-# Run just the terminal system (requires Task A complete)
-./scripts/launch-agents.sh --task b
-
-# Run B and C in parallel (requires Task A complete)
-./scripts/launch-agents.sh --parallel
-
-# Resume from Task D (requires A, B, C complete)
-./scripts/launch-agents.sh --resume d
+git clone https://github.com/usemozzie/mozzie.git
+cd mozzie
+pnpm install
+pnpm dev
 ```
 
-## Manual Agent Execution
+### Configure
 
-If you prefer to run agents manually or in separate terminal windows:
+1. Open **Settings** (gear icon) and add API keys for your LLM provider (OpenAI, Anthropic, or Gemini)
+2. Add agent configurations for the coding agents you want to use (Claude Code, Gemini CLI, etc.)
+3. Create a work item, assign a repo and agent, and hit play
 
-```bash
-# Terminal 1: Run Task A first
-claude -p "$(cat agents/task-a-scaffold.md)" --allowedTools "Bash(command:*),Read,Write,Edit"
+Or use the orchestrator (`Ctrl+K`) — describe what you want built and let it create the work items for you.
 
-# Terminal 2: After Task A, run Task B
-claude -p "$(cat agents/task-b-pty-terminals.md)" --allowedTools "Bash(command:*),Read,Write,Edit"
+## Architecture
 
-# Terminal 3: After Task A, run Task C (can run simultaneously with B)
-claude -p "$(cat agents/task-c-tickets-ui.md)" --allowedTools "Bash(command:*),Read,Write,Edit"
-
-# Terminal 4: After B and C complete, run Task D
-claude -p "$(cat agents/task-d-orchestration.md)" --allowedTools "Bash(command:*),Read,Write,Edit"
+```
+mozzie/
+├── apps/desktop/             # Tauri 2.0 desktop app
+│   ├── src/                  # React frontend (TypeScript)
+│   └── src-tauri/            # Rust backend
+├── packages/
+│   ├── db/                   # SQLite schema and type definitions
+│   ├── agent-sdk/            # Agent communication types
+│   └── ui/                   # Shared UI components
 ```
 
-## Build Logs
+**Stack:** Tauri 2.0 + React 18 + TypeScript + Tailwind CSS + SQLite + TanStack Query + Zustand
 
-All agent output is logged to `.mozzie-build-logs/`:
-- `Task-A-Scaffold.log`
-- `Task-B-PTY-Terminals.log`
-- `Task-C-Tickets-UI.log`
-- `Task-D-Orchestration.log`
+Agents communicate via [ACP](https://github.com/anthropics/agent-client-protocol) (Agent Communication Protocol) over stdio transport.
 
-## File Ownership Map
+## Contributing
 
-Each task owns specific files. This prevents agents from stepping on each other:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
-| Path | Owner |
-|------|-------|
-| `pnpm-workspace.yaml`, `turbo.json`, `tsconfig.*.json` | Task A |
-| `packages/db/`, `packages/agent-sdk/`, `packages/ui/` | Task A |
-| `apps/desktop/src-tauri/tauri.conf.json` | Task A |
-| `apps/desktop/src-tauri/src/pty/` | Task B |
-| `apps/desktop/src/components/terminal/` | Task B |
-| `apps/desktop/src/hooks/useTerminal.ts`, `usePty.ts` | Task B |
-| `apps/desktop/src-tauri/src/commands/tickets.rs` | Task C |
-| `apps/desktop/src/components/tickets/`, `ui/` | Task C |
-| `apps/desktop/src/stores/` | Task C |
-| `apps/desktop/src-tauri/src/agents/` | Task D |
-| `apps/desktop/src-tauri/src/commands/agents.rs`, `worktree.rs` | Task D |
-| `apps/desktop/src/components/review/`, `settings/` | Task D |
-| `apps/desktop/src/App.tsx` (final assembly) | Task D |
+## Security
 
-## Troubleshooting
+See [SECURITY.md](SECURITY.md) for information about API key storage and agent execution model.
 
-**Task fails midway:** Use `--resume` to pick up from where it left off. Check the build log for the specific error.
+## License
 
-**Type errors after Task A:** Ensure `pnpm install` ran successfully. Check that `packages/db/src/schema.ts` exports all types.
-
-**Tauri won't compile:** Check `Cargo.toml` for missing dependencies. Run `cargo check` in `apps/desktop/src-tauri/` for Rust errors.
-
-**Agents conflict on a file:** This shouldn't happen if ownership is respected. If it does, the later task's version should take precedence since it has more context.
+[MIT](LICENSE)

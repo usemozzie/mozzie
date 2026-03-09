@@ -66,7 +66,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for AgentConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentLog {
     pub id: String,
-    pub ticket_id: String,
+    pub work_item_id: String,
     pub agent_id: String,
     pub run_id: Option<String>,
     pub messages: Option<String>, // JSON: Vec<AcpEventItem>
@@ -85,7 +85,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for AgentLog {
     fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
         Ok(AgentLog {
             id: row.try_get("id")?,
-            ticket_id: row.try_get("ticket_id")?,
+            work_item_id: row.try_get("work_item_id")?,
             agent_id: row.try_get("agent_id")?,
             run_id: row.try_get("run_id")?,
             messages: row.try_get("messages")?,
@@ -144,7 +144,7 @@ pub struct AgentPermissionRequestState {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentSessionState {
-    pub ticket_id: String,
+    pub work_item_id: String,
     pub agent_id: String,
     pub session_id: String,
     pub is_running: bool,
@@ -163,7 +163,7 @@ struct PendingPermissionDecision {
 #[derive(Clone)]
 struct SessionShared {
     app: AppHandle,
-    ticket_id: String,
+    work_item_id: String,
     agent_id: String,
     worktree_root: PathBuf,
     snapshot: Arc<Mutex<AgentSessionState>>,
@@ -178,7 +178,7 @@ impl SessionShared {
             .lock()
             .map(|state| state.clone())
             .unwrap_or_else(|_| AgentSessionState {
-                ticket_id: self.ticket_id.clone(),
+                work_item_id: self.work_item_id.clone(),
                 agent_id: self.agent_id.clone(),
                 session_id: String::new(),
                 is_running: false,
@@ -204,7 +204,7 @@ impl SessionShared {
 
     fn emit_state(&self) {
         let state = self.snapshot();
-        emit_session_state(&self.app, &self.ticket_id, Some(&state));
+        emit_session_state(&self.app, &self.work_item_id, Some(&state));
     }
 
     fn mark_activity(&self) {
@@ -248,7 +248,7 @@ impl SessionShared {
             events.push(item.clone());
         }
         if let Some(log_id) = self.current_log_id() {
-            emit_acp_event(&self.app, &self.ticket_id, &log_id, &item);
+            emit_acp_event(&self.app, &self.work_item_id, &log_id, &item);
         }
     }
 
@@ -584,36 +584,38 @@ fn render_content_block(block: &ContentBlock) -> String {
     }
 }
 
+/// Extract explicit file references using the `@file:path/to/file.ext` syntax.
+/// Bare `@path` is NOT treated as a file reference because execution contexts are full
+/// of npm scoped packages (`@testing-library/jest-dom`), import aliases (`@/components/...`),
+/// and other `@`-prefixed tokens that are not file references.
 fn extract_file_references(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
+    let prefix = "@file:";
 
-    while i < chars.len() {
-        if chars[i] != '@' {
-            i += 1;
-            continue;
-        }
+    let mut search_from = 0;
+    while let Some(pos) = text[search_from..].find(prefix) {
+        let abs_pos = search_from + pos + prefix.len();
+        let mut end = abs_pos;
+        let chars: Vec<char> = text[abs_pos..].chars().collect();
 
-        let start = i + 1;
-        let mut end = start;
-        while end < chars.len() {
-            let ch = chars[end];
+        for &ch in &chars {
             if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\') {
-                end += 1;
+                end += ch.len_utf8();
             } else {
                 break;
             }
         }
 
-        if end > start {
-            let candidate: String = chars[start..end].iter().collect();
-            if !refs.iter().any(|existing| existing == &candidate) {
+        if end > abs_pos {
+            let candidate = text[abs_pos..end]
+                .trim_end_matches(|c: char| c == '.' || c == '/')
+                .to_string();
+            if !candidate.is_empty() && !refs.contains(&candidate) {
                 refs.push(candidate);
             }
         }
 
-        i = end.max(i + 1);
+        search_from = end.max(abs_pos);
     }
 
     refs
@@ -751,13 +753,13 @@ fn build_command(command_line: &str, cwd: &str, api_key_ref: Option<&str>, api_k
 
 // ─── Attempt History Injection ─────────────────────────────────────────────────
 
-async fn build_attempt_history_section(pool: &SqlitePool, ticket_id: &str) -> String {
+async fn build_attempt_history_section(pool: &SqlitePool, work_item_id: &str) -> String {
     let attempts: Vec<(i64, String, String, Option<String>, Option<String>, Option<i64>)> =
         match sqlx::query_as(
             "SELECT attempt_number, agent_id, outcome, rejection_reason, files_changed, duration_ms \
-             FROM ticket_attempts WHERE ticket_id = ? ORDER BY attempt_number ASC",
+             FROM work_item_attempts WHERE work_item_id = ? ORDER BY attempt_number ASC",
         )
-        .bind(ticket_id)
+        .bind(work_item_id)
         .fetch_all(pool)
         .await
         {
@@ -911,7 +913,7 @@ pub async fn delete_agent_config(db: State<'_, SqlitePool>, id: String) -> Resul
 // ─── Agent Launch (ACP) ───────────────────────────────────────────────────────
 
 struct AgentTurnRequest {
-    ticket_id: String,
+    work_item_id: String,
     agent_id: String,
     acp_target: String,
     prompt: String,
@@ -923,25 +925,25 @@ struct AgentTurnRequest {
 
 async fn build_turn_request(
     pool: &SqlitePool,
-    ticket_id: &str,
+    work_item_id: &str,
     extra_instruction: Option<String>,
 ) -> Result<AgentTurnRequest, String> {
     let row = sqlx::query(
-        "SELECT context, execution_context, worktree_path, assigned_agent FROM tickets WHERE id = ?",
+        "SELECT context, execution_context, worktree_path, assigned_agent FROM work_items WHERE id = ?",
     )
-    .bind(ticket_id)
+    .bind(work_item_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("Ticket {} not found", ticket_id))?;
+    .ok_or_else(|| format!("Work item {} not found", work_item_id))?;
 
     let context: Option<String> = row.try_get("context").ok().flatten();
     let execution_context: Option<String> = row.try_get("execution_context").ok().flatten();
     let worktree_path: Option<String> = row.try_get("worktree_path").ok().flatten();
     let assigned_agent: Option<String> = row.try_get("assigned_agent").ok().flatten();
 
-    let worktree_path = worktree_path.ok_or("Ticket has no worktree_path; run create_worktree first")?;
-    let agent_id = assigned_agent.ok_or("Ticket has no assigned_agent")?;
+    let worktree_path = worktree_path.ok_or("Work item has no worktree_path; run create_worktree first")?;
+    let agent_id = assigned_agent.ok_or("Work item has no assigned_agent")?;
 
     let agent = sqlx::query_as::<_, AgentConfig>(
         "SELECT id, display_name, acp_url, api_key_ref, model, max_concurrent, enabled, strengths, weaknesses, best_for, reasoning_class, speed_class, edit_reliability \
@@ -957,10 +959,10 @@ async fn build_turn_request(
         .filter(|s| !s.trim().is_empty())
         .or(context.filter(|s| !s.trim().is_empty()))
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "Ticket is missing executable context".to_string())?;
+        .ok_or_else(|| "Work item is missing executable context".to_string())?;
 
     // Inject attempt history so agents learn from prior rejections.
-    let attempt_history = build_attempt_history_section(pool, &ticket_id).await;
+    let attempt_history = build_attempt_history_section(pool, &work_item_id).await;
     let base_prompt = if attempt_history.is_empty() {
         base_prompt
     } else {
@@ -982,7 +984,7 @@ async fn build_turn_request(
         .and_then(|var| std::env::var(var).ok());
 
     Ok(AgentTurnRequest {
-        ticket_id: ticket_id.to_string(),
+        work_item_id: work_item_id.to_string(),
         agent_id,
         acp_target: agent.acp_url,
         prompt: full_prompt,
@@ -993,11 +995,11 @@ async fn build_turn_request(
     })
 }
 
-async fn insert_agent_log(pool: &SqlitePool, ticket_id: &str, agent_id: &str) -> Result<String, String> {
+async fn insert_agent_log(pool: &SqlitePool, work_item_id: &str, agent_id: &str) -> Result<String, String> {
     let log_id = Ulid::new().to_string();
-    sqlx::query("INSERT INTO agent_logs (id, ticket_id, agent_id, created_at) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO agent_logs (id, work_item_id, agent_id, created_at) VALUES (?, ?, ?, ?)")
         .bind(&log_id)
-        .bind(ticket_id)
+        .bind(work_item_id)
         .bind(agent_id)
         .bind(now_iso())
         .execute(pool)
@@ -1008,16 +1010,16 @@ async fn insert_agent_log(pool: &SqlitePool, ticket_id: &str, agent_id: &str) ->
 
 async fn finalize_start_failure(
     app: AppHandle,
-    ticket_id: String,
+    work_item_id: String,
     pool: &SqlitePool,
     log_id: &str,
     message: String,
 ) {
-    emit_error_event(&app, &ticket_id, log_id, &message);
+    emit_error_event(&app, &work_item_id, log_id, &message);
     finalize(
         &app,
         pool,
-        &ticket_id,
+        &work_item_id,
         log_id,
         None,
         &[],
@@ -1035,14 +1037,14 @@ async fn finalize_start_failure(
 async fn start_agent_run(
     app: AppHandle,
     pool: &SqlitePool,
-    ticket_id: String,
+    work_item_id: String,
     slot: u8,
     active_sessions: State<'_, ActiveSessions>,
     extra_instruction: Option<String>,
     permission_policy: Option<AgentPermissionPolicy>,
 ) -> Result<String, String> {
-    let request = build_turn_request(pool, &ticket_id, extra_instruction).await?;
-    let log_id = insert_agent_log(pool, &request.ticket_id, &request.agent_id).await?;
+    let request = build_turn_request(pool, &work_item_id, extra_instruction).await?;
+    let log_id = insert_agent_log(pool, &request.work_item_id, &request.agent_id).await?;
 
     let handle = match get_or_create_session_handle(
         &app,
@@ -1056,13 +1058,13 @@ async fn start_agent_run(
     {
         Ok(handle) => handle,
         Err(err) => {
-            finalize_start_failure(app, ticket_id, pool, &log_id, err.clone()).await;
+            finalize_start_failure(app, work_item_id, pool, &log_id, err.clone()).await;
             return Err(err);
         }
     };
 
     if let Err(err) = start_turn(&handle, log_id.clone(), request.prompt).await {
-        finalize_start_failure(app, ticket_id, pool, &log_id, err.clone()).await;
+        finalize_start_failure(app, work_item_id, pool, &log_id, err.clone()).await;
         return Err(err);
     }
 
@@ -1074,14 +1076,14 @@ pub async fn launch_agent(
     app: AppHandle,
     db: State<'_, SqlitePool>,
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
     slot: u8,
     permission_policy: Option<AgentPermissionPolicy>,
 ) -> Result<String, String> {
     start_agent_run(
         app,
         db.inner(),
-        ticket_id,
+        work_item_id,
         slot,
         active_sessions,
         None,
@@ -1095,12 +1097,12 @@ pub async fn continue_agent(
     app: AppHandle,
     db: State<'_, SqlitePool>,
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
     slot: u8,
     message: String,
     permission_policy: Option<AgentPermissionPolicy>,
 ) -> Result<String, String> {
-    if let Some(handle) = get_session_handle(active_sessions.inner(), &ticket_id)? {
+    if let Some(handle) = get_session_handle(active_sessions.inner(), &work_item_id)? {
         handle.set_slot(slot);
         if handle.shared.snapshot().is_running {
             cancel_turn(&handle).await?;
@@ -1110,7 +1112,7 @@ pub async fn continue_agent(
     start_agent_run(
         app,
         db.inner(),
-        ticket_id,
+        work_item_id,
         slot,
         active_sessions,
         Some(message),
@@ -1122,17 +1124,17 @@ pub async fn continue_agent(
 #[tauri::command]
 pub async fn interrupt_agent(
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
 ) -> Result<(), String> {
-    shutdown_ticket_session(active_sessions.inner(), &ticket_id).await
+    shutdown_work_item_session(active_sessions.inner(), &work_item_id).await
 }
 
 #[tauri::command]
 pub async fn cancel_agent_turn(
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
 ) -> Result<(), String> {
-    if let Some(handle) = get_session_handle(active_sessions.inner(), &ticket_id)? {
+    if let Some(handle) = get_session_handle(active_sessions.inner(), &work_item_id)? {
         return cancel_turn(&handle).await;
     }
     Ok(())
@@ -1141,9 +1143,9 @@ pub async fn cancel_agent_turn(
 #[tauri::command]
 pub async fn stop_agent_session(
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
 ) -> Result<(), String> {
-    shutdown_ticket_session(active_sessions.inner(), &ticket_id).await
+    shutdown_work_item_session(active_sessions.inner(), &work_item_id).await
 }
 
 #[tauri::command]
@@ -1156,9 +1158,9 @@ pub async fn shutdown_all_agent_sessions(
 #[tauri::command]
 pub async fn get_agent_session(
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
 ) -> Result<Option<AgentSessionState>, String> {
-    let Some(handle) = get_session_handle(active_sessions.inner(), &ticket_id)? else {
+    let Some(handle) = get_session_handle(active_sessions.inner(), &work_item_id)? else {
         return Ok(None);
     };
     let state = handle.shared.snapshot();
@@ -1171,11 +1173,11 @@ pub async fn get_agent_session(
 #[tauri::command]
 pub async fn set_agent_permission_policy(
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
     policy: AgentPermissionPolicy,
 ) -> Result<AgentSessionState, String> {
-    let handle = get_session_handle(active_sessions.inner(), &ticket_id)?
-        .ok_or_else(|| "No active agent session for this ticket".to_string())?;
+    let handle = get_session_handle(active_sessions.inner(), &work_item_id)?
+        .ok_or_else(|| "No active agent session for this work item".to_string())?;
     let updated = handle.shared.update_snapshot(|state| {
         state.permission_policy = policy.clone();
         state.last_activity_at = now_iso();
@@ -1189,12 +1191,12 @@ pub async fn set_agent_permission_policy(
 #[tauri::command]
 pub async fn respond_to_agent_permission(
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
     request_id: String,
     option_id: Option<String>,
 ) -> Result<(), String> {
-    let handle = get_session_handle(active_sessions.inner(), &ticket_id)?
-        .ok_or_else(|| "No active agent session for this ticket".to_string())?;
+    let handle = get_session_handle(active_sessions.inner(), &work_item_id)?
+        .ok_or_else(|| "No active agent session for this work item".to_string())?;
     handle.shared.respond_to_permission(&request_id, option_id)?;
     handle.shared.mark_activity();
     Ok(())
@@ -1208,9 +1210,9 @@ async fn get_or_create_session_handle(
     slot: u8,
     initial_policy: Option<AgentPermissionPolicy>,
 ) -> Result<ActiveSessionHandle, String> {
-    if let Some(handle) = get_session_handle(active_sessions, &request.ticket_id)? {
+    if let Some(handle) = get_session_handle(active_sessions, &request.work_item_id)? {
         if handle.shared.snapshot().agent_id != request.agent_id {
-            shutdown_ticket_session(active_sessions, &request.ticket_id).await?;
+            shutdown_work_item_session(active_sessions, &request.work_item_id).await?;
         } else {
             handle.set_slot(slot);
             if let Some(policy) = initial_policy {
@@ -1229,11 +1231,11 @@ async fn get_or_create_session_handle(
     let permission_policy = initial_policy.unwrap_or(AgentPermissionPolicy::AllowOnce);
     let shared = SessionShared {
         app: app.clone(),
-        ticket_id: request.ticket_id.clone(),
+        work_item_id: request.work_item_id.clone(),
         agent_id: request.agent_id.clone(),
         worktree_root: PathBuf::from(&request.worktree_path),
         snapshot: Arc::new(Mutex::new(AgentSessionState {
-            ticket_id: request.ticket_id.clone(),
+            work_item_id: request.work_item_id.clone(),
             agent_id: request.agent_id.clone(),
             session_id: String::new(),
             is_running: false,
@@ -1259,14 +1261,14 @@ async fn get_or_create_session_handle(
             .0
             .lock()
             .map_err(|_| "Active session state is unavailable".to_string())?;
-        sessions.insert(request.ticket_id.clone(), handle.clone());
+        sessions.insert(request.work_item_id.clone(), handle.clone());
     }
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let pool_bg = pool.clone();
     let active_sessions_bg = active_sessions.clone();
     let request_bg = AgentTurnRequest {
-        ticket_id: request.ticket_id.clone(),
+        work_item_id: request.work_item_id.clone(),
         agent_id: request.agent_id.clone(),
         acp_target: request.acp_target.clone(),
         prompt: String::new(),
@@ -1287,9 +1289,9 @@ async fn get_or_create_session_handle(
                 Err(err) => {
                     let _ = ready_tx.send(Err(format!("Failed to create ACP runtime: {err}")));
                     if let Ok(mut sessions) = active_sessions_bg.0.lock() {
-                        sessions.remove(request_bg.ticket_id.as_str());
+                        sessions.remove(request_bg.work_item_id.as_str());
                     }
-                    emit_session_state(&app, &request_bg.ticket_id, None);
+                    emit_session_state(&app, &request_bg.work_item_id, None);
                     return;
                 }
             };
@@ -1310,16 +1312,16 @@ async fn get_or_create_session_handle(
         Ok(Ok(())) => Ok(handle),
         Ok(Err(err)) => {
             if let Ok(mut sessions) = active_sessions.0.lock() {
-                sessions.remove(request.ticket_id.as_str());
+                sessions.remove(request.work_item_id.as_str());
             }
-            emit_session_state(app, &request.ticket_id, None);
+            emit_session_state(app, &request.work_item_id, None);
             Err(err)
         }
         Err(_) => {
             if let Ok(mut sessions) = active_sessions.0.lock() {
-                sessions.remove(request.ticket_id.as_str());
+                sessions.remove(request.work_item_id.as_str());
             }
-            emit_session_state(app, &request.ticket_id, None);
+            emit_session_state(app, &request.work_item_id, None);
             Err("ACP session setup terminated unexpectedly".to_string())
         }
     }
@@ -1340,13 +1342,13 @@ async fn run_session_worker(
         Err(err) => {
             let _ = ready_tx.send(Err(err));
             if let Ok(mut sessions) = active_sessions.0.lock() {
-                sessions.remove(request.ticket_id.as_str());
+                sessions.remove(request.work_item_id.as_str());
             }
-            emit_session_state(&app, &request.ticket_id, None);
+            emit_session_state(&app, &request.work_item_id, None);
             return;
         }
     };
-    let ticket_id_after = request.ticket_id.clone();
+    let work_item_id_after = request.work_item_id.clone();
     let app_after = app.clone();
 
     tokio::task::LocalSet::new()
@@ -1492,15 +1494,15 @@ async fn run_session_worker(
 
                                 let events = shared.take_turn_events();
                                 if turn.exit_code == 0 && events.is_empty() {
-                                    emit_error_event(&app, &request.ticket_id, &log_id, "ACP run completed without output");
+                                    emit_error_event(&app, &request.work_item_id, &log_id, "ACP run completed without output");
                                 } else if let Some(message) = turn.error_summary.as_deref() {
-                                    emit_error_event(&app, &request.ticket_id, &log_id, message);
+                                    emit_error_event(&app, &request.work_item_id, &log_id, message);
                                 }
 
                                 finalize(
                                     &app,
                                     &pool,
-                                    &request.ticket_id,
+                                    &request.work_item_id,
                                     &log_id,
                                     Some(session_id.as_str()),
                                     &events,
@@ -1563,9 +1565,9 @@ async fn run_session_worker(
         .await;
 
     if let Ok(mut sessions) = active_sessions.0.lock() {
-        sessions.remove(ticket_id_after.as_str());
+        sessions.remove(work_item_id_after.as_str());
     }
-    emit_session_state(&app_after, &ticket_id_after, None);
+    emit_session_state(&app_after, &work_item_id_after, None);
 }
 
 struct PromptTurnResult {
@@ -1631,7 +1633,7 @@ async fn run_prompt_turn(
 
                 match command {
                     SessionCommand::StartTurn { reply, .. } => {
-                        let _ = reply.send(Err("A prompt is already running for this ticket".to_string()));
+                        let _ = reply.send(Err("A prompt is already running for this work item".to_string()));
                     }
                     SessionCommand::CancelTurn { reply } => {
                         match connection
@@ -1665,13 +1667,13 @@ async fn run_prompt_turn(
 
 fn get_session_handle(
     active_sessions: &ActiveSessions,
-    ticket_id: &str,
+    work_item_id: &str,
 ) -> Result<Option<ActiveSessionHandle>, String> {
     let sessions = active_sessions
         .0
         .lock()
         .map_err(|_| "Active session state is unavailable".to_string())?;
-    Ok(sessions.get(ticket_id).cloned())
+    Ok(sessions.get(work_item_id).cloned())
 }
 
 async fn start_turn(
@@ -1711,11 +1713,11 @@ async fn touch_session(handle: &ActiveSessionHandle) -> Result<(), String> {
         .map_err(|_| "Agent session is unavailable".to_string())
 }
 
-pub(crate) async fn shutdown_ticket_session(
+pub(crate) async fn shutdown_work_item_session(
     active_sessions: &ActiveSessions,
-    ticket_id: &str,
+    work_item_id: &str,
 ) -> Result<(), String> {
-    let Some(handle) = get_session_handle(active_sessions, ticket_id)? else {
+    let Some(handle) = get_session_handle(active_sessions, work_item_id)? else {
         return Ok(());
     };
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -1728,7 +1730,7 @@ pub(crate) async fn shutdown_ticket_session(
         .map_err(|_| "Agent session did not acknowledge shutdown".to_string())?;
 
     for _ in 0..60 {
-        if get_session_handle(active_sessions, ticket_id)?.is_none() {
+        if get_session_handle(active_sessions, work_item_id)?.is_none() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1738,7 +1740,7 @@ pub(crate) async fn shutdown_ticket_session(
 }
 
 async fn shutdown_all_sessions(active_sessions: &ActiveSessions) -> Result<(), String> {
-    let ticket_ids = {
+    let work_item_ids = {
         let sessions = active_sessions
             .0
             .lock()
@@ -1746,14 +1748,14 @@ async fn shutdown_all_sessions(active_sessions: &ActiveSessions) -> Result<(), S
         sessions.keys().cloned().collect::<Vec<_>>()
     };
 
-    for ticket_id in ticket_ids {
-        let _ = shutdown_ticket_session(active_sessions, &ticket_id).await;
+    for work_item_id in work_item_ids {
+        let _ = shutdown_work_item_session(active_sessions, &work_item_id).await;
     }
 
     Ok(())
 }
 
-fn emit_error_event(app: &AppHandle, ticket_id: &str, log_id: &str, message: &str) {
+fn emit_error_event(app: &AppHandle, work_item_id: &str, log_id: &str, message: &str) {
     let item = AcpEventItem {
         id: Ulid::new().to_string(),
         kind: "error".to_string(),
@@ -1763,35 +1765,35 @@ fn emit_error_event(app: &AppHandle, ticket_id: &str, log_id: &str, message: &st
         tool_call_id: None,
         ts: now_iso(),
     };
-    emit_acp_event(app, ticket_id, log_id, &item);
+    emit_acp_event(app, work_item_id, log_id, &item);
 }
 
-fn emit_acp_event(app: &AppHandle, ticket_id: &str, log_id: &str, item: &AcpEventItem) {
+fn emit_acp_event(app: &AppHandle, work_item_id: &str, log_id: &str, item: &AcpEventItem) {
     let _ = app.emit(
         "acp:event",
         serde_json::json!({
-            "ticketId": ticket_id,
+            "workItemId": work_item_id,
             "logId": log_id,
             "item": item,
         }),
     );
 }
 
-fn emit_session_state(app: &AppHandle, ticket_id: &str, state: Option<&AgentSessionState>) {
+fn emit_session_state(app: &AppHandle, work_item_id: &str, state: Option<&AgentSessionState>) {
     let _ = app.emit(
         "agent:session-state",
         serde_json::json!({
-            "ticketId": ticket_id,
+            "workItemId": work_item_id,
             "state": state,
         }),
     );
 }
 
-fn emit_log_change(app: &AppHandle, ticket_id: &str, log_id: &str) {
+fn emit_log_change(app: &AppHandle, work_item_id: &str, log_id: &str) {
     let _ = app.emit(
         "agent:log-change",
         serde_json::json!({
-            "ticketId": ticket_id,
+            "workItemId": work_item_id,
             "logId": log_id,
         }),
     );
@@ -1800,7 +1802,7 @@ fn emit_log_change(app: &AppHandle, ticket_id: &str, log_id: &str) {
 async fn finalize(
     app: &AppHandle,
     pool: &SqlitePool,
-    ticket_id: &str,
+    work_item_id: &str,
     log_id: &str,
     run_id: Option<&str>,
     events: &[AcpEventItem],
@@ -1837,37 +1839,37 @@ async fn finalize(
 
     if to_status == "ready" {
         let _ = sqlx::query(
-            "UPDATE tickets SET status = ?, completed_at = ?, updated_at = ?, terminal_slot = NULL \
+            "UPDATE work_items SET status = ?, completed_at = ?, updated_at = ?, terminal_slot = NULL \
              WHERE id = ? AND status = 'running'",
         )
         .bind(to_status)
         .bind(&now)
         .bind(&now)
-        .bind(ticket_id)
+        .bind(work_item_id)
         .execute(pool)
         .await;
     } else {
         let _ = sqlx::query(
-            "UPDATE tickets SET status = ?, completed_at = ?, updated_at = ? \
+            "UPDATE work_items SET status = ?, completed_at = ?, updated_at = ? \
              WHERE id = ? AND status = 'running'",
         )
         .bind(to_status)
         .bind(&now)
         .bind(&now)
-        .bind(ticket_id)
+        .bind(work_item_id)
         .execute(pool)
         .await;
     }
 
     let _ = app.emit(
-        "ticket:state-change",
+        "work-item:state-change",
         serde_json::json!({
-            "ticketId": ticket_id,
+            "workItemId": work_item_id,
             "from": "running",
             "to": to_status,
         }),
     );
-    emit_log_change(app, ticket_id, log_id);
+    emit_log_change(app, work_item_id, log_id);
 }
 
 // ─── Agent Log Commands ───────────────────────────────────────────────────────
@@ -1875,14 +1877,14 @@ async fn finalize(
 #[tauri::command]
 pub async fn get_agent_logs(
     db: State<'_, SqlitePool>,
-    ticket_id: String,
+    work_item_id: String,
 ) -> Result<Vec<AgentLog>, String> {
     sqlx::query_as::<_, AgentLog>(
-        "SELECT id, ticket_id, agent_id, run_id, messages, summary, tokens_in, tokens_out, \
+        "SELECT id, work_item_id, agent_id, run_id, messages, summary, tokens_in, tokens_out, \
          cost_usd, exit_code, duration_ms, cleanup_warning, cleanup_warning_message, created_at \
-         FROM agent_logs WHERE ticket_id = ? ORDER BY created_at DESC",
+         FROM agent_logs WHERE work_item_id = ? ORDER BY created_at DESC",
     )
-    .bind(&ticket_id)
+    .bind(&work_item_id)
     .fetch_all(db.inner())
     .await
     .map_err(|e| e.to_string())

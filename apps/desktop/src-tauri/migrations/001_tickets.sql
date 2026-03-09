@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS tickets (
+CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   context TEXT,
@@ -19,5 +19,5 @@ CREATE TABLE IF NOT EXISTS tickets (
   completed_at TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
-CREATE INDEX IF NOT EXISTS idx_tickets_updated_at ON tickets(updated_at);
+CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status);
+CREATE INDEX IF NOT EXISTS idx_work_items_updated_at ON work_items(updated_at);

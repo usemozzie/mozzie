@@ -8,14 +8,16 @@ import {
   Clock3,
   Layers3,
   ChevronRight,
+  Trash2,
 } from 'lucide-react';
-import { useTicketStore } from '../../stores/ticketStore';
-import { useTickets } from '../../hooks/useTickets';
+import { useWorkItemStore } from '../../stores/workItemStore';
+import { useWorkItems } from '../../hooks/useWorkItems';
+import { useDeleteWorkItem } from '../../hooks/useWorkItemMutation';
 import { useStartAgent } from '../../hooks/useStartAgent';
-import { getTicketColor } from '../../lib/ticketColors';
-import type { Ticket, TicketStatus } from '@mozzie/db';
+import { getWorkItemTag } from '../../lib/workItemColors';
+import type { WorkItem, WorkItemStatus } from '@mozzie/db';
 
-const statusDot: Record<TicketStatus, string> = {
+const statusDot: Record<WorkItemStatus, string> = {
   draft: 'bg-state-idle',
   ready: 'bg-state-active',
   blocked: 'bg-amber-500',
@@ -31,14 +33,14 @@ interface AppSidebarProps {
 }
 
 export function AppSidebar({ collapsed }: AppSidebarProps) {
-  const openNewTicketModal = useTicketStore((s) => s.openNewTicketModal);
+  const openNewWorkItemModal = useWorkItemStore((s) => s.openNewWorkItemModal);
 
   if (collapsed) {
     return (
       <div className="w-11 shrink-0 flex flex-col items-center py-2 gap-1 bg-bg border-r border-border">
         <button
-          onClick={() => openNewTicketModal()}
-          title="New Ticket"
+          onClick={() => openNewWorkItemModal()}
+          title="New Work Item"
           className="w-8 h-8 flex items-center justify-center rounded-lg text-text-dim hover:text-text hover:bg-white/[0.06] transition-all duration-150"
         >
           <Plus className="w-4 h-4" />
@@ -51,28 +53,28 @@ export function AppSidebar({ collapsed }: AppSidebarProps) {
     <div className="flex h-full w-[260px] min-w-[260px] max-w-[260px] flex-col bg-bg border-r border-border select-none">
       {/* Header row */}
       <div className="flex items-center justify-between px-3 pt-3 pb-1">
-        <span className="text-[11px] font-medium uppercase tracking-wider text-text-dim">Tickets</span>
+        <span className="text-[11px] font-medium uppercase tracking-wider text-text-dim">Work Items</span>
         <button
-          onClick={() => openNewTicketModal()}
+          onClick={() => openNewWorkItemModal()}
           className="w-6 h-6 flex items-center justify-center rounded-md text-text-dim hover:text-text hover:bg-white/[0.06] transition-colors"
-          title="New Ticket"
+          title="New Work Item"
         >
           <Plus className="w-3.5 h-3.5" />
         </button>
       </div>
 
-      {/* Ticket list */}
+      {/* Work item list */}
       <div className="flex-1 min-h-0">
-        <TicketListSection />
+        <WorkItemListSection />
       </div>
     </div>
   );
 }
 
-type TicketScope = 'active' | 'recent' | 'all';
+type WorkItemScope = 'active' | 'recent' | 'all';
 
-const TICKET_SCOPE_OPTIONS: Array<{
-  id: TicketScope;
+const WORK_ITEM_SCOPE_OPTIONS: Array<{
+  id: WorkItemScope;
   label: string;
   icon: typeof ListFilter;
 }> = [
@@ -81,10 +83,10 @@ const TICKET_SCOPE_OPTIONS: Array<{
   { id: 'all', label: 'All', icon: Layers3 },
 ];
 
-function TicketListSection() {
-  const [scope, setScope] = useState<TicketScope>('active');
-  const { data: tickets, isLoading } = useTickets();
-  const { selectedTicketIds, toggleTicketSelection } = useTicketStore();
+function WorkItemListSection() {
+  const [scope, setScope] = useState<WorkItemScope>('active');
+  const { data: workItems, isLoading } = useWorkItems();
+  const { selectedWorkItemIds, toggleWorkItemSelection } = useWorkItemStore();
 
   if (isLoading) {
     return <div className="flex items-center justify-center h-20 text-text-dim text-[13px]">Loading...</div>;
@@ -92,16 +94,16 @@ function TicketListSection() {
 
   const now = Date.now();
   const recentCutoffMs = 1000 * 60 * 60 * 24 * 7;
-  const filteredTickets = (tickets ?? []).filter((ticket) => {
-    if (scope === 'active') return ticket.status !== 'done' && ticket.status !== 'archived';
-    if (scope === 'recent') return now - new Date(ticket.updated_at).getTime() <= recentCutoffMs;
+  const filteredWorkItems = (workItems ?? []).filter((workItem) => {
+    if (scope === 'active') return workItem.status !== 'done' && workItem.status !== 'archived';
+    if (scope === 'recent') return now - new Date(workItem.updated_at).getTime() <= recentCutoffMs;
     return true;
   });
 
-  if (!tickets || tickets.length === 0) {
+  if (!workItems || workItems.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-1.5 px-4 text-center">
-        <p className="text-[13px] text-text-muted">No tickets yet</p>
+        <p className="text-[13px] text-text-muted">No work items yet</p>
         <p className="text-[11px] text-text-dim">Click + to create one</p>
       </div>
     );
@@ -112,7 +114,7 @@ function TicketListSection() {
       {/* Scope filter */}
       <div className="shrink-0 px-2 pb-2">
         <div className="grid grid-cols-3 gap-1 rounded-lg bg-white/[0.03] p-0.5">
-          {TICKET_SCOPE_OPTIONS.map(({ id, label, icon: Icon }) => {
+          {WORK_ITEM_SCOPE_OPTIONS.map(({ id, label, icon: Icon }) => {
             const active = scope === id;
             return (
               <button
@@ -135,20 +137,20 @@ function TicketListSection() {
 
       {/* List grouped by repo */}
       <div className="min-h-0 flex-1 overflow-y-auto px-1 py-0.5">
-        {filteredTickets.length === 0 ? (
+        {filteredWorkItems.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-1.5 px-4 text-center">
             <p className="text-[13px] text-text-muted">
-              {scope === 'active' ? 'No active tickets' : scope === 'recent' ? 'No recent tickets' : 'No tickets'}
+              {scope === 'active' ? 'No active work items' : scope === 'recent' ? 'No recent work items' : 'No work items'}
             </p>
           </div>
         ) : (
-          <GroupedTicketList tickets={filteredTickets} selectedTicketIds={selectedTicketIds} toggleTicketSelection={toggleTicketSelection} />
+          <GroupedWorkItemList workItems={filteredWorkItems} selectedWorkItemIds={selectedWorkItemIds} toggleWorkItemSelection={toggleWorkItemSelection} />
         )}
       </div>
 
       {/* Count */}
       <div className="shrink-0 px-3 py-1.5 border-t border-border">
-        <span className="text-[10px] text-text-dim">{filteredTickets.length} of {tickets.length}</span>
+        <span className="text-[10px] text-text-dim">{filteredWorkItems.length} of {workItems.length}</span>
       </div>
     </div>
   );
@@ -159,32 +161,36 @@ function getRepoName(repoPath: string | null): string {
   return repoPath.split(/[/\\]/).filter(Boolean).pop() || repoPath;
 }
 
-function GroupedTicketList({
-  tickets,
-  selectedTicketIds,
-  toggleTicketSelection,
+function GroupedWorkItemList({
+  workItems,
+  selectedWorkItemIds,
+  toggleWorkItemSelection,
 }: {
-  tickets: Ticket[];
-  selectedTicketIds: string[];
-  toggleTicketSelection: (id: string) => void;
+  workItems: WorkItem[];
+  selectedWorkItemIds: string[];
+  toggleWorkItemSelection: (id: string) => void;
 }) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const parentIds = useMemo(
+    () => new Set(workItems.filter((workItem) => workItem.parent_id).map((workItem) => workItem.parent_id!)),
+    [workItems],
+  );
 
   const groups = useMemo(() => {
-    const map = new Map<string, Ticket[]>();
-    for (const ticket of tickets) {
-      const key = ticket.repo_path ?? '__none__';
+    const map = new Map<string, WorkItem[]>();
+    for (const workItem of workItems) {
+      const key = workItem.repo_path ?? '__none__';
       const list = map.get(key);
-      if (list) list.push(ticket);
-      else map.set(key, [ticket]);
+      if (list) list.push(workItem);
+      else map.set(key, [workItem]);
     }
-    // Sort: repos with tickets first, "No repo" last
+    // Sort: repos with work items first, "No repo" last
     return Array.from(map.entries()).sort(([a], [b]) => {
       if (a === '__none__') return 1;
       if (b === '__none__') return -1;
       return getRepoName(a).localeCompare(getRepoName(b));
     });
-  }, [tickets]);
+  }, [workItems]);
 
   const toggleGroup = (key: string) => {
     setCollapsedGroups((prev) => {
@@ -199,13 +205,14 @@ function GroupedTicketList({
   if (groups.length === 1) {
     return (
       <>
-        {groups[0][1].map((ticket) => (
-          <SidebarTicketRow
-            key={ticket.id}
-            ticket={ticket}
-            isSelected={selectedTicketIds.includes(ticket.id)}
-            selectedIndex={selectedTicketIds.indexOf(ticket.id)}
-            onClick={() => toggleTicketSelection(ticket.id)}
+        {groups[0][1].map((workItem) => (
+          <SidebarWorkItemRow
+            key={workItem.id}
+            workItem={workItem}
+            canStart={!parentIds.has(workItem.id)}
+            isSelected={selectedWorkItemIds.includes(workItem.id)}
+            selectedIndex={selectedWorkItemIds.indexOf(workItem.id)}
+            onClick={() => toggleWorkItemSelection(workItem.id)}
           />
         ))}
       </>
@@ -214,7 +221,7 @@ function GroupedTicketList({
 
   return (
     <>
-      {groups.map(([key, groupTickets]) => {
+      {groups.map(([key, groupWorkItems]) => {
         const collapsed = collapsedGroups.has(key);
         const label = key === '__none__' ? 'No repo' : getRepoName(key);
         return (
@@ -226,15 +233,16 @@ function GroupedTicketList({
             >
               <ChevronRight className={`w-3 h-3 shrink-0 transition-transform duration-150 ${collapsed ? '' : 'rotate-90'}`} />
               <span className="truncate">{label}</span>
-              <span className="ml-auto text-text-dim/50 tabular-nums">{groupTickets.length}</span>
+              <span className="ml-auto text-text-dim/50 tabular-nums">{groupWorkItems.length}</span>
             </button>
-            {!collapsed && groupTickets.map((ticket) => (
-              <SidebarTicketRow
-                key={ticket.id}
-                ticket={ticket}
-                isSelected={selectedTicketIds.includes(ticket.id)}
-                selectedIndex={selectedTicketIds.indexOf(ticket.id)}
-                onClick={() => toggleTicketSelection(ticket.id)}
+            {!collapsed && groupWorkItems.map((workItem) => (
+              <SidebarWorkItemRow
+                key={workItem.id}
+                workItem={workItem}
+                canStart={!parentIds.has(workItem.id)}
+                isSelected={selectedWorkItemIds.includes(workItem.id)}
+                selectedIndex={selectedWorkItemIds.indexOf(workItem.id)}
+                onClick={() => toggleWorkItemSelection(workItem.id)}
               />
             ))}
           </div>
@@ -244,47 +252,63 @@ function GroupedTicketList({
   );
 }
 
-function SidebarTicketRow({
-  ticket,
+function SidebarWorkItemRow({
+  workItem,
+  canStart,
   isSelected,
   selectedIndex,
   onClick,
 }: {
-  ticket: Ticket;
+  workItem: WorkItem;
+  canStart: boolean;
   isSelected: boolean;
   selectedIndex: number;
   onClick: () => void;
 }) {
   const { startAgent, isStarting } = useStartAgent();
-  const selectTicket = useTicketStore((s) => s.selectTicket);
-  const openTicketDetail = useTicketStore((s) => s.openTicketDetail);
+  const selectWorkItem = useWorkItemStore((s) => s.selectWorkItem);
+  const removeSelectedWorkItem = useWorkItemStore((s) => s.removeSelectedWorkItem);
+  const deleteWorkItem = useDeleteWorkItem();
   const [showMenu, setShowMenu] = useState(false);
-  const isReady = ticket.status === 'ready';
-  const accent = getTicketColor(selectedIndex);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const isReady = workItem.status === 'ready';
+  const isRunning = workItem.status === 'running';
+  const showStartButton = isReady && canStart;
+  const tag = isSelected ? getWorkItemTag(selectedIndex) : null;
 
   return (
     <div className="relative group">
       <button
         onClick={onClick}
-        onDoubleClick={() => openTicketDetail(ticket.id)}
-        style={isSelected ? { background: `${accent}0D`, boxShadow: `inset 2px 0 0 ${accent}` } : undefined}
+        style={tag ? { background: `${tag.color}10`, boxShadow: `inset 2px 0 0 ${tag.color}` } : undefined}
         className={`w-full text-left flex items-center gap-2 px-2.5 py-1.5 rounded-lg transition-colors duration-100
-          ${isSelected ? '' : 'hover:bg-white/[0.04]'}`}
+          ${isSelected ? '' : 'hover:bg-white/[0.04]'} ${showStartButton ? 'pr-16' : 'pr-10'}`}
       >
-        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot[ticket.status]}`} />
+        {tag ? (
+          <span
+            className="w-[18px] h-[18px] rounded-md flex items-center justify-center text-[10px] font-bold shrink-0 text-white/90"
+            style={{ backgroundColor: tag.color }}
+          >
+            {tag.letter}
+          </span>
+        ) : (
+          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot[workItem.status]}`} />
+        )}
         <span className="flex-1 text-[13px] text-text truncate min-w-0">
-          {ticket.title || <span className="italic text-text-dim">Untitled</span>}
+          {workItem.title || <span className="italic text-text-dim">Untitled</span>}
         </span>
       </button>
 
       {/* Hover actions */}
-      <div className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-        {isReady && (
+      <div
+        className="pointer-events-none absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 rounded-md border border-border/60 bg-bg/95 px-1 py-0.5 opacity-0 shadow-sm transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
+      >
+        {showStartButton && (
           <button
             onClick={(e) => {
               e.stopPropagation();
-              selectTicket(ticket.id);
-              void startAgent(ticket);
+              selectWorkItem(workItem.id);
+              void startAgent(workItem);
             }}
             disabled={isStarting}
             title="Start agent"
@@ -306,14 +330,44 @@ function SidebarTicketRow({
 
       {showMenu && (
         <>
-          <div className="fixed inset-0 z-30" onClick={() => setShowMenu(false)} />
-          <div className="absolute right-1 top-full mt-1 z-40 w-36 bg-surface border border-border rounded-lg shadow-xl py-1">
-            <button
-              onClick={() => { openTicketDetail(ticket.id); setShowMenu(false); }}
-              className="w-full text-left px-3 py-1.5 text-[12px] text-text hover:bg-white/[0.06] transition-colors"
-            >
-              Open details
-            </button>
+          <div className="fixed inset-0 z-30" onClick={() => { setShowMenu(false); setConfirmDelete(false); }} />
+          <div className="absolute right-1 top-full mt-1 z-40 w-40 bg-surface border border-border rounded-lg shadow-xl py-1">
+            {confirmDelete ? (
+              <div className="px-3 py-2 space-y-2">
+                <div className="text-[11px] text-text-dim">Delete this work item?</div>
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={async () => {
+                      try {
+                        removeSelectedWorkItem(workItem.id);
+                        await deleteWorkItem.mutateAsync(workItem.id);
+                      } catch { /* swallow */ }
+                      setShowMenu(false);
+                      setConfirmDelete(false);
+                    }}
+                    disabled={deleteWorkItem.isPending}
+                    className="flex-1 px-2 py-1 text-[11px] rounded bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors"
+                  >
+                    {deleteWorkItem.isPending ? 'Deleting…' : 'Delete'}
+                  </button>
+                  <button
+                    onClick={() => { setConfirmDelete(false); setShowMenu(false); }}
+                    className="flex-1 px-2 py-1 text-[11px] rounded bg-white/[0.06] text-text-dim hover:bg-white/[0.1] transition-colors"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                disabled={isRunning}
+                onClick={() => setConfirmDelete(true)}
+                className="w-full text-left px-3 py-1.5 text-[12px] text-red-400 hover:bg-white/[0.06] transition-colors flex items-center gap-2 disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <Trash2 className="w-3 h-3" />
+                Delete work item
+              </button>
+            )}
           </div>
         </>
       )}

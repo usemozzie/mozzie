@@ -1,6 +1,6 @@
 import { Plus, TicketCheck, GitFork, Settings } from 'lucide-react';
 import { useSidebarStore, type SidebarView } from '../../stores/sidebarStore';
-import { useTicketStore } from '../../stores/ticketStore';
+import { useWorkItemStore } from '../../stores/workItemStore';
 
 interface IconSidebarProps {
   onSettingsClick: () => void;
@@ -8,28 +8,28 @@ interface IconSidebarProps {
 
 export function IconSidebar({ onSettingsClick }: IconSidebarProps) {
   const { activeView, setActiveView } = useSidebarStore();
-  const openNewTicketModal = useTicketStore((s) => s.openNewTicketModal);
+  const openNewWorkItemModal = useWorkItemStore((s) => s.openNewWorkItemModal);
 
   return (
     <div className="w-11 shrink-0 flex flex-col items-center py-2 gap-1 bg-bg border-r border-border">
-      {/* New ticket */}
+      {/* New work item */}
       <SidebarIcon
         icon={<Plus className="w-4 h-4" />}
-        title="New Ticket"
+        title="New Work Item"
         onClick={() => {
-          setActiveView('tickets');
-          openNewTicketModal();
+          setActiveView('work-items');
+          openNewWorkItemModal();
         }}
       />
 
       <div className="w-5 h-px bg-border my-1" />
 
-      {/* Tickets view */}
+      {/* Work items view */}
       <SidebarIcon
         icon={<TicketCheck className="w-4 h-4" />}
-        title="Tickets"
-        active={activeView === 'tickets'}
-        onClick={() => setActiveView('tickets')}
+        title="Work Items"
+        active={activeView === 'work-items'}
+        onClick={() => setActiveView('work-items')}
       />
 
       {/* Repos view */}

@@ -1,5 +1,5 @@
-export const CREATE_TICKETS_TABLE = `
-CREATE TABLE IF NOT EXISTS tickets (
+export const CREATE_WORK_ITEMS_TABLE = `
+CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
   context TEXT,
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 export const CREATE_AGENT_LOGS_TABLE = `
 CREATE TABLE IF NOT EXISTS agent_logs (
   id TEXT PRIMARY KEY,
-  ticket_id TEXT NOT NULL REFERENCES tickets(id),
+  work_item_id TEXT NOT NULL REFERENCES work_items(id),
   agent_id TEXT NOT NULL,
   run_id TEXT,
   messages TEXT,
@@ -53,9 +53,9 @@ CREATE TABLE IF NOT EXISTS agent_config (
 `;
 
 export const CREATE_INDEXES = `
-CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
-CREATE INDEX IF NOT EXISTS idx_tickets_updated_at ON tickets(updated_at);
-CREATE INDEX IF NOT EXISTS idx_agent_logs_ticket_id ON agent_logs(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status);
+CREATE INDEX IF NOT EXISTS idx_work_items_updated_at ON work_items(updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_work_item_id ON agent_logs(work_item_id);
 `;
 
 export const INSERT_DEFAULT_AGENTS = `
@@ -67,7 +67,7 @@ VALUES
 `;
 
 export const ALL_MIGRATIONS = [
-  CREATE_TICKETS_TABLE,
+  CREATE_WORK_ITEMS_TABLE,
   CREATE_AGENT_LOGS_TABLE,
   CREATE_AGENT_CONFIG_TABLE,
   CREATE_INDEXES,

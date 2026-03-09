@@ -2,14 +2,14 @@ import { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { useQueryClient } from '@tanstack/react-query';
-import type { Ticket } from '@mozzie/db';
+import type { WorkItem } from '@mozzie/db';
 import { useStartAgent } from './useStartAgent';
-import { TICKETS_KEY } from './useTickets';
+import { WORK_ITEMS_KEY } from './useWorkItems';
 
 /**
- * Listens for `ticket:deps-unblocked` events (emitted by the Rust cascade logic
- * when a ticket is approved and its dependents become unblocked).
- * Auto-starts each newly-unblocked ticket.
+ * Listens for `work-item:deps-unblocked` events (emitted by the Rust cascade logic
+ * when a work item is approved and its dependents become unblocked).
+ * Auto-starts each newly-unblocked work item.
  */
 export function useAutoLaunchUnblocked() {
   const { startAgent } = useStartAgent();
@@ -18,19 +18,19 @@ export function useAutoLaunchUnblocked() {
   startAgentRef.current = startAgent;
 
   useEffect(() => {
-    const unlisten = listen<{ ticketIds: string[] }>('ticket:deps-unblocked', async (event) => {
-      // Invalidate ticket list so UI updates
-      queryClient.invalidateQueries({ queryKey: [TICKETS_KEY] });
+    const unlisten = listen<{ workItemIds: string[] }>('work-item:deps-unblocked', async (event) => {
+      // Invalidate work item list so UI updates
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEMS_KEY] });
 
-      // Auto-launch each unblocked ticket sequentially
-      for (const ticketId of event.payload.ticketIds) {
+      // Auto-launch each unblocked work item sequentially
+      for (const workItemId of event.payload.workItemIds) {
         try {
-          const ticket = await invoke<Ticket>('get_ticket', { id: ticketId });
-          if (ticket.status === 'ready') {
-            await startAgentRef.current(ticket);
+          const workItem = await invoke<WorkItem>('get_work_item', { id: workItemId });
+          if (workItem.status === 'ready') {
+            await startAgentRef.current(workItem);
           }
         } catch {
-          // Ticket may have been deleted or is no longer in ready state
+          // Work item may have been deleted or is no longer in ready state
         }
       }
     });

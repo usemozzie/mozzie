@@ -61,23 +61,23 @@ export function useLaunchAgent() {
   const assignSlot = useTerminalStore((s) => s.assignSlot);
   return useMutation({
     mutationFn: ({
-      ticketId,
+      workItemId,
       slot,
       permissionPolicy,
     }: {
-      ticketId: string;
+      workItemId: string;
       slot: number;
       permissionPolicy?: AgentPermissionPolicy;
     }) =>
       invoke<string>('launch_agent', {
-        ticketId,
+        workItemId,
         slot,
         permissionPolicy: permissionPolicy ?? null,
       }),
-    onSuccess: (_logId, { ticketId, slot }) => {
-      assignSlot(slot, ticketId);
-      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
-      queryClient.invalidateQueries({ queryKey: [AGENT_LOGS_KEY, ticketId] });
+    onSuccess: (_logId, { workItemId, slot }) => {
+      assignSlot(slot, workItemId);
+      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
+      queryClient.invalidateQueries({ queryKey: [AGENT_LOGS_KEY, workItemId] });
     },
   });
 }
@@ -87,26 +87,26 @@ export function useContinueAgent() {
   const assignSlot = useTerminalStore((s) => s.assignSlot);
   return useMutation({
     mutationFn: ({
-      ticketId,
+      workItemId,
       slot,
       message,
       permissionPolicy,
     }: {
-      ticketId: string;
+      workItemId: string;
       slot: number;
       message: string;
       permissionPolicy?: AgentPermissionPolicy;
     }) =>
       invoke<string>('continue_agent', {
-        ticketId,
+        workItemId,
         slot,
         message,
         permissionPolicy: permissionPolicy ?? null,
       }),
-    onSuccess: (_logId, { ticketId, slot }) => {
-      assignSlot(slot, ticketId);
-      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
-      queryClient.invalidateQueries({ queryKey: [AGENT_LOGS_KEY, ticketId] });
+    onSuccess: (_logId, { workItemId, slot }) => {
+      assignSlot(slot, workItemId);
+      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
+      queryClient.invalidateQueries({ queryKey: [AGENT_LOGS_KEY, workItemId] });
     },
   });
 }
@@ -114,9 +114,9 @@ export function useContinueAgent() {
 export function useInterruptAgent() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (ticketId: string) => invoke<void>('interrupt_agent', { ticketId }),
-    onSuccess: (_value, ticketId) => {
-      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
+    mutationFn: (workItemId: string) => invoke<void>('interrupt_agent', { workItemId }),
+    onSuccess: (_value, workItemId) => {
+      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
     },
   });
 }
@@ -124,9 +124,9 @@ export function useInterruptAgent() {
 export function useCancelAgentTurn() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (ticketId: string) => invoke<void>('cancel_agent_turn', { ticketId }),
-    onSuccess: (_value, ticketId) => {
-      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
+    mutationFn: (workItemId: string) => invoke<void>('cancel_agent_turn', { workItemId }),
+    onSuccess: (_value, workItemId) => {
+      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
     },
   });
 }
@@ -134,9 +134,9 @@ export function useCancelAgentTurn() {
 export function useStopAgentSession() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (ticketId: string) => invoke<void>('stop_agent_session', { ticketId }),
-    onSuccess: (_value, ticketId) => {
-      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
+    mutationFn: (workItemId: string) => invoke<void>('stop_agent_session', { workItemId }),
+    onSuccess: (_value, workItemId) => {
+      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
     },
   });
 }
@@ -151,25 +151,25 @@ export function useShutdownAllAgentSessions() {
   });
 }
 
-export function useAgentLogs(ticketId: string | null) {
+export function useAgentLogs(workItemId: string | null) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    if (!ticketId) return;
+    if (!workItemId) return;
     const unlisten = listen<AgentLogChangeEvent>('agent:log-change', (event) => {
-      if (event.payload.ticketId === ticketId) {
-        queryClient.invalidateQueries({ queryKey: [AGENT_LOGS_KEY, ticketId] });
+      if (event.payload.workItemId === workItemId) {
+        queryClient.invalidateQueries({ queryKey: [AGENT_LOGS_KEY, workItemId] });
       }
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [ticketId, queryClient]);
+  }, [workItemId, queryClient]);
 
   return useQuery<AgentLog[]>({
-    queryKey: [AGENT_LOGS_KEY, ticketId],
-    queryFn: () => invoke('get_agent_logs', { ticketId }),
-    enabled: !!ticketId,
+    queryKey: [AGENT_LOGS_KEY, workItemId],
+    queryFn: () => invoke('get_agent_logs', { workItemId }),
+    enabled: !!workItemId,
   });
 }
 
@@ -181,25 +181,25 @@ export function useGetAcpMessages(logId: string | null) {
   });
 }
 
-export function useAgentSession(ticketId: string | null) {
+export function useAgentSession(workItemId: string | null) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    if (!ticketId) return;
+    if (!workItemId) return;
     const unlisten = listen<AgentSessionStateEvent>('agent:session-state', (event) => {
-      if (event.payload.ticketId === ticketId) {
-        queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
+      if (event.payload.workItemId === workItemId) {
+        queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
       }
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [ticketId, queryClient]);
+  }, [workItemId, queryClient]);
 
   return useQuery<AgentSessionState | null>({
-    queryKey: [AGENT_SESSION_KEY, ticketId],
-    queryFn: () => invoke('get_agent_session', { ticketId }),
-    enabled: !!ticketId,
+    queryKey: [AGENT_SESSION_KEY, workItemId],
+    queryFn: () => invoke('get_agent_session', { workItemId }),
+    enabled: !!workItemId,
     staleTime: 5_000,
   });
 }
@@ -208,14 +208,14 @@ export function useSetAgentPermissionPolicy() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({
-      ticketId,
+      workItemId,
       policy,
     }: {
-      ticketId: string;
+      workItemId: string;
       policy: AgentPermissionPolicy;
-    }) => invoke<AgentSessionState>('set_agent_permission_policy', { ticketId, policy }),
-    onSuccess: (_value, { ticketId }) => {
-      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
+    }) => invoke<AgentSessionState>('set_agent_permission_policy', { workItemId, policy }),
+    onSuccess: (_value, { workItemId }) => {
+      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
     },
   });
 }
@@ -224,21 +224,21 @@ export function useRespondToAgentPermission() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({
-      ticketId,
+      workItemId,
       requestId,
       optionId,
     }: {
-      ticketId: string;
+      workItemId: string;
       requestId: string;
       optionId: string | null;
     }) =>
       invoke<void>('respond_to_agent_permission', {
-        ticketId,
+        workItemId,
         requestId,
         optionId,
       }),
-    onSuccess: (_value, { ticketId }) => {
-      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, ticketId] });
+    onSuccess: (_value, { workItemId }) => {
+      queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
     },
   });
 }

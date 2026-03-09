@@ -2,7 +2,7 @@ export type AgentCapability = 'generate-plan' | 'execute-code' | 'review-code' |
 
 /** Configuration for starting an ACP run. */
 export interface AcpRunConfig {
-  ticketId: string;
+  workItemId: string;
   logId: string;
   workingDir: string;
   prompt: string;

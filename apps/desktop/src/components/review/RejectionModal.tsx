@@ -3,7 +3,7 @@ import { RotateCcw, X, Loader2 } from 'lucide-react';
 import { Button } from '../ui/button';
 
 interface RejectionModalProps {
-  ticketTitle: string;
+  workItemTitle: string;
   filesChanged: string[];
   onConfirm: (reason: string) => void;
   onCancel: () => void;
@@ -11,7 +11,7 @@ interface RejectionModalProps {
 }
 
 export function RejectionModal({
-  ticketTitle,
+  workItemTitle,
   filesChanged,
   onConfirm,
   onCancel,
@@ -48,7 +48,7 @@ export function RejectionModal({
         {/* Body */}
         <div className="px-4 py-4 space-y-3">
           <p className="text-[12px] text-text-dim">
-            Rejecting <span className="text-text font-medium">{ticketTitle}</span>.
+            Rejecting <span className="text-text font-medium">{workItemTitle}</span>.
             This feedback will be injected into the next run so the agent avoids the same mistakes.
           </p>
 

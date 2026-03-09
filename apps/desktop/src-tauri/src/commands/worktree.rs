@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::commands::agents::{shutdown_ticket_session, ActiveSessions};
+use crate::commands::agents::{shutdown_work_item_session, ActiveSessions};
+use crate::commands::work_items::all_children_done;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorktreeInfo {
@@ -20,8 +21,8 @@ pub struct RepoBranchInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TicketReviewState {
-    pub ticket_id: String,
+pub struct WorkItemReviewState {
+    pub work_item_id: String,
     pub review_status: String,
     pub summary: String,
     pub source_branch: Option<String>,
@@ -34,16 +35,24 @@ pub struct TicketReviewState {
     pub branch_present: bool,
     pub can_review: bool,
     pub can_continue: bool,
+    pub remote_branch_name: Option<String>,
+    pub remote_branch_exists: bool,
+    pub ahead_count: i64,
+    pub behind_count: i64,
+    pub needs_push: bool,
+    pub can_push: bool,
+    pub push_summary: String,
 }
 
 #[derive(Debug, Clone)]
-struct TicketGitInfo {
+pub(crate) struct WorkItemGitInfo {
     id: String,
     status: String,
     repo_path: Option<String>,
     source_branch: Option<String>,
     branch_name: Option<String>,
     worktree_path: Option<String>,
+    parent_id: Option<String>,
 }
 
 fn worktrees_base() -> PathBuf {
@@ -163,6 +172,15 @@ fn source_branch_exists(repo_path: &str, source_branch: &str) -> bool {
     branch_exists(repo_path, source_branch)
 }
 
+fn remote_branch_exists(repo_path: &str, branch_name: &str) -> bool {
+    run_git_in_repo_output(
+        repo_path,
+        &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch_name}")],
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false)
+}
+
 fn is_branch_merged(repo_path: &str, branch_name: &str, source_branch: &str) -> Result<bool, String> {
     let out = run_git_in_repo_output(repo_path, &["merge-base", "--is-ancestor", branch_name, source_branch])?;
     match out.status.code() {
@@ -175,7 +193,30 @@ fn is_branch_merged(repo_path: &str, branch_name: &str, source_branch: &str) -> 
     }
 }
 
-fn remove_worktree_internal(worktree_path: &str, repo_path: &str, branch_name: &str) -> Result<(), String> {
+fn ahead_behind_counts(repo_path: &str, branch_name: &str) -> Result<(i64, i64), String> {
+    let out = run_git(
+        &[
+            "-C",
+            repo_path,
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("origin/{branch_name}...{branch_name}"),
+        ],
+    )?;
+    let mut counts = out.split_whitespace();
+    let behind = counts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let ahead = counts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    Ok((ahead, behind))
+}
+
+pub(crate) fn remove_worktree_internal(worktree_path: &str, repo_path: &str, branch_name: &str) -> Result<(), String> {
     let mut errors: Vec<String> = Vec::new();
 
     if PathBuf::from(worktree_path).exists() {
@@ -312,17 +353,29 @@ fn commit_pending_changes(worktree_path: &str, branch_name: &str) -> Result<bool
     Ok(true)
 }
 
+fn sync_worktree_to_branch(worktree_path: &str, branch_name: &str) -> Result<(), String> {
+    if !has_valid_worktree(worktree_path) {
+        return Ok(());
+    }
+
+    run_git(&["-C", worktree_path, "reset", "--hard", branch_name])?;
+    run_git(&["-C", worktree_path, "clean", "-fd"])?;
+    Ok(())
+}
+
 fn merge_branch_internal(
     repo_path: &str,
     worktree_path: &str,
     source_branch: &str,
     branch_name: &str,
 ) -> Result<(), String> {
+    // Commit pending changes BEFORE checking merge status — otherwise
+    // uncommitted work causes is_branch_merged to return a false positive.
+    let _ = commit_pending_changes(worktree_path, branch_name);
+
     if is_branch_merged(repo_path, branch_name, source_branch)? {
         return Ok(());
     }
-
-    let _ = commit_pending_changes(worktree_path, branch_name)?;
     let integration_path = integration_worktree_path(repo_path, source_branch);
     let integration_path_str = integration_path.to_string_lossy().to_string();
 
@@ -358,30 +411,31 @@ fn merge_branch_internal(
     Ok(())
 }
 
-async fn fetch_ticket_git_info(pool: &SqlitePool, ticket_id: &str) -> Result<TicketGitInfo, String> {
+async fn fetch_work_item_git_info(pool: &SqlitePool, work_item_id: &str) -> Result<WorkItemGitInfo, String> {
     sqlx::query(
-        "SELECT id, status, repo_path, source_branch, branch_name, worktree_path FROM tickets WHERE id = ?",
+        "SELECT id, status, repo_path, source_branch, branch_name, worktree_path, parent_id FROM work_items WHERE id = ?",
     )
-    .bind(ticket_id)
+    .bind(work_item_id)
     .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
-    .map(|row| TicketGitInfo {
+    .map(|row| WorkItemGitInfo {
         id: row.try_get("id").unwrap_or_default(),
         status: row.try_get("status").unwrap_or_default(),
         repo_path: row.try_get("repo_path").ok().flatten(),
         source_branch: row.try_get("source_branch").ok().flatten(),
         branch_name: row.try_get("branch_name").ok().flatten(),
         worktree_path: row.try_get("worktree_path").ok().flatten(),
+        parent_id: row.try_get("parent_id").ok().flatten(),
     })
-    .ok_or_else(|| format!("Ticket {ticket_id} not found"))
+    .ok_or_else(|| format!("Work item {work_item_id} not found"))
 }
 
-fn compute_review_state(ticket: &TicketGitInfo) -> TicketReviewState {
-    let repo_path = ticket.repo_path.as_deref();
-    let source_branch = ticket.source_branch.as_deref();
-    let branch_name = ticket.branch_name.as_deref();
-    let worktree_path = ticket.worktree_path.as_deref();
+fn compute_review_state(work_item: &WorkItemGitInfo) -> WorkItemReviewState {
+    let repo_path = work_item.repo_path.as_deref();
+    let source_branch = work_item.source_branch.as_deref();
+    let branch_name = work_item.branch_name.as_deref();
+    let worktree_path = work_item.worktree_path.as_deref();
 
     let worktree_present = worktree_path.map(has_valid_worktree).unwrap_or(false);
     let branch_present = match (repo_path, branch_name) {
@@ -406,39 +460,67 @@ fn compute_review_state(ticket: &TicketGitInfo) -> TicketReviewState {
         }
         _ => false,
     };
+    let remote_branch_name = branch_name.map(|name| format!("origin/{name}"));
+    let remote_branch_exists = match (repo_path, branch_name) {
+        (Some(repo_path), Some(branch_name)) if branch_present => remote_branch_exists(repo_path, branch_name),
+        _ => false,
+    };
+    let (ahead_count, behind_count) = match (repo_path, branch_name) {
+        (Some(repo_path), Some(branch_name)) if branch_present && remote_branch_exists => {
+            ahead_behind_counts(repo_path, branch_name).unwrap_or((0, 0))
+        }
+        _ => (0, 0),
+    };
+    let needs_push = branch_present && (!remote_branch_exists || ahead_count > 0);
+    let can_push = branch_present && (!remote_branch_exists || behind_count == 0);
+    let push_summary = if !branch_present {
+        "The work item branch is missing.".to_string()
+    } else if !remote_branch_exists {
+        "This branch has not been pushed to GitHub yet.".to_string()
+    } else if ahead_count > 0 && behind_count > 0 {
+        format!(
+            "This branch has diverged from origin (ahead {ahead_count}, behind {behind_count})."
+        )
+    } else if ahead_count > 0 {
+        format!("This branch is ahead of origin by {ahead_count} commit(s).")
+    } else if behind_count > 0 {
+        format!("This branch is behind origin by {behind_count} commit(s).")
+    } else {
+        "This branch is up to date with origin.".to_string()
+    };
 
     let (review_status, summary) = if repo_path.is_none() {
-        ("unavailable", "Set a repository on the ticket to enable Git review.")
+        ("unavailable", "Set a repository on the work item to enable Git review.")
     } else if worktree_path.is_none() || !worktree_present {
-        ("unavailable", "No active ticket worktree is available.")
+        ("unavailable", "No active work item worktree is available.")
     } else if branch_name.is_none() || !branch_present {
-        ("unavailable", "The ticket branch is missing.")
+        ("unavailable", "The work item branch is missing.")
     } else if source_branch.is_none() || !source_branch_present {
         ("unavailable", "The source branch is missing.")
     } else if is_merged && !has_changes {
-        ("merged", "This ticket branch is already merged into the source branch.")
+        ("merged", "This work item branch is already merged into the source branch.")
     } else if has_changes {
         ("changes", "Git changes are ready for review.")
     } else {
         ("clean", "No Git changes are pending review.")
     };
 
-    let legacy_review = ticket.status == "review";
-    let has_git_context = ticket.repo_path.is_some()
-        || ticket.source_branch.is_some()
-        || ticket.branch_name.is_some()
-        || ticket.worktree_path.is_some();
-    let is_closed = matches!(ticket.status.as_str(), "done" | "archived");
+    let legacy_review = work_item.status == "review";
+    let has_git_context = work_item.repo_path.is_some()
+        || work_item.source_branch.is_some()
+        || work_item.branch_name.is_some()
+        || work_item.worktree_path.is_some();
+    let is_closed = matches!(work_item.status.as_str(), "done" | "archived");
     let can_review = has_git_context || legacy_review || !matches!(review_status, "unavailable");
     let can_continue = !is_closed && worktree_present && branch_present && !is_merged;
 
-    TicketReviewState {
-        ticket_id: ticket.id.clone(),
+    WorkItemReviewState {
+        work_item_id: work_item.id.clone(),
         review_status: review_status.to_string(),
         summary: summary.to_string(),
-        source_branch: ticket.source_branch.clone(),
-        branch_name: ticket.branch_name.clone(),
-        worktree_path: ticket.worktree_path.clone(),
+        source_branch: work_item.source_branch.clone(),
+        branch_name: work_item.branch_name.clone(),
+        worktree_path: work_item.worktree_path.clone(),
         diff,
         has_changes,
         is_merged,
@@ -446,6 +528,13 @@ fn compute_review_state(ticket: &TicketGitInfo) -> TicketReviewState {
         branch_present,
         can_review,
         can_continue,
+        remote_branch_name,
+        remote_branch_exists,
+        ahead_count,
+        behind_count,
+        needs_push,
+        can_push,
+        push_summary,
     }
 }
 
@@ -471,14 +560,14 @@ fn validate_branch_name(name: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn create_worktree(
-    ticket_id: String,
+    work_item_id: String,
     repo_path: String,
     source_branch: Option<String>,
     branch_name: Option<String>,
 ) -> Result<WorktreeInfo, String> {
     if !repo_has_commits(&repo_path) {
         return Err(
-            "Repository has no commits yet. Create an initial commit in that repo, then run the ticket again."
+            "Repository has no commits yet. Create an initial commit in that repo, then run the work item again."
                 .to_string(),
         );
     }
@@ -489,10 +578,10 @@ pub async fn create_worktree(
             validate_branch_name(&name)?;
             name
         }
-        _ => format!("mozzie/{}", ticket_id),
+        _ => format!("mozzie/{}", work_item_id),
     };
     let base = worktrees_base();
-    let worktree_path = base.join(&ticket_id);
+    let worktree_path = base.join(&work_item_id);
     let worktree_str = worktree_path.to_string_lossy().to_string();
     let source = match source_branch {
         Some(b) if !b.trim().is_empty() => b,
@@ -500,28 +589,46 @@ pub async fn create_worktree(
     };
 
     if worktree_path.exists() && has_valid_worktree(&worktree_str) {
-        return Ok(WorktreeInfo {
-            worktree_path: worktree_str,
-            branch_name,
-            source_branch: source,
-        });
+        let current = current_branch_name(&worktree_str)?;
+        if current.branch_name == branch_name {
+            return Ok(WorktreeInfo {
+                worktree_path: worktree_str,
+                branch_name,
+                source_branch: source,
+            });
+        }
     }
 
     let _ = run_git(&["-C", &repo_path, "worktree", "remove", "--force", &worktree_str]);
-    let _ = run_git(&["-C", &repo_path, "branch", "-D", &branch_name]);
     let _ = run_git(&["-C", &repo_path, "worktree", "prune"]);
     let _ = std::fs::remove_dir_all(&worktree_path);
 
     std::fs::create_dir_all(&base)
         .map_err(|e| format!("Cannot create worktrees directory: {e}"))?;
 
-    run_git(&[
-        "-C", &repo_path,
-        "worktree", "add",
-        "-b", &branch_name,
-        &worktree_str,
-        &source,
-    ])?;
+    if branch_exists(&repo_path, &branch_name) {
+        run_git(&[
+            "-C",
+            &repo_path,
+            "worktree",
+            "add",
+            "--force",
+            &worktree_str,
+            &branch_name,
+        ])?;
+    } else {
+        run_git(&[
+            "-C",
+            &repo_path,
+            "worktree",
+            "add",
+            "--force",
+            "-b",
+            &branch_name,
+            &worktree_str,
+            &source,
+        ])?;
+    }
 
     Ok(WorktreeInfo {
         worktree_path: worktree_str,
@@ -557,115 +664,236 @@ pub async fn merge_branch(
     merge_branch_internal(&repo_path, &worktree_path, &source_branch, &branch_name)
 }
 
-#[tauri::command]
-pub async fn get_ticket_review_state(
-    db: State<'_, SqlitePool>,
-    ticket_id: String,
-) -> Result<TicketReviewState, String> {
-    let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
-    Ok(compute_review_state(&ticket))
-}
-
-#[tauri::command]
-pub async fn approve_ticket_review(
-    app: AppHandle,
-    db: State<'_, SqlitePool>,
-    active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
-) -> Result<(), String> {
-    let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
-    let from_status = ticket.status.clone();
-    let repo_path = ticket.repo_path.as_deref().ok_or("Ticket has no repo_path")?;
-    let worktree_path = ticket.worktree_path.as_deref().ok_or("Ticket has no worktree_path")?;
-    let source_branch = ticket.source_branch.as_deref().ok_or("Ticket has no source_branch")?;
-    let branch_name = ticket.branch_name.as_deref().ok_or("Ticket has no branch_name")?;
-
-    let _ = shutdown_ticket_session(active_sessions.inner(), &ticket_id).await;
-
-    if !source_branch_exists(repo_path, source_branch) {
-        return Err(format!(
-            "Source branch '{source_branch}' is missing. Refusing to approve because merge cannot be verified."
-        ));
+pub(crate) async fn ensure_top_level_worktree(
+    pool: &SqlitePool,
+    work_item_id: &str,
+) -> Result<WorkItemGitInfo, String> {
+    let work_item = fetch_work_item_git_info(pool, work_item_id).await?;
+    if work_item.parent_id.is_some() || work_item.repo_path.is_none() {
+        return Ok(work_item);
     }
 
-    if !branch_exists(repo_path, branch_name) {
-        return Err(format!(
-            "Ticket branch '{branch_name}' is missing. Refusing to approve because merge cannot be verified."
-        ));
-    }
+    let repo_path = work_item.repo_path.as_deref().unwrap_or_default().to_string();
+    let branch_name = work_item
+        .branch_name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("mozzie/{work_item_id}"));
+    validate_branch_name(&branch_name)?;
 
-    let already_merged = is_branch_merged(repo_path, branch_name, source_branch)?;
+    let source_branch = work_item
+        .source_branch
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(current_branch_name(&repo_path)?.branch_name);
 
-    if !already_merged {
-        if !has_valid_worktree(worktree_path) {
-            return Err(
-                "Ticket worktree is missing. Cannot checkpoint pending work before merge; approval aborted."
-                    .to_string(),
-            );
-        }
-
-        merge_branch_internal(repo_path, worktree_path, source_branch, branch_name)?;
-
-        if !is_branch_merged(repo_path, branch_name, source_branch)? {
-            return Err(format!(
-                "Merge verification failed: branch '{branch_name}' is not an ancestor of '{source_branch}'."
-            ));
-        }
-    }
-
-    remove_worktree_internal(worktree_path, repo_path, branch_name)?;
-
+    let info = create_worktree(
+        work_item_id.to_string(),
+        repo_path,
+        Some(source_branch),
+        Some(branch_name),
+    )
+    .await?;
     let now = now_iso();
     sqlx::query(
-        r#"UPDATE tickets SET
-            status = 'done', terminal_slot = NULL,
-            worktree_path = NULL, source_branch = NULL, branch_name = NULL,
-            completed_at = ?, updated_at = ?
-          WHERE id = ?"#,
+        "UPDATE work_items SET source_branch = ?, branch_name = ?, worktree_path = ?, updated_at = ? WHERE id = ?",
     )
+    .bind(&info.source_branch)
+    .bind(&info.branch_name)
+    .bind(&info.worktree_path)
     .bind(&now)
-    .bind(&now)
-    .bind(&ticket_id)
-    .execute(db.inner())
+    .bind(work_item_id)
+    .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
 
-    app.emit(
-        "ticket:state-change",
-        serde_json::json!({
-            "ticketId": ticket_id,
-            "from": from_status,
-            "to": "done",
-        }),
-    )
-    .map_err(|e| e.to_string())?;
+    fetch_work_item_git_info(pool, work_item_id).await
+}
+
+#[tauri::command]
+pub async fn get_work_item_review_state(
+    db: State<'_, SqlitePool>,
+    work_item_id: String,
+) -> Result<WorkItemReviewState, String> {
+    let mut work_item = fetch_work_item_git_info(db.inner(), &work_item_id).await?;
+    if work_item.parent_id.is_none()
+        && work_item.repo_path.is_some()
+        && (work_item.branch_name.is_none()
+            || work_item.worktree_path.is_none()
+            || work_item
+                .worktree_path
+                .as_deref()
+                .map(|path| !has_valid_worktree(path))
+                .unwrap_or(true))
+    {
+        work_item = ensure_top_level_worktree(db.inner(), &work_item_id).await?;
+    }
+    Ok(compute_review_state(&work_item))
+}
+
+#[tauri::command]
+pub async fn approve_work_item_review(
+    app: AppHandle,
+    db: State<'_, SqlitePool>,
+    active_sessions: State<'_, ActiveSessions>,
+    work_item_id: String,
+) -> Result<(), String> {
+    let mut work_item = fetch_work_item_git_info(db.inner(), &work_item_id).await?;
+    if work_item.parent_id.is_none() {
+        work_item = ensure_top_level_worktree(db.inner(), &work_item_id).await?;
+    }
+    let from_status = work_item.status.clone();
+    let repo_path = work_item.repo_path.as_deref().ok_or("Work item has no repo_path")?;
+    let branch_name = work_item.branch_name.as_deref().ok_or("Work item has no branch_name")?;
+    let worktree_path = work_item.worktree_path.as_deref();
+
+    let _ = shutdown_work_item_session(active_sessions.inner(), &work_item_id).await;
+
+    if !branch_exists(repo_path, branch_name) {
+        return Err(format!(
+            "Work item branch '{branch_name}' is missing. Cannot approve."
+        ));
+    }
+
+    // Commit any uncommitted work so the merge/push includes everything the agent produced.
+    if let Some(worktree_path) = worktree_path.filter(|path| has_valid_worktree(path)) {
+        let _ = commit_pending_changes(worktree_path, branch_name);
+    }
+
+    if let Some(ref parent_id) = work_item.parent_id {
+        // ── Child work item: merge into the parent's branch ──
+        let parent = ensure_top_level_worktree(db.inner(), parent_id).await?;
+        let parent_branch = parent.branch_name.as_deref()
+            .ok_or("Parent work item has no branch_name. Cannot merge child.")?;
+        let child_worktree_path = work_item
+            .worktree_path
+            .as_deref()
+            .ok_or("Child work item has no worktree_path")?;
+
+        // Merge child branch into parent branch
+        merge_branch_internal(repo_path, child_worktree_path, parent_branch, branch_name)?;
+
+        // Clean up the child's worktree
+        let _ = remove_worktree_internal(child_worktree_path, repo_path, branch_name);
+
+        // Mark child as done
+        let now = now_iso();
+        sqlx::query(
+            r#"UPDATE work_items SET
+                status = 'done', terminal_slot = NULL,
+                completed_at = ?, updated_at = ?
+              WHERE id = ?"#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&work_item_id)
+        .execute(db.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+        app.emit(
+            "work-item:state-change",
+            serde_json::json!({
+                "workItemId": work_item_id,
+                "from": from_status,
+                "to": "done",
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+
+        if let Some(parent_worktree_path) = parent.worktree_path.as_deref() {
+            let _ = sync_worktree_to_branch(parent_worktree_path, parent_branch);
+        }
+        sqlx::query("UPDATE work_items SET updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(parent_id)
+            .execute(db.inner())
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = app.emit(
+            "work-item:git-state-change",
+            serde_json::json!({ "workItemId": parent_id }),
+        );
+
+        // Check if all children are now done → transition parent to review
+        if all_children_done(db.inner(), parent_id).await? {
+            let parent_from = parent.status.clone();
+            if !matches!(parent_from.as_str(), "done" | "archived" | "review") {
+                sqlx::query(
+                    "UPDATE work_items SET status = 'review', updated_at = ? WHERE id = ?",
+                )
+                .bind(&now)
+                .bind(parent_id)
+                .execute(db.inner())
+                .await
+                .map_err(|e| e.to_string())?;
+
+                let _ = app.emit(
+                    "work-item:state-change",
+                    serde_json::json!({
+                        "workItemId": parent_id,
+                        "from": parent_from,
+                        "to": "review",
+                    }),
+                );
+
+                let _ = app.emit(
+                    "work-item:children-complete",
+                    serde_json::json!({ "parentId": parent_id }),
+                );
+            }
+        }
+    } else {
+        // ── Top-level work item: push its branch without changing completion state ──
+        let push_target = if let Some(worktree_path) = worktree_path.filter(|path| has_valid_worktree(path)) {
+            worktree_path
+        } else {
+            repo_path
+        };
+        run_git(&["-C", push_target, "push", "-u", "origin", branch_name])?;
+
+        let now = now_iso();
+        sqlx::query("UPDATE work_items SET updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(&work_item_id)
+        .execute(db.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+        let _ = app.emit(
+            "work-item:git-state-change",
+            serde_json::json!({ "workItemId": work_item_id }),
+        );
+    }
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn reject_ticket_review(
+pub async fn reject_work_item_review(
     app: AppHandle,
     db: State<'_, SqlitePool>,
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
 ) -> Result<(), String> {
-    let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
-    let from_status = ticket.status.clone();
+    let work_item = fetch_work_item_git_info(db.inner(), &work_item_id).await?;
+    if work_item.parent_id.is_none() {
+        return Err("Discard is only supported for child work items. Top-level work items can be pushed or marked done.".to_string());
+    }
+    let from_status = work_item.status.clone();
 
-    let _ = shutdown_ticket_session(active_sessions.inner(), &ticket_id).await;
+    let _ = shutdown_work_item_session(active_sessions.inner(), &work_item_id).await;
 
     if let (Some(repo_path), Some(worktree_path), Some(branch_name)) = (
-        ticket.repo_path.as_deref(),
-        ticket.worktree_path.as_deref(),
-        ticket.branch_name.as_deref(),
+        work_item.repo_path.as_deref(),
+        work_item.worktree_path.as_deref(),
+        work_item.branch_name.as_deref(),
     ) {
         remove_worktree_internal(worktree_path, repo_path, branch_name)?;
     }
 
     let now = now_iso();
     sqlx::query(
-        r#"UPDATE tickets SET
+        r#"UPDATE work_items SET
             status = 'ready', terminal_slot = NULL,
             started_at = NULL, completed_at = NULL,
             worktree_path = NULL, source_branch = NULL, branch_name = NULL,
@@ -673,15 +901,15 @@ pub async fn reject_ticket_review(
           WHERE id = ?"#,
     )
     .bind(&now)
-    .bind(&ticket_id)
+    .bind(&work_item_id)
     .execute(db.inner())
     .await
     .map_err(|e| e.to_string())?;
 
     app.emit(
-        "ticket:state-change",
+        "work-item:state-change",
         serde_json::json!({
-            "ticketId": ticket_id,
+            "workItemId": work_item_id,
             "from": from_status,
             "to": "ready",
         }),
@@ -692,35 +920,38 @@ pub async fn reject_ticket_review(
 }
 
 #[tauri::command]
-pub async fn close_ticket_review(
+pub async fn close_work_item_review(
     app: AppHandle,
     db: State<'_, SqlitePool>,
     active_sessions: State<'_, ActiveSessions>,
-    ticket_id: String,
+    work_item_id: String,
 ) -> Result<(), String> {
-    let ticket = fetch_ticket_git_info(db.inner(), &ticket_id).await?;
-    let from_status = ticket.status.clone();
+    let work_item = fetch_work_item_git_info(db.inner(), &work_item_id).await?;
+    if work_item.parent_id.is_some() {
+        return Err("Child work items must be merged or discarded; they cannot be marked done directly.".to_string());
+    }
+    let from_status = work_item.status.clone();
     let now = now_iso();
 
-    let _ = shutdown_ticket_session(active_sessions.inner(), &ticket_id).await;
+    let _ = shutdown_work_item_session(active_sessions.inner(), &work_item_id).await;
 
     sqlx::query(
-        r#"UPDATE tickets SET
+        r#"UPDATE work_items SET
             status = 'done', terminal_slot = NULL,
             completed_at = ?, updated_at = ?
           WHERE id = ?"#,
     )
     .bind(&now)
     .bind(&now)
-    .bind(&ticket_id)
+    .bind(&work_item_id)
     .execute(db.inner())
     .await
     .map_err(|e| e.to_string())?;
 
     app.emit(
-        "ticket:state-change",
+        "work-item:state-change",
         serde_json::json!({
-            "ticketId": ticket_id,
+            "workItemId": work_item_id,
             "from": from_status,
             "to": "done",
         }),
@@ -728,6 +959,19 @@ pub async fn close_ticket_review(
     .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Ensures a parent work item's branch exists in the repo (without a worktree).
+/// Called before starting a child so the child can branch off the parent's branch.
+#[tauri::command]
+pub async fn ensure_parent_branch(
+    db: State<'_, SqlitePool>,
+    parent_id: String,
+) -> Result<String, String> {
+    let parent = ensure_top_level_worktree(db.inner(), &parent_id).await?;
+    parent
+        .branch_name
+        .ok_or("Parent work item has no branch_name".to_string())
 }
 
 #[tauri::command]

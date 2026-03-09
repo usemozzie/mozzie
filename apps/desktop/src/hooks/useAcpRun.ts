@@ -4,23 +4,23 @@ import type { AcpEventItem } from '@mozzie/db';
 import type { AgentLogChangeEvent } from '../types/events';
 
 interface AcpEventPayload {
-  ticketId: string;
+  workItemId: string;
   logId: string;
   item: AcpEventItem;
 }
 
 /**
- * Subscribes to live "acp:event" Tauri events for a specific ticket.
+ * Subscribes to live "acp:event" Tauri events for a specific work item.
  * Returns the accumulated list of AcpEventItem objects streamed so far.
  * When `logId` is provided, also accepts seed items from a persisted log.
  */
-export function useAcpRun(ticketId: string | null) {
+export function useAcpRun(workItemId: string | null) {
   const [items, setItems] = useState<AcpEventItem[]>([]);
   const currentLogIdRef = useRef<string | null>(null);
   const unlistenRefs = useRef<Array<() => void>>([]);
 
   useEffect(() => {
-    if (!ticketId) {
+    if (!workItemId) {
       setItems([]);
       currentLogIdRef.current = null;
       return;
@@ -35,7 +35,7 @@ export function useAcpRun(ticketId: string | null) {
 
     listen<AcpEventPayload>('acp:event', (event) => {
       if (cancelled) return;
-      if (event.payload.ticketId !== ticketId) return;
+      if (event.payload.workItemId !== workItemId) return;
       if (currentLogIdRef.current !== event.payload.logId) {
         currentLogIdRef.current = event.payload.logId;
         setItems([event.payload.item]);
@@ -53,7 +53,7 @@ export function useAcpRun(ticketId: string | null) {
 
     listen<AgentLogChangeEvent>('agent:log-change', (event) => {
       if (cancelled) return;
-      if (event.payload.ticketId !== ticketId) return;
+      if (event.payload.workItemId !== workItemId) return;
       currentLogIdRef.current = null;
       setItems([]);
     }).then((unlisten) => {
@@ -72,7 +72,7 @@ export function useAcpRun(ticketId: string | null) {
       }
       unlistenRefs.current = [];
     };
-  }, [ticketId]);
+  }, [workItemId]);
 
   return items;
 }

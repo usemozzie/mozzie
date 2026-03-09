@@ -1,21 +1,22 @@
-export type TicketStatus = 'draft' | 'ready' | 'blocked' | 'queued' | 'running' | 'review' | 'done' | 'archived';
+export type WorkItemStatus = 'draft' | 'ready' | 'blocked' | 'queued' | 'running' | 'review' | 'done' | 'archived';
 
-export interface Ticket {
+export interface WorkItem {
   id: string;
   title: string;
   context: string | null;
   execution_context: string | null;
   orchestrator_note: string | null;
-  duplicate_of_ticket_id: string | null;
+  duplicate_of_work_item_id: string | null;
   duplicate_policy: string | null;
   intent_type: string | null;
-  status: TicketStatus;
+  status: WorkItemStatus;
   repo_path: string | null;
   source_branch: string | null;
   branch_name: string | null;
   worktree_path: string | null;
   assigned_agent: string | null;
   terminal_slot: number | null;
+  parent_id: string | null;
   workspace_id: string;
   created_at: string;
   updated_at: string;
@@ -23,8 +24,8 @@ export interface Ticket {
   completed_at: string | null;
 }
 
-export interface TicketReviewState {
-  ticket_id: string;
+export interface WorkItemReviewState {
+  work_item_id: string;
   review_status: 'unavailable' | 'clean' | 'changes' | 'merged' | string;
   summary: string;
   source_branch: string | null;
@@ -37,6 +38,13 @@ export interface TicketReviewState {
   branch_present: boolean;
   can_review: boolean;
   can_continue: boolean;
+  remote_branch_name: string | null;
+  remote_branch_exists: boolean;
+  ahead_count: number;
+  behind_count: number;
+  needs_push: boolean;
+  can_push: boolean;
+  push_summary: string;
 }
 
 /** A single streamed event item from an ACP run, stored as JSON in agent_logs.messages. */
@@ -53,7 +61,7 @@ export interface AcpEventItem {
 
 export interface AgentLog {
   id: string;
-  ticket_id: string;
+  work_item_id: string;
   agent_id: string;
   run_id: string | null;
   /** JSON-serialised AcpEventItem[] collected during the run. */
@@ -87,25 +95,17 @@ export interface Workspace {
   updated_at: string;
 }
 
-export interface LicenseStatus {
-  is_pro: boolean;
-  license_key: string | null;
-  email: string | null;
-  status: string | null;
-  validated_at: string | null;
-}
-
-export interface TicketDependency {
-  ticket_id: string;
+export interface WorkItemDependency {
+  work_item_id: string;
   depends_on_id: string;
   created_at: string;
 }
 
 export type AttemptOutcome = 'approved' | 'rejected' | 'error' | 'timeout';
 
-export interface TicketAttempt {
+export interface WorkItemAttempt {
   id: string;
-  ticket_id: string;
+  work_item_id: string;
   attempt_number: number;
   agent_id: string;
   agent_log_id: string | null;
@@ -177,7 +177,7 @@ export interface AgentPermissionRequest {
 }
 
 export interface AgentSessionState {
-  ticket_id: string;
+  work_item_id: string;
   agent_id: string;
   session_id: string;
   is_running: boolean;

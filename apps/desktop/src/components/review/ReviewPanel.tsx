@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check, Loader2, RotateCcw, X } from 'lucide-react';
-import type { AgentLog, Ticket, TicketReviewState } from '@mozzie/db';
+import type { AgentLog, WorkItem, WorkItemReviewState } from '@mozzie/db';
 import { DiffViewer, formatFileLabel, getFileStatus, parseDiff } from './DiffViewer';
 import { RejectionModal } from './RejectionModal';
 import { Button } from '../ui/button';
 
 interface ReviewPanelProps {
-  ticket: Ticket;
-  review: TicketReviewState | null;
+  workItem: WorkItem;
+  review: WorkItemReviewState | null;
   reviewLoading?: boolean;
   reviewError?: string | null;
   latestLog?: AgentLog | null;
@@ -51,7 +51,7 @@ function getParsedDiffSummary(diff: string) {
 }
 
 export function ReviewPanel({
-  ticket,
+  workItem,
   review,
   reviewLoading,
   reviewError,
@@ -64,11 +64,26 @@ export function ReviewPanel({
 }: ReviewPanelProps) {
   const [selectedFileKey, setSelectedFileKey] = useState<string | null>(null);
   const [showRejectionModal, setShowRejectionModal] = useState(false);
+  const isChild = !!workItem.parent_id;
 
   const diff = review?.diff ?? '';
   const { files, totalAdditions, totalDeletions } = useMemo(
     () => getParsedDiffSummary(diff),
     [diff],
+  );
+  const primaryLabel = isChild
+    ? 'Merge to Parent'
+    : !review?.branch_present
+      ? 'Branch Missing'
+      : !review.can_push && review.needs_push
+        ? 'Push Blocked'
+        : review.needs_push
+          ? review.remote_branch_exists ? 'Push Updates' : 'Push to GitHub'
+          : 'Up to Date';
+  const primaryDisabled = isMutating || !review || (
+    isChild
+      ? (!review.has_changes && !review.is_merged)
+      : !review.can_push || !review.needs_push
   );
 
   useEffect(() => {
@@ -91,6 +106,11 @@ export function ReviewPanel({
       {latestLog?.cleanup_warning_message && (
         <div className="shrink-0 px-3 py-2 border-b border-amber-500/20 text-xs text-amber-300 bg-amber-500/10">
           {latestLog.cleanup_warning_message}
+        </div>
+      )}
+      {!isChild && review && !reviewLoading && !reviewError && (
+        <div className="shrink-0 px-3 py-2 border-b border-border bg-surface/20 text-xs text-text-dim">
+          {review.push_summary}
         </div>
       )}
 
@@ -125,7 +145,7 @@ export function ReviewPanel({
                   className={`w-full px-3 py-2 text-left border-b border-border/60 transition-colors ${active ? 'bg-white/[0.08]' : 'hover:bg-white/[0.04]'}`}
                 >
                   <div className="flex items-center gap-2">
-                    <span className={`w-5 shrink-0 text-[11px] font-mono ${status === 'new' ? 'text-emerald-400' : status === 'deleted' ? 'text-red-400' : 'text-blue-300'}`}>
+                    <span className={`w-5 shrink-0 text-[11px] font-mono ${status === 'new' ? 'text-emerald-400' : status === 'deleted' ? 'text-red-400' : 'text-zinc-300'}`}>
                       {status === 'new' ? 'A' : status === 'deleted' ? 'D' : 'M'}
                     </span>
                     <span className="truncate text-[12px] text-text">{formatFileLabel(file.oldPath, file.newPath)}</span>
@@ -167,8 +187,8 @@ export function ReviewPanel({
       {(onApprove || onReject || onClose) && (
         <div className="shrink-0 sticky bottom-0 z-10 px-3 py-3 border-t border-border flex gap-2 bg-surface">
           {onApprove && (
-            <Button size="sm" className="flex-1" onClick={onApprove} disabled={isMutating || !review || (!review.has_changes && !review.is_merged)}>
-              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Check className="w-3 h-3" />Keep All</>}
+            <Button size="sm" className="flex-1" onClick={onApprove} disabled={primaryDisabled}>
+              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><Check className="w-3 h-3" />{primaryLabel}</>}
             </Button>
           )}
           {onReject && (
@@ -178,7 +198,7 @@ export function ReviewPanel({
           )}
           {onClose && (
             <Button variant="outline" size="sm" className="flex-1" onClick={onClose} disabled={isMutating}>
-              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><X className="w-3 h-3" />Close</>}
+              {isMutating ? <Loader2 className="w-3 h-3 animate-spin" /> : <><X className="w-3 h-3" />Mark Done</>}
             </Button>
           )}
         </div>
@@ -186,7 +206,7 @@ export function ReviewPanel({
 
       {showRejectionModal && onReject && (
         <RejectionModal
-          ticketTitle={ticket.title}
+          workItemTitle={workItem.title}
           filesChanged={files.map((f) => formatFileLabel(f.oldPath, f.newPath))}
           onConfirm={(reason) => {
             setShowRejectionModal(false);

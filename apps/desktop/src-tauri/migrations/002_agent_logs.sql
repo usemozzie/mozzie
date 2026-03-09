@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS agent_logs (
   id          TEXT PRIMARY KEY,
-  ticket_id   TEXT NOT NULL REFERENCES tickets(id),
+  work_item_id TEXT NOT NULL REFERENCES work_items(id),
   agent_id    TEXT NOT NULL,
   run_id      TEXT,           -- ACP run identifier returned by the agent server
   messages    TEXT,           -- JSON: AcpEventItem[] (streamed events from the run)
@@ -15,4 +15,4 @@ CREATE TABLE IF NOT EXISTS agent_logs (
   created_at  TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_agent_logs_ticket_id ON agent_logs(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_work_item_id ON agent_logs(work_item_id);

@@ -1,13 +1,13 @@
 import { Play, Loader2, GitBranch } from 'lucide-react';
-import type { Ticket, TicketStatus } from '@mozzie/db';
+import type { WorkItem, WorkItemStatus } from '@mozzie/db';
 import { formatDistanceToNow } from '../../lib/time';
 import { useStartAgent } from '../../hooks/useStartAgent';
-import { useTicketDependencies } from '../../hooks/useDependencies';
-import { getTicketColor } from '../../lib/ticketColors';
-import { useTicketStore } from '../../stores/ticketStore';
+import { useWorkItemDependencies } from '../../hooks/useDependencies';
+import { getWorkItemTag } from '../../lib/workItemColors';
+import { useWorkItemStore } from '../../stores/workItemStore';
 
 // Traffic-light state colors
-const statusDot: Record<TicketStatus, string> = {
+const statusDot: Record<WorkItemStatus, string> = {
   draft:    'bg-state-idle',
   ready:    'bg-state-active',
   blocked:  'bg-amber-500',
@@ -18,38 +18,48 @@ const statusDot: Record<TicketStatus, string> = {
   archived: 'bg-state-idle opacity-50',
 };
 
-interface TicketCardProps {
-  ticket: Ticket;
+interface WorkItemCardProps {
+  workItem: WorkItem;
   isSelected: boolean;
   selectedIndex: number;
   onClick: () => void;
+  canStart?: boolean;
 }
 
-export function TicketCard({ ticket, isSelected, selectedIndex, onClick }: TicketCardProps) {
+export function WorkItemCard({ workItem, isSelected, selectedIndex, onClick, canStart = true }: WorkItemCardProps) {
   const { startAgent, isStarting } = useStartAgent();
-  const runError = useTicketStore((s) => s.runErrorsByTicketId[ticket.id]);
-  const selectTicket = useTicketStore((s) => s.selectTicket);
-  const { data: deps } = useTicketDependencies(ticket.id);
-  const isReady = ticket.status === 'ready';
-  const isBlocked = ticket.status === 'blocked';
+  const runError = useWorkItemStore((s) => s.runErrorsByWorkItemId[workItem.id]);
+  const selectWorkItem = useWorkItemStore((s) => s.selectWorkItem);
+  const { data: deps } = useWorkItemDependencies(workItem.id);
+  const isReady = workItem.status === 'ready';
+  const isBlocked = workItem.status === 'blocked';
   const hasDeps = deps && deps.length > 0;
-  const accent = getTicketColor(selectedIndex);
+  const tag = isSelected ? getWorkItemTag(selectedIndex) : null;
 
   return (
     <div className="relative group">
       <button
         onClick={onClick}
-        style={isSelected ? { boxShadow: `inset 2px 0 0 ${accent}`, background: `${accent}0D` } : undefined}
+        style={tag ? { boxShadow: `inset 2px 0 0 ${tag.color}`, background: `${tag.color}10` } : undefined}
         className={`w-full text-left flex items-center gap-2.5 px-3 h-10 select-none transition-colors duration-100
           ${isSelected ? '' : 'hover:bg-surface'}
           ${isReady ? 'pr-8' : ''}`}
       >
-        {/* Status dot */}
-        <span className={`w-2 h-2 rounded-full shrink-0 ${statusDot[ticket.status]}`} />
+        {/* Tag badge or status dot */}
+        {tag ? (
+          <span
+            className="w-[18px] h-[18px] rounded-md flex items-center justify-center text-[10px] font-bold shrink-0 text-white/90"
+            style={{ backgroundColor: tag.color }}
+          >
+            {tag.letter}
+          </span>
+        ) : (
+          <span className={`w-2 h-2 rounded-full shrink-0 ${statusDot[workItem.status]}`} />
+        )}
 
         {/* Title — 30% Primary: bold, high contrast */}
         <span className="flex-1 text-[13px] font-medium text-text truncate min-w-0">
-          {ticket.title || <span className="italic text-text-dim font-normal">Untitled</span>}
+          {workItem.title || <span className="italic text-text-dim font-normal">Untitled</span>}
         </span>
 
         {/* Right meta — 60% Neutral: smaller, dimmer */}
@@ -63,13 +73,13 @@ export function TicketCard({ ticket, isSelected, selectedIndex, onClick }: Ticke
           {isBlocked && (
             <span className="text-[10px] text-amber-400 font-medium">blocked</span>
           )}
-          {ticket.assigned_agent && (
+          {workItem.assigned_agent && (
             <span className="text-[10px] text-text-dim opacity-50 max-w-[70px] truncate">
-              {ticket.assigned_agent}
+              {workItem.assigned_agent}
             </span>
           )}
           <span className="text-[10px] text-text-dim opacity-40 w-12 text-right">
-            {formatDistanceToNow(ticket.updated_at)}
+            {formatDistanceToNow(workItem.updated_at)}
           </span>
         </div>
       </button>
@@ -82,11 +92,11 @@ export function TicketCard({ ticket, isSelected, selectedIndex, onClick }: Ticke
       )}
 
       {/* Play button */}
-      {isReady && (
+      {isReady && canStart && (
         <button
           onClick={() => {
-            selectTicket(ticket.id);
-            void startAgent(ticket);
+            selectWorkItem(workItem.id);
+            void startAgent(workItem);
           }}
           disabled={isStarting}
           title="Start agent"

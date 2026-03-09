@@ -1,8 +1,7 @@
 import { useState } from 'react';
-import { X, Key, Bot, Shield, Info } from 'lucide-react';
+import { X, Key, Bot, Info } from 'lucide-react';
 import { AgentConfigSection } from './AgentConfigForm';
 import { OrchestratorConfigSection } from './OrchestratorConfigSection';
-import { LicenseSection } from './LicenseSection';
 
 interface SettingsPanelProps {
   onClose: () => void;
@@ -11,7 +10,6 @@ interface SettingsPanelProps {
 const TABS = [
   { id: 'api-keys', label: 'API Keys', icon: Key },
   { id: 'agents', label: 'Agents', icon: Bot },
-  { id: 'license', label: 'License', icon: Shield },
   { id: 'about', label: 'About', icon: Info },
 ] as const;
 
@@ -78,16 +76,10 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
             <div>
               <h3 className="text-[13px] font-medium text-text">Agent Configurations</h3>
               <p className="text-[11px] text-text-dim mt-1">
-                Configure agents that execute ticket work via ACP.
+                Configure agents that execute work items via ACP.
               </p>
             </div>
             <AgentConfigSection />
-          </div>
-        )}
-
-        {activeTab === 'license' && (
-          <div className="space-y-3">
-            <LicenseSection />
           </div>
         )}
 

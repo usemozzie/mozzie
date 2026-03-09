@@ -2,7 +2,9 @@
 name = "mozzie"
 version = "0.1.0"
 description = "Mozzie — AI Agent Orchestration Desktop App"
-authors = ["Mozzie"]
+authors = ["Mozzie Contributors"]
+license = "MIT"
+repository = "https://github.com/usemozzie/mozzie"
 edition = "2021"
 
 [lib]
@@ -13,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
@@ -29,8 +31,8 @@ async-trait = "0.1.89"
 anyhow = "1.0.102"
 shell-words = "1.1.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-jsonwebtoken = "9"
 
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+devtools = ["tauri/devtools"]

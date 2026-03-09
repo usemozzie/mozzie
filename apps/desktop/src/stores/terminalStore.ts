@@ -4,19 +4,19 @@ const MAX_SLOTS = 8;
 
 export interface AgentProcessInfo {
   processId: string;
-  ticketId: string;
+  workItemId: string;
   startedAt: number; // epoch ms
 }
 
 interface TerminalStore {
-  activeSlots: Map<number, string>; // slot → ticketId
+  activeSlots: Map<number, string>; // slot → workItemId
   focusedSlot: number | null;
   maximizedSlot: number | null;
   agentProcesses: Map<number, AgentProcessInfo>; // slot → process info
 
-  assignSlot: (slot: number, ticketId: string) => void;
+  assignSlot: (slot: number, workItemId: string) => void;
   releaseSlot: (slot: number) => void;
-  releaseSlotForTicket: (ticketId: string) => void;
+  releaseSlotForWorkItem: (workItemId: string) => void;
   focusSlot: (slot: number | null) => void;
   toggleMaximize: (slot: number) => void;
   getNextAvailableSlot: () => number | null;
@@ -32,10 +32,10 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
   maximizedSlot: null,
   agentProcesses: new Map(),
 
-  assignSlot: (slot, ticketId) =>
+  assignSlot: (slot, workItemId) =>
     set((state) => {
       const next = new Map(state.activeSlots);
-      next.set(slot, ticketId);
+      next.set(slot, workItemId);
       return { activeSlots: next };
     }),
 
@@ -53,12 +53,12 @@ export const useTerminalStore = create<TerminalStore>((set, get) => ({
       };
     }),
 
-  releaseSlotForTicket: (ticketId) =>
+  releaseSlotForWorkItem: (workItemId) =>
     set((state) => {
       let matchedSlot: number | null = null;
 
-      for (const [slot, activeTicketId] of state.activeSlots.entries()) {
-        if (activeTicketId === ticketId) {
+      for (const [slot, activeWorkItemId] of state.activeSlots.entries()) {
+        if (activeWorkItemId === workItemId) {
           matchedSlot = slot;
           break;
         }

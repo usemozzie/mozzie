@@ -9,7 +9,7 @@ pub fn run() {
     let migrations = vec![
         Migration {
             version: 1,
-            description: "create_tickets_table",
+            description: "create_work_items_table",
             sql: include_str!("../migrations/001_tickets.sql"),
             kind: MigrationKind::Up,
         },
@@ -33,13 +33,13 @@ pub fn run() {
         },
         Migration {
             version: 5,
-            description: "create_workspaces_and_license",
+            description: "create_workspaces",
             sql: include_str!("../migrations/005_workspaces.sql"),
             kind: MigrationKind::Up,
         },
         Migration {
             version: 6,
-            description: "create_ticket_dependencies",
+            description: "create_work_item_dependencies",
             sql: include_str!("../migrations/006_ticket_dependencies.sql"),
             kind: MigrationKind::Up,
         },
@@ -51,7 +51,7 @@ pub fn run() {
         },
         Migration {
             version: 8,
-            description: "create_ticket_attempts",
+            description: "create_work_item_attempts",
             sql: include_str!("../migrations/008_attempt_history.sql"),
             kind: MigrationKind::Up,
         },
@@ -59,6 +59,18 @@ pub fn run() {
             version: 9,
             description: "create_conversations",
             sql: include_str!("../migrations/009_conversations.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 10,
+            description: "rename_ticket_to_work_item",
+            sql: include_str!("../migrations/010_rename_ticket_to_work_item.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 11,
+            description: "sub_work_items",
+            sql: include_str!("../migrations/011_sub_work_items.sql"),
             kind: MigrationKind::Up,
         },
     ];
@@ -85,6 +97,34 @@ pub fn run() {
                 // Run migrations eagerly so tables exist before any Rust command fires.
                 // tauri-plugin-sql only runs migrations when the frontend calls
                 // Database.load(), which may happen after the first invoke.
+
+                // If upgrading from a pre-v10 database, rename ticket → work_item tables/columns
+                // BEFORE running any other migrations (which now reference the new names).
+                // A previous failed startup may have created an empty `work_items` table via
+                // CREATE TABLE IF NOT EXISTS while `tickets` still existed — drop it first.
+                let has_tickets_table: i32 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tickets'"
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+                if has_tickets_table > 0 {
+                    // Drop accidental empty work_items table if it exists alongside tickets
+                    let _ = sqlx::raw_sql("DROP TABLE IF EXISTS work_items")
+                        .execute(&pool)
+                        .await;
+                    // Same for dependency/attempt tables that may have been created with new names
+                    let _ = sqlx::raw_sql("DROP TABLE IF EXISTS work_item_dependencies")
+                        .execute(&pool)
+                        .await;
+                    let _ = sqlx::raw_sql("DROP TABLE IF EXISTS work_item_attempts")
+                        .execute(&pool)
+                        .await;
+                    sqlx::raw_sql(include_str!("../migrations/010_rename_ticket_to_work_item.sql"))
+                        .execute(&pool)
+                        .await?;
+                }
+
                 sqlx::raw_sql(include_str!("../migrations/001_tickets.sql"))
                     .execute(&pool)
                     .await?;
@@ -115,7 +155,7 @@ pub fn run() {
                 .await;
 
                 let _ = sqlx::raw_sql(
-                    "ALTER TABLE tickets ADD COLUMN source_branch TEXT;"
+                    "ALTER TABLE work_items ADD COLUMN source_branch TEXT;"
                 )
                 .execute(&pool)
                 .await;
@@ -142,27 +182,20 @@ pub fn run() {
                     .execute(&pool)
                     .await?;
 
-                // Create workspaces + license tables, seed default workspace.
+                // Create workspaces tables, seed default workspace.
                 sqlx::raw_sql(include_str!("../migrations/005_workspaces.sql"))
                     .execute(&pool)
                     .await?;
 
-                // Add workspace_id to tickets and repos (idempotent).
+                // Add workspace_id to work_items and repos (idempotent).
                 let _ = sqlx::raw_sql(
-                    "ALTER TABLE tickets ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default';"
+                    "ALTER TABLE work_items ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default';"
                 )
                 .execute(&pool)
                 .await;
 
                 let _ = sqlx::raw_sql(
                     "ALTER TABLE repos ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default';"
-                )
-                .execute(&pool)
-                .await;
-
-                // Add token column to license table (idempotent).
-                let _ = sqlx::raw_sql(
-                    "ALTER TABLE license ADD COLUMN token TEXT;"
                 )
                 .execute(&pool)
                 .await;
@@ -179,34 +212,34 @@ pub fn run() {
                 .execute(&pool)
                 .await?;
 
-                // Create ticket_dependencies table (no-op if already exists).
+                // Create work_item_dependencies table (no-op if already exists).
                 sqlx::raw_sql(include_str!("../migrations/006_ticket_dependencies.sql"))
                     .execute(&pool)
                     .await?;
 
                 // Orchestrator v3 metadata columns (idempotent).
                 let _ = sqlx::raw_sql(
-                    "ALTER TABLE tickets ADD COLUMN execution_context TEXT;"
+                    "ALTER TABLE work_items ADD COLUMN execution_context TEXT;"
                 )
                 .execute(&pool)
                 .await;
                 let _ = sqlx::raw_sql(
-                    "ALTER TABLE tickets ADD COLUMN orchestrator_note TEXT;"
+                    "ALTER TABLE work_items ADD COLUMN orchestrator_note TEXT;"
                 )
                 .execute(&pool)
                 .await;
                 let _ = sqlx::raw_sql(
-                    "ALTER TABLE tickets ADD COLUMN duplicate_of_ticket_id TEXT;"
+                    "ALTER TABLE work_items ADD COLUMN duplicate_of_work_item_id TEXT;"
                 )
                 .execute(&pool)
                 .await;
                 let _ = sqlx::raw_sql(
-                    "ALTER TABLE tickets ADD COLUMN duplicate_policy TEXT;"
+                    "ALTER TABLE work_items ADD COLUMN duplicate_policy TEXT;"
                 )
                 .execute(&pool)
                 .await;
                 let _ = sqlx::raw_sql(
-                    "ALTER TABLE tickets ADD COLUMN intent_type TEXT;"
+                    "ALTER TABLE work_items ADD COLUMN intent_type TEXT;"
                 )
                 .execute(&pool)
                 .await;
@@ -241,7 +274,7 @@ pub fn run() {
                 .execute(&pool)
                 .await;
 
-                // Create ticket_attempts table (no-op if already exists).
+                // Create work_item_attempts table (no-op if already exists).
                 sqlx::raw_sql(include_str!("../migrations/008_attempt_history.sql"))
                     .execute(&pool)
                     .await?;
@@ -251,15 +284,22 @@ pub fn run() {
                     .execute(&pool)
                     .await?;
 
-                // On every startup, reset tickets that were left mid-flight from a previous
+                // Sub-work-item parent_id column (idempotent).
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE work_items ADD COLUMN parent_id TEXT REFERENCES work_items(id);"
+                )
+                .execute(&pool)
+                .await;
+
+                // On every startup, reset work items that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
-                // restarts, so queued/running tickets would be stuck indefinitely.
+                // restarts, so queued/running work items would be stuck indefinitely.
                 // worktree_path and branch_name are intentionally kept so the user can
                 // resume or inspect the work; terminal_slot is cleared since slots are
                 // re-allocated fresh each session.
-                // Blocked tickets stay blocked — their deps haven't changed.
+                // Blocked work items stay blocked — their deps haven't changed.
                 sqlx::raw_sql(
-                    "UPDATE tickets \
+                    "UPDATE work_items \
                      SET status = 'ready', terminal_slot = NULL, updated_at = datetime('now') \
                      WHERE status IN ('queued', 'running')",
                 )
@@ -276,39 +316,41 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // PTY minimal stub (ACP replaces full PTY)
             commands::pty::kill_process,
-            // Tickets (Task C)
-            commands::tickets::create_ticket,
-            commands::tickets::update_ticket,
-            commands::tickets::list_tickets,
-            commands::tickets::get_ticket,
-            commands::tickets::transition_ticket,
-            commands::tickets::archive_ticket,
-            commands::tickets::close_ticket,
-            commands::tickets::reopen_ticket,
-            commands::tickets::delete_ticket,
-            commands::tickets::find_similar_tickets,
-            commands::tickets::search_repo_files,
-            commands::tickets::add_ticket_dependency,
-            commands::tickets::remove_ticket_dependency,
-            commands::tickets::get_ticket_dependencies,
-            commands::tickets::get_ticket_dependents,
-            commands::tickets::has_unmet_dependencies,
-            commands::tickets::get_ticket_attempts,
-            commands::tickets::record_ticket_attempt,
+            // Work Items (Task C)
+            commands::work_items::create_work_item,
+            commands::work_items::update_work_item,
+            commands::work_items::list_work_items,
+            commands::work_items::get_work_item,
+            commands::work_items::transition_work_item,
+            commands::work_items::archive_work_item,
+            commands::work_items::close_work_item,
+            commands::work_items::reopen_work_item,
+            commands::work_items::delete_work_item,
+            commands::work_items::find_similar_work_items,
+            commands::work_items::search_repo_files,
+            commands::work_items::add_work_item_dependency,
+            commands::work_items::remove_work_item_dependency,
+            commands::work_items::get_work_item_dependencies,
+            commands::work_items::get_work_item_dependents,
+            commands::work_items::has_unmet_dependencies,
+            commands::work_items::get_work_item_attempts,
+            commands::work_items::record_work_item_attempt,
+            commands::work_items::get_child_work_items,
             // Worktree (Task D)
             commands::worktree::create_worktree,
             commands::worktree::remove_worktree,
             commands::worktree::get_diff,
             commands::worktree::merge_branch,
-            commands::worktree::get_ticket_review_state,
-            commands::worktree::approve_ticket_review,
-            commands::worktree::reject_ticket_review,
-            commands::worktree::close_ticket_review,
+            commands::worktree::get_work_item_review_state,
+            commands::worktree::approve_work_item_review,
+            commands::worktree::reject_work_item_review,
+            commands::worktree::close_work_item_review,
+            commands::worktree::ensure_parent_branch,
             commands::worktree::get_repo_branch,
             commands::worktree::list_repo_branches,
             // Orchestrator LLM
             commands::orchestrator::plan_orchestrator_actions,
-            commands::orchestrator::analyze_and_plan,
+            commands::orchestrator::explore_repo,
             // Agents (Task D / ACP)
             commands::agents::list_agent_configs,
             commands::agents::save_agent_config,
@@ -335,10 +377,6 @@ pub fn run() {
             commands::workspaces::create_workspace,
             commands::workspaces::rename_workspace,
             commands::workspaces::delete_workspace,
-            // License
-            commands::license::get_license_status,
-            commands::license::activate_license,
-            commands::license::deactivate_license,
             // Notes
             commands::notes::get_workspace_notes,
             commands::notes::save_workspace_notes,

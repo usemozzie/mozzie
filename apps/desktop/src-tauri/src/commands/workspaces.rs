@@ -93,18 +93,18 @@ pub async fn delete_workspace(pool: State<'_, SqlitePool>, id: String) -> Result
         return Err("Cannot delete the default workspace".to_string());
     }
 
-    // Check for remaining tickets
-    let ticket_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE workspace_id = ?")
+    // Check for remaining work items
+    let work_item_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM work_items WHERE workspace_id = ?")
             .bind(&id)
             .fetch_one(pool.inner())
             .await
             .map_err(|e| e.to_string())?;
 
-    if ticket_count > 0 {
+    if work_item_count > 0 {
         return Err(format!(
-            "Cannot delete workspace with {} ticket(s). Move or delete them first.",
-            ticket_count
+            "Cannot delete workspace with {} work item(s). Move or delete them first.",
+            work_item_count
         ));
     }
 

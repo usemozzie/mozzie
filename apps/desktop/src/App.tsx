@@ -9,14 +9,14 @@ import { TerminalGrid } from './components/terminal/TerminalGrid';
 import { SettingsPanel } from './components/settings/SettingsPanel';
 import { NotesPanel } from './components/notes/NotesPanel';
 import { ReposPanel } from './components/repos/ReposPanel';
-import { FloatingCommandBar } from './components/tickets/FloatingCommandBar';
-import { NewTicketModal } from './components/tickets/NewTicketModal';
+import { FloatingCommandBar } from './components/work-items/FloatingCommandBar';
+import { NewWorkItemModal } from './components/work-items/NewWorkItemModal';
 import { AppSidebar } from './components/sidebar/AppSidebar';
 import { WorkspaceSwitcher } from './components/sidebar/WorkspaceSwitcher';
 import { useTerminalStore } from './stores/terminalStore';
-import { useTicketStore } from './stores/ticketStore';
+import { useWorkItemStore } from './stores/workItemStore';
 import { useAutoLaunchUnblocked } from './hooks/useAutoLaunchUnblocked';
-import type { TicketStateChangeEvent } from './types/events';
+import type { WorkItemStateChangeEvent } from './types/events';
 
 // ---- Status bar ----
 function StatusBar() {
@@ -54,11 +54,11 @@ export default function App() {
   const [commandBarOpen, setCommandBarOpen] = useState(false);
   const appWindow = getCurrentWindow();
   const allowCloseRef = useRef(false);
-  const releaseSlotForTicket = useTerminalStore((s) => s.releaseSlotForTicket);
-  const removeSelectedTicket = useTicketStore((s) => s.removeSelectedTicket);
-  const { isNewTicketModalOpen, newTicketContextSeed, closeNewTicketModal } = useTicketStore();
+  const releaseSlotForWorkItem = useTerminalStore((s) => s.releaseSlotForWorkItem);
+  const removeSelectedWorkItem = useWorkItemStore((s) => s.removeSelectedWorkItem);
+  const { isNewWorkItemModalOpen, newWorkItemContextSeed, closeNewWorkItemModal } = useWorkItemStore();
 
-  // Auto-launch tickets whose dependencies just got approved
+  // Auto-launch work items whose dependencies just got approved
   useAutoLaunchUnblocked();
 
   const handleToolbarMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -87,19 +87,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<TicketStateChangeEvent>('ticket:state-change', (event) => {
-      if (['ready', 'review', 'done', 'archived'].includes(event.payload.to)) {
-        releaseSlotForTicket(event.payload.ticketId);
+    const unlisten = listen<WorkItemStateChangeEvent>('work-item:state-change', (event) => {
+      if (['ready', 'review', 'done', 'archived', 'deleted'].includes(event.payload.to)) {
+        releaseSlotForWorkItem(event.payload.workItemId);
       }
       if (['done', 'archived', 'deleted'].includes(event.payload.to)) {
-        removeSelectedTicket(event.payload.ticketId);
+        removeSelectedWorkItem(event.payload.workItemId);
       }
     });
 
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [releaseSlotForTicket, removeSelectedTicket]);
+  }, [releaseSlotForWorkItem, removeSelectedWorkItem]);
 
   useEffect(() => {
     const unlisten = appWindow.onCloseRequested(async (event) => {
@@ -295,11 +295,11 @@ export default function App() {
 
       <StatusBar />
 
-      {/* New ticket modal (triggered from sidebar) */}
-      {isNewTicketModalOpen && (
-        <NewTicketModal
-          onClose={closeNewTicketModal}
-          initialContext={newTicketContextSeed}
+      {/* New work item modal (triggered from sidebar) */}
+      {isNewWorkItemModalOpen && (
+        <NewWorkItemModal
+          onClose={closeNewWorkItemModal}
+          initialContext={newWorkItemContextSeed}
         />
       )}
 

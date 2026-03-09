@@ -2,10 +2,8 @@ import { useState, useRef, useEffect } from 'react';
 import { ChevronDown, Plus, Pencil, Trash2, Check, X } from 'lucide-react';
 import { useWorkspaces, useCreateWorkspace, useRenameWorkspace, useDeleteWorkspace } from '../../hooks/useWorkspaces';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
-import { useLicense } from '../../hooks/useLicense';
 
 export function WorkspaceSwitcher() {
-  const { data: license } = useLicense();
   const { data: workspaces } = useWorkspaces();
   const { activeWorkspaceId, setActiveWorkspaceId } = useWorkspaceStore();
   const createWorkspace = useCreateWorkspace();
@@ -19,8 +17,6 @@ export function WorkspaceSwitcher() {
   const [editName, setEditName] = useState('');
   const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-
-  const isPro = license?.is_pro ?? false;
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -40,9 +36,6 @@ export function WorkspaceSwitcher() {
   useEffect(() => {
     if (creating && inputRef.current) inputRef.current.focus();
   }, [creating]);
-
-  // Don't render at all for free users
-  if (!isPro) return null;
 
   const active = workspaces?.find((w) => w.id === activeWorkspaceId) ?? workspaces?.[0];
 

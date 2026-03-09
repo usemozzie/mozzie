@@ -16,14 +16,3 @@ CREATE TABLE IF NOT EXISTS workspace_notes (
     content      TEXT NOT NULL DEFAULT '',
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
-
--- License table (for Pro feature gating)
-CREATE TABLE IF NOT EXISTS license (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    license_key TEXT NOT NULL,
-    email       TEXT,
-    status      TEXT NOT NULL DEFAULT 'active',
-    validated_at TEXT NOT NULL,
-    valid_until  TEXT,
-    token       TEXT
-);

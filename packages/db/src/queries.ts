@@ -1,39 +1,39 @@
 import { ulid } from 'ulid';
-import type { Ticket, AgentLog, AgentConfig, TicketStatus } from './schema.js';
+import type { WorkItem, AgentLog, AgentConfig, WorkItemStatus } from './schema.js';
 
 export type SqlQuery = { sql: string; params: unknown[] };
 
-export function insertTicket(
-  ticket: Omit<Ticket, 'id' | 'created_at' | 'updated_at'>
+export function insertWorkItem(
+  workItem: Omit<WorkItem, 'id' | 'created_at' | 'updated_at'>
 ): SqlQuery {
   const id = ulid();
   const now = new Date().toISOString();
   return {
-    sql: `INSERT INTO tickets (
+    sql: `INSERT INTO work_items (
       id, title, context, status,
       repo_path, source_branch, branch_name, worktree_path, assigned_agent, terminal_slot,
       created_at, updated_at, started_at, completed_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     params: [
       id,
-      ticket.title,
-      ticket.context,
-      ticket.status,
-      ticket.repo_path,
-      ticket.source_branch,
-      ticket.branch_name,
-      ticket.worktree_path,
-      ticket.assigned_agent,
-      ticket.terminal_slot,
+      workItem.title,
+      workItem.context,
+      workItem.status,
+      workItem.repo_path,
+      workItem.source_branch,
+      workItem.branch_name,
+      workItem.worktree_path,
+      workItem.assigned_agent,
+      workItem.terminal_slot,
       now,
       now,
-      ticket.started_at,
-      ticket.completed_at,
+      workItem.started_at,
+      workItem.completed_at,
     ],
   };
 }
 
-export function updateTicket(id: string, fields: Partial<Ticket>): SqlQuery {
+export function updateWorkItem(id: string, fields: Partial<WorkItem>): SqlQuery {
   const now = new Date().toISOString();
   const updates = { ...fields, updated_at: now };
   delete updates.id;
@@ -44,28 +44,28 @@ export function updateTicket(id: string, fields: Partial<Ticket>): SqlQuery {
   const params = [...keys.map((k) => updates[k]), id];
 
   return {
-    sql: `UPDATE tickets SET ${setClauses} WHERE id = ?`,
+    sql: `UPDATE work_items SET ${setClauses} WHERE id = ?`,
     params,
   };
 }
 
-export function listTickets(filters?: { status?: TicketStatus[] }): SqlQuery {
+export function listWorkItems(filters?: { status?: WorkItemStatus[] }): SqlQuery {
   if (filters?.status && filters.status.length > 0) {
     const placeholders = filters.status.map(() => '?').join(', ');
     return {
-      sql: `SELECT * FROM tickets WHERE status IN (${placeholders}) ORDER BY updated_at DESC`,
+      sql: `SELECT * FROM work_items WHERE status IN (${placeholders}) ORDER BY updated_at DESC`,
       params: filters.status,
     };
   }
   return {
-    sql: `SELECT * FROM tickets ORDER BY updated_at DESC`,
+    sql: `SELECT * FROM work_items ORDER BY updated_at DESC`,
     params: [],
   };
 }
 
-export function getTicket(id: string): SqlQuery {
+export function getWorkItem(id: string): SqlQuery {
   return {
-    sql: `SELECT * FROM tickets WHERE id = ?`,
+    sql: `SELECT * FROM work_items WHERE id = ?`,
     params: [id],
   };
 }
@@ -77,13 +77,13 @@ export function insertAgentLog(
   const now = new Date().toISOString();
   return {
     sql: `INSERT INTO agent_logs (
-      id, ticket_id, agent_id, run_id, messages, summary,
+      id, work_item_id, agent_id, run_id, messages, summary,
       tokens_in, tokens_out, cost_usd, exit_code, duration_ms,
       cleanup_warning, cleanup_warning_message, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     params: [
       id,
-      log.ticket_id,
+      log.work_item_id,
       log.agent_id,
       log.run_id,
       log.messages,
@@ -100,10 +100,10 @@ export function insertAgentLog(
   };
 }
 
-export function getAgentLogs(ticketId: string): SqlQuery {
+export function getAgentLogs(workItemId: string): SqlQuery {
   return {
-    sql: `SELECT * FROM agent_logs WHERE ticket_id = ? ORDER BY created_at ASC`,
-    params: [ticketId],
+    sql: `SELECT * FROM agent_logs WHERE work_item_id = ? ORDER BY created_at ASC`,
+    params: [workItemId],
   };
 }
 

@@ -2,30 +2,33 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::Emitter;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestratorActionKind {
     Summary,
-    CreateTickets,
-    StartTicket,
+    CreateWorkItems,
+    StartWorkItem,
     RunAllReady,
-    CloseTickets,
-    ReopenTickets,
-    DeleteTickets,
-    AnalyzeAndPlan,
+    CloseWorkItems,
+    ReopenWorkItems,
+    DeleteWorkItems,
+    ExploreRepo,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OrchestratorTicketSpec {
+pub struct OrchestratorWorkItemSpec {
     pub title: String,
     pub context: String,
     pub execution_context: Option<String>,
     pub orchestrator_note: Option<String>,
     pub repo_path: Option<String>,
+    pub branch_name: Option<String>,
     pub assigned_agent: Option<String>,
     pub depends_on_titles: Option<Vec<String>>,
-    pub duplicate_of_ticket_id: Option<String>,
+    pub parent_title: Option<String>,
+    pub duplicate_of_work_item_id: Option<String>,
     pub duplicate_policy: Option<String>,
     pub intent_type: Option<String>,
 }
@@ -33,26 +36,23 @@ pub struct OrchestratorTicketSpec {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OrchestratorAction {
     pub kind: OrchestratorActionKind,
-    pub ticket_id: Option<String>,
-    pub ticket_ids: Option<Vec<String>>,
-    pub tickets: Option<Vec<OrchestratorTicketSpec>>,
+    pub work_item_id: Option<String>,
+    pub work_item_ids: Option<Vec<String>>,
+    pub work_items: Option<Vec<OrchestratorWorkItemSpec>>,
     pub repo_path: Option<String>,
-    pub objective: Option<String>,
-    pub repo_paths: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct AnalysisWorkItem {
-    pub title: String,
-    pub description: String,
-    pub files: Option<Vec<String>>,
-    pub depends_on: Option<Vec<String>>,
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OrchestratorPlan {
     pub assistant_message: String,
     pub actions: Vec<OrchestratorAction>,
+    #[serde(default = "default_done")]
+    pub done: bool,
+}
+
+fn default_done() -> bool {
+    true
 }
 
 #[tauri::command]
@@ -62,7 +62,7 @@ pub async fn plan_orchestrator_actions(
     model: String,
     message: String,
     workspace_id: String,
-    tickets_json: String,
+    work_items_json: String,
     history_json: String,
     repos_json: String,
     agents_json: String,
@@ -79,7 +79,7 @@ pub async fn plan_orchestrator_actions(
     let prompt = build_prompt(
         &message,
         &workspace_id,
-        &tickets_json,
+        &work_items_json,
         &history_json,
         &repos_json,
         &agents_json,
@@ -92,22 +92,20 @@ pub async fn plan_orchestrator_actions(
         _ => return Err(format!("Unsupported provider '{provider}'")),
     };
 
-    let cleaned = clean_json_response(&raw);
-    serde_json::from_str::<OrchestratorPlan>(&cleaned)
-        .map_err(|err| format!("Failed to parse orchestrator response: {err}. Raw: {cleaned}"))
+    parse_orchestrator_plan_response(&raw)
 }
 
 fn build_prompt(
     message: &str,
     workspace_id: &str,
-    tickets_json: &str,
+    work_items_json: &str,
     history_json: &str,
     repos_json: &str,
     agents_json: &str,
     recent_repos_json: &str,
 ) -> Result<String, String> {
-    let tickets: Value = serde_json::from_str(tickets_json)
-        .map_err(|err| format!("Invalid ticket snapshot payload: {err}"))?;
+    let work_items: Value = serde_json::from_str(work_items_json)
+        .map_err(|err| format!("Invalid work item snapshot payload: {err}"))?;
     let history: Value = serde_json::from_str(history_json)
         .map_err(|err| format!("Invalid orchestrator history payload: {err}"))?;
     let repos: Value = serde_json::from_str(repos_json)
@@ -117,136 +115,437 @@ fn build_prompt(
     let recent_repos: Value = serde_json::from_str(recent_repos_json)
         .map_err(|err| format!("Invalid recent repository payload: {err}"))?;
     let repo_summaries = build_repo_summaries(&repos);
-    let duplicate_candidates = build_duplicate_candidates(message, &tickets);
+    let duplicate_candidates = build_duplicate_candidates(message, &work_items);
+    let conversation_work_item_progress = build_conversation_work_item_progress(&history);
+    let current_work_scope = build_current_work_scope(&history);
     let agent_profiles = build_agent_profiles(&agents);
 
     Ok(format!(
-        r#"You are the Mozzie orchestrator.
+        r#"<system>
+You are the Mozzie orchestrator — an autonomous planning agent that decomposes user goals into
+concrete, parallelisable coding work items and manages their lifecycle.
 
-You control tickets, not code. You decide actions, then the app executes them.
-You must choose actions based on the workflow semantics below, not just the words in the user's prompt.
-You are effectively a tool-using planner with the structured state below. Use that state aggressively before deciding.
-You are scoped to a single active workspace. Never reason about, reference, or mutate tickets outside this workspace.
+You do NOT write code. You think, plan, explore, and create work items. Coding agents execute them.
 
-Return ONLY valid JSON. Do not wrap in markdown fences.
+## Identity & loop
 
-Schema:
+You are called in a loop:
+1. You receive the user message + workspace state + conversation history.
+2. You return a JSON response with actions.
+3. The app executes your actions, appends results to the conversation, and calls you again.
+4. This repeats until you set `"done": true`.
+
+You MUST set `"done": false` whenever you need to see the results of your actions before continuing.
+You MUST set `"done": true` when the user's intent is fully resolved.
+
+## How to think
+
+Before producing JSON, mentally walk through these steps:
+
+1. **Classify the intent**: Is the user asking for information (summary), management (close/reopen/delete),
+   execution (start/run), or planning (explore + create work items)?
+
+2. **Assess what you know**: Do you understand the codebase well enough to create specific work items?
+   If not, you MUST explore first. Never create vague work items when you lack codebase knowledge.
+
+3. **Plan the FULL work item batch for PARALLEL execution**: This is the most important step.
+   Mozzie runs multiple coding agents simultaneously in isolated git worktrees that merge back
+   to the same branch. If two work items touch the same file, their merges WILL conflict and one
+   agent's work gets destroyed.
+
+   Your job is to create the COMPLETE set of work items needed to fulfill the user's request,
+   not just the first obvious work item. Do not stop at a single "bootstrap" or "setup" work item
+   if you can already see the downstream work. If a foundation work item must run first, include
+   that foundation work item AND the dependent follow-up work items in the same batch using
+   `depends_on_titles`.
+
+   Your job is to partition work so agents never collide:
+
+   a) IDENTIFY BOUNDARIES: After exploring, mentally map the codebase into non-overlapping zones.
+      Components, pages, API routes, config files, utilities — each zone can be one work item.
+      Example zones for a Next.js app: "src/app/page.tsx + src/components/Hero.tsx" vs
+      "src/app/pricing/page.tsx + src/components/PricingCard.tsx" vs "src/lib/api.ts + src/types/".
+
+   b) ONE FILE = ONE WORK ITEM: A file must never appear in two work items. If two features both need
+      to modify the same file, either combine them into one work item or create a dependency chain
+      (work item B depends on work item A, runs after A merges).
+
+   c) SHARED FILES GO IN A FOUNDATION WORK ITEM: If multiple features need a shared utility, type
+      definition, or config change, create a "foundation" work item that runs first (other work items
+      depend_on it). Example: "Add shared types and API client" → then "Build pricing page"
+      and "Build features page" run in parallel after it.
+
+   d) EXPLICIT FILE OWNERSHIP: Every work item's execution_context MUST list the exact files it
+      owns. The agent may ONLY create/modify files listed in its work item.
+      Example: "You own: src/app/pricing/page.tsx, src/components/PricingCard.tsx,
+      src/components/PricingToggle.tsx. Do NOT modify any files outside this list."
+
+   e) AIM FOR 3-8 WORK ITEMS: Too few = not enough parallelism. Too many = overhead. Find the
+      natural boundaries in the work.
+
+   f) WORK ITEM SIZE MUST BE MEDIUM: A work item is a substantial unit of work for one agent, usually
+      one coherent feature slice or one shared foundation layer. It is NOT the entire project,
+      and it is NOT a tiny tweak. Good: "Build hero + social proof section" or
+      "Implement pricing + FAQ section". Bad: "Build the whole landing page". Bad:
+      "Change hero headline text".
+
+   g) DEFAULT TO COMPLETE COVERAGE: When the user asks to build or change a feature, the batch
+      of work items should cover the full request end-to-end. If the repo is empty, create the
+      minimum foundation work item plus the next implementation work items that become parallelisable
+      after it. Avoid singleton batches unless the request is genuinely tiny or hard-blocked.
+
+   h) EACH WORK ITEM MUST BE SELF-CONTAINED: An agent starts with zero context about other work items.
+      Include everything it needs in execution_context — what to import, what APIs exist, what
+      patterns to follow. Reference specific code patterns from the exploration results.
+
+4. **Write execution_context like a tech lead**: The coding agent is a capable programmer but knows
+   NOTHING about the project. execution_context must contain:
+   - Exactly which files to create or modify (full relative paths).
+   - What each file should contain or how it should change.
+   - Dependencies, imports, and integration points.
+   - Concrete acceptance criteria.
+   Bad: "Build a landing page for the app"
+   Good: "Create src/app/page.tsx with a hero section (h1: 'Mozzie — Multi-Agent Build Orchestration'),
+   feature grid (3 cols: 'Parallel Agents', 'Git Worktree Isolation', 'Review & Approve'), pricing
+   section, and footer. Use Tailwind CSS. Import from @/components/ui/button. The hero should link
+   to /docs. Mobile-responsive with sm/md/lg breakpoints."
+
+5. **Assign agents intelligently**: Match work item characteristics to agent strengths.
+
+## Response schema
+
+Return ONLY valid JSON. No markdown fences, no commentary outside JSON.
+
 {{
-  "assistant_message": "short explanation for the user",
+  "assistant_message": "Brief status for the user — what you did, what you're doing next, or why",
   "actions": [
     {{
-      "kind": "summary" | "create_tickets" | "start_ticket" | "run_all_ready" | "close_tickets" | "reopen_tickets" | "delete_tickets" | "analyze_and_plan",
-      "ticket_id": "required only for start_ticket",
-      "ticket_ids": ["required only for close_tickets, reopen_tickets or delete_tickets"],
-      "objective": "required only for analyze_and_plan — the goal to analyze and decompose",
-      "repo_path": "primary repo path for analyze_and_plan",
-      "repo_paths": ["optional array of repo paths for analyze_and_plan when multiple repos are involved"],
-      "tickets": [
+      "kind": "summary | create_work_items | start_work_item | run_all_ready | close_work_items | reopen_work_items | delete_work_items | explore_repo",
+
+      "work_item_id": "for start_work_item only",
+      "work_item_ids": ["for run_all_ready when execution should target a specific work item batch, or for close/reopen/delete_work_items"],
+
+      "repo_path": "for explore_repo, or for run_all_ready when execution must be scoped to a repository",
+      "prompt": "for explore_repo — specific questions for the explorer agent",
+
+      "work_items": [
         {{
-          "title": "required for create_tickets",
-          "context": "short human-readable summary for the ticket detail view",
-          "execution_context": "required agent-facing instructions for the coding agent",
-          "orchestrator_note": "optional planner note for why this ticket exists",
-          "repo_path": "optional absolute path or null",
-          "assigned_agent": "optional or null",
-          "depends_on_titles": ["optional array of ticket titles this ticket depends on"],
-          "duplicate_of_ticket_id": "optional similar ticket id if this is intentionally related to an existing ticket",
-          "duplicate_policy": "optional one of intentional_new_ticket | reuse_existing_ticket | reopen_existing_ticket",
-          "intent_type": "optional high-level intent such as create_ticket | create_duplicate_ticket | reopen_ticket"
+          "title": "Short, specific title (e.g. 'Add pricing section to landing page')",
+          "context": "1-2 sentence human-readable summary",
+          "execution_context": "Detailed agent instructions — files, changes, acceptance criteria",
+          "orchestrator_note": "Why this work item exists (internal, not shown to agent)",
+          "repo_path": "Absolute path to the target repository",
+          "branch_name": "Git branch name, e.g. feat/add-pricing-section (see Branch Naming below). For parent wrappers, this is the long-lived integration branch.",
+          "assigned_agent": "Agent ID from profiles below, or null. Use null for parent integration work items that should not run directly.",
+          "depends_on_titles": ["Exact title of prerequisite work item in this batch"],
+          "parent_title": "Exact title of the parent work item in this batch (for sub-work-items)",
+          "duplicate_of_work_item_id": "ID of similar existing work item, if any",
+          "duplicate_policy": "intentional_new_work_item | reuse_existing_work_item | reopen_existing_work_item",
+          "intent_type": "create_work_item | create_duplicate_work_item | reopen_work_item"
         }}
       ]
     }}
-  ]
+  ],
+  "done": false
 }}
 
-Rules:
-- The active workspace id is `{workspace_id}`. Every action must be interpreted as applying only to this workspace.
-- Phrases like "all tickets", "run all", "close all", or "summarize tickets" always refer only to the tickets in the current workspace snapshot below.
-- Use ticket IDs exactly as provided in the ticket snapshot.
-- Ticket statuses mean:
-  - `draft`: not ready to run yet
-  - `ready`: ready to be started
-  - `queued`: about to run
-  - `running`: currently running on an agent
-  - `blocked`: waiting on dependencies
-  - `done`: finished or administratively closed
-  - `archived`: historical, normally not acted on
-- Action semantics:
-  - `start_ticket` means actually start execution on an agent. Only use it when the user clearly wants work to run now.
-  - `run_all_ready` means start every ticket currently in `ready`.
-  - `close_tickets` means mark matching tickets as `done` without running them. Use this for requests like close, finish, mark done, not needed, no longer relevant, cancel this work, or administrative completion.
-  - `reopen_tickets` means move matching done/archived tickets back into an active state. Use this for requests like reopen, resume, continue the old one.
-  - `delete_tickets` means permanently remove tickets. Only use it when the user clearly wants deletion, not closure.
-  - `summary` means explain the state without mutating anything.
-  - `analyze_and_plan` means spawn a CLI agent to explore the codebase and return work items. Use this when the user asks to "analyze", "explore", "plan", "break down", or "figure out what needs to be done" for a feature or change that requires understanding the codebase first. Requires `objective` (what to analyze/implement) and `repo_path` (which repo to explore). Use `repo_paths` when multiple repos are involved (e.g. "analyze my app and update my landing page"). The analysis agent will read files, understand the architecture, and return parallelizable work items.
-- Never use `start_ticket` when the user asks to close, finish, mark done, cancel, skip, abandon, or otherwise stop tracking a ticket.
-- A close request can apply to tickets in any state. Prefer `close_tickets` over `start_ticket` for those requests.
-- Never copy ticket-management language into `execution_context`. Forbidden examples: "create a ticket", "open a task", "track this", "ask the orchestrator", "create this ticket anyway".
-- `execution_context` must be written as direct instructions to the coding agent that will work inside the repository.
-- If the user says "create a ticket for X" and a similar ticket already exists, use duplicate candidates and status to decide:
-  - active similar ticket: prefer summary or reuse unless the user explicitly wants a new one
-  - done or archived similar ticket: prefer `reopen_tickets` if the user says reopen/resume/continue
-  - done or archived similar ticket: prefer `create_tickets` with `duplicate_policy = intentional_new_ticket` if the user says "create it anyway", "new one", "fresh ticket", "do it again"
-- If you create a new ticket despite a similar existing one, do NOT mention ticket creation mechanics in `execution_context`. Put rationale in `orchestrator_note`.
-- For delete requests, do not assume immediate execution is safe. Return a delete_tickets action and a clear assistant_message; the UI will ask for confirmation.
-- Prefer create_tickets when the user wants work split into independent runnable tickets.
-- If the user is only asking for status or summary, return a summary action or no actions.
-- Do not invent ticket IDs.
-- Keep assistant_message concise.
-- When creating multiple tickets where some depend on others, use depends_on_titles to reference prerequisite tickets by their exact title in the same batch. Dependencies are only set for Pro users.
-- Prefer repo_path values from the repository snapshot or recent repos when creating tickets.
-- If the user clearly refers to an existing repo by name, map it to the matching absolute repo_path from the repository snapshot.
-- If no repo is specified by the user, prefer the first recent repo when it looks relevant.
-- If the repo is ambiguous for ticket creation and multiple repositories are plausible, leave `repo_path` null so the UI can ask the user inline.
-- When matching an existing ticket, use the title and status context to choose the intended ticket conservatively. If unclear, prefer a summary over a destructive action.
-- Only choose `assigned_agent` values from the configured agent profiles below, and choose based on strengths, best_for, reasoning_class, speed_class, and edit_reliability.
-- If agent choice is ambiguous, prefer the strongest reasoning agent for vague work and the strongest edit_reliability agent for implementation-heavy work.
+## Action reference
 
-Current ticket snapshot:
-{tickets}
+| Action | When to use | Key fields |
+|--------|------------|------------|
+| `explore_repo` | You need codebase understanding before creating work items. ALWAYS explore before creating work items for unfamiliar repos. | `repo_path`, `prompt` |
+| `create_work_items` | You have enough context to write the complete initial batch of specific, actionable work items. | `work_items[]` |
+| `start_work_item` | User explicitly wants to run a specific work item now. | `work_item_id` |
+| `run_all_ready` | User wants to start currently runnable work items, optionally scoped to one repository or one work item batch. | `repo_path` optional, `work_item_ids[]` optional |
+| `close_work_items` | User wants to close/cancel/finish work items without running them. | `work_item_ids[]` |
+| `reopen_work_items` | User wants to resume done/archived work items. | `work_item_ids[]` |
+| `delete_work_items` | User explicitly wants permanent deletion. | `work_item_ids[]` |
+| `summary` | User asks about status, or you need to explain without mutating. | — |
 
-Structured duplicate candidates for the user message:
+## Critical rules
+
+EXPLORATION:
+- NEVER create work items for a repo you haven't explored in this conversation. Explore first, create on the next turn.
+- When exploring, write a SPECIFIC prompt. Bad: "explore the repo". Good: "Find the routing structure, component hierarchy, styling approach (CSS modules vs Tailwind vs styled-components), and any existing landing page or marketing components. List the key directories and their purposes."
+- You can explore multiple repos in one turn (multiple explore_repo actions).
+- After exploration, your next turn has the results in history. USE THEM — reference specific files, components, and patterns you learned about.
+
+WORK ITEM QUALITY (PARALLEL-FIRST):
+- Every work item's `execution_context` must reference specific files from the exploration results.
+- NO FILE OVERLAP: Two work items must NEVER modify the same file. This is the #1 rule. Violating it
+  causes merge conflicts that destroy agent work. If overlap is unavoidable, use depends_on_titles.
+- Every work item must include a "You own:" file list in execution_context telling the agent exactly
+  which files it may create or modify — nothing else.
+- CHOOSE THE RIGHT STRUCTURE:
+  - First decompose the request into the complete set of medium-sized implementation slices.
+  - Then decide the branch topology that best fits those slices.
+  - Use standalone work items when a slice can be implemented, reviewed, and pushed independently.
+  - Use `parent_title` only when several slices belong to ONE shared integration branch and should
+    accumulate into one cohesive deliverable.
+  - Do NOT choose parent/child structure from keywords or domains. Infer it from the plan:
+    shared integration target, sibling work that should merge into the same branch, or later work
+    that should branch from earlier merged sibling work.
+- If a shared file (types, config, utils) needs changes, put it in a foundation work item that others
+  depend on. The foundation work item runs first and merges before dependent work items start.
+- Default to ONE `create_work_items` action that contains the full, parallel-ready batch for the
+  user's request. Do not emit only the first work item unless you truly cannot define the rest yet.
+- Prefer medium-sized work items: one meaningful feature slice or one foundation layer per work item.
+  Avoid "entire project" work items and avoid micro-work-items that only change a label, heading, or
+  single trivial styling detail.
+- For new or empty repos, do not stop at "bootstrap". Create the bootstrap/foundation work item plus
+  the downstream feature work items that should follow it, linked with `depends_on_titles`.
+- For broad product requests, do NOT create one vague "build the app" work item. Break the request
+  into the full first batch of medium-sized work items that cover the feature set end-to-end. A
+  batch may contain standalone items, parent/child groups, or a mix of both if that is what the
+  plan's integration topology requires.
+- `execution_context` is instructions for a CODING AGENT, not a human. Be precise and technical.
+- NEVER put work-item-management language in `execution_context` (no "create a work item", "track this", etc.).
+- A batch of work items should completely cover the user's request — don't leave work unspecified.
+- Include existing patterns from exploration results so agents follow consistent conventions.
+
+WORKSPACE SCOPING:
+- Active workspace: `{workspace_id}`. All actions apply only to this workspace.
+- Use work item IDs exactly as provided in the snapshot. Never invent IDs.
+- Work item statuses: draft, ready, queued, running, blocked, done, archived.
+
+DUPLICATE HANDLING:
+- Check the duplicate candidates below before creating. If a similar active work item exists, prefer summary or reuse.
+- For done/archived similar work items: reopen if user says "resume/continue", create new if user says "fresh/again".
+- Treat the "Conversation work item progress" section below as ground truth for work items already handled
+  in this conversation. If a title appears there, do NOT create it again unless the user explicitly
+  asks for another copy or a fresh duplicate.
+- Conversation work item progress is NOT the same thing as execution scope. Older work item batches in the
+  same conversation may be unrelated to the current request.
+
+AGENT ASSIGNMENT:
+- Choose from configured agent profiles based on strengths and the work item's nature.
+- Prefer high reasoning_class agents for ambiguous/architectural work.
+- Prefer high edit_reliability agents for implementation-heavy work.
+
+REPO RESOLUTION:
+- Map user repo references to absolute paths from the repository snapshot.
+- If ambiguous, leave `repo_path` null (UI will ask).
+- If only one repo exists, default to it.
+
+EXECUTION SCOPING:
+- For repo-scoped run requests like "run work items in @repo", return `run_all_ready` with that
+  repo's absolute `repo_path`.
+- For "run the work you just planned/created" requests, use the "Current conversation work scope"
+  below and return `run_all_ready` with `work_item_ids` limited to that batch.
+- `run_all_ready` starts only runnable work items. Parent integration wrappers are NOT runnable and
+  should never be treated as execution targets.
+- When `run_all_ready.repo_path` is set, it means: start only work items in the snapshot whose
+  `status` is `ready` and whose `repo_path` matches that repository.
+- When `run_all_ready.work_item_ids` is set, it means: start only those work items, not every ready work item
+  in the workspace.
+- NEVER use workspace-wide execution for a repo-scoped run request.
+- NEVER treat older unrelated conversation work items as automatically relevant just because they appear
+  in conversation history.
+- NEVER start work items from a different repository when the user explicitly scoped the run.
+
+BRANCH NAMING:
+- ALWAYS provide a `branch_name` for every work item. The branch is pushed to GitHub for PR review.
+- Use conventional prefixes: `feat/`, `fix/`, `refactor/`, `chore/`, `docs/` based on work item intent.
+- Slugify the title: lowercase, alphanumeric + hyphens only, max 60 chars. Example: "Add pricing section" → `feat/add-pricing-section`.
+- Branch names must be unique across the batch. If two work items have similar titles, differentiate them.
+- Never use spaces, uppercase, or special characters beyond hyphens and forward slashes.
+
+SUB-WORK-ITEMS (STACKED BRANCHES):
+- Use `parent_title` when a request should be decomposed into child work items that all merge back
+  into ONE long-lived integration branch. Decide this from the work graph, not from the domain.
+- The parent work item defines the integration branch (e.g. `feat/add-testing`) and gets that branch
+  immediately. The parent is the source branch for all children.
+- Child work items do NOT get their own branch/worktree until they are run. At run time, each child
+  branches from the CURRENT HEAD of the parent branch, so it includes any earlier merged sibling work.
+- Child work items are the only items that run agents and receive merge/discard style review.
+- Approving a child merges it back into the parent's branch. The source branch (e.g. `main`, `beta`,
+  `develop`) is NEVER modified directly by children. The source branch only gets changes via GitHub PR.
+- The parent work item is NOT approved. It is an integration branch that the user can inspect and
+  push to GitHub at any time. When all children are done, the parent may move to review so the user
+  can inspect and/or push the integrated branch.
+- `parent_title` is the exact title of a work item in the SAME batch. The parent must NOT have its own
+  `parent_title` (only one level of nesting is supported).
+- Parent work items DO NOT run agents. Set `assigned_agent` to null for the parent. The parent's
+  `execution_context` should describe the overall feature goal, key constraints, and integrated
+  acceptance criteria, not agent instructions.
+- Children should have their OWN `branch_name` (e.g. `feat/billing-db`, `feat/billing-api`), distinct
+  from the parent's branch.
+- DEPENDENCY CHAINS WITHIN CHILDREN: When one child must land before other children should branch,
+  use `depends_on_titles` BETWEEN children. The earlier child merges into the parent branch first.
+  Then dependent children branch from the updated parent branch. This keeps the source branch untouched.
+- WHEN TO USE: Large features with multiple coordinated sub-tasks that logically belong in one
+  integration branch, especially when later children should branch from earlier merged child work.
+- WHEN NOT TO USE: Simple standalone tasks, small changes, or work that should ship as independent PRs.
+  If in doubt, choose the simplest structure that preserves clean file ownership and merge safety.
+
+DELETE SAFETY:
+- Always return a `delete_work_items` action with a confirming `assistant_message`. The UI handles confirmation.
+</system>
+
+<workspace-state>
+Work item snapshot:
+{work_items}
+
+Duplicate candidates:
 {duplicate_candidates}
 
-Available repositories:
+Repositories:
 {repos}
 
 Repository summaries:
 {repo_summaries}
 
-Configured agent profiles:
+Agent profiles:
 {agent_profiles}
 
 Recent repositories:
 {recent_repos}
 
-Recent orchestrator chat history:
-{history}
+Conversation work item progress:
+{conversation_work_item_progress}
 
-User message:
-{message}"#,
-        tickets = serde_json::to_string_pretty(&tickets).unwrap_or_else(|_| "[]".to_string()),
+Current conversation work scope:
+{current_work_scope}
+</workspace-state>
+
+<conversation>
+{history}
+</conversation>
+
+<user-message>
+{message}
+</user-message>"#,
+        work_items = serde_json::to_string_pretty(&work_items).unwrap_or_else(|_| "[]".to_string()),
         duplicate_candidates = duplicate_candidates,
         repos = serde_json::to_string_pretty(&repos).unwrap_or_else(|_| "[]".to_string()),
         repo_summaries = repo_summaries,
         agent_profiles = agent_profiles,
         recent_repos = serde_json::to_string_pretty(&recent_repos).unwrap_or_else(|_| "[]".to_string()),
+        conversation_work_item_progress = conversation_work_item_progress,
+        current_work_scope = current_work_scope,
         history = serde_json::to_string_pretty(&history).unwrap_or_else(|_| "[]".to_string()),
         workspace_id = workspace_id.trim(),
         message = message.trim(),
     ))
 }
 
-fn build_duplicate_candidates(message: &str, tickets: &Value) -> String {
+fn build_conversation_work_item_progress(history: &Value) -> String {
+    let Some(items) = history.as_array() else {
+        return "{}".to_string();
+    };
+
+    let mut created = std::collections::BTreeSet::new();
+    let mut reopened = std::collections::BTreeSet::new();
+    let mut reused = std::collections::BTreeSet::new();
+    let mut handled = std::collections::BTreeSet::new();
+
+    for item in items {
+        let Some(metadata_str) = item.get("metadata").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_str::<Value>(metadata_str) else {
+            continue;
+        };
+        if metadata.get("kind").and_then(Value::as_str) != Some("create_work_items_result") {
+            continue;
+        }
+
+        for title in metadata
+            .get("created_titles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            created.insert(title.to_string());
+            handled.insert(title.to_string());
+        }
+
+        for title in metadata
+            .get("reopened_titles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            reopened.insert(title.to_string());
+            handled.insert(title.to_string());
+        }
+
+        for title in metadata
+            .get("reused_titles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            reused.insert(title.to_string());
+            handled.insert(title.to_string());
+        }
+    }
+
+    serde_json::to_string_pretty(&json!({
+        "handled_titles": handled.into_iter().collect::<Vec<_>>(),
+        "created_titles": created.into_iter().collect::<Vec<_>>(),
+        "reopened_titles": reopened.into_iter().collect::<Vec<_>>(),
+        "reused_titles": reused.into_iter().collect::<Vec<_>>(),
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn build_current_work_scope(history: &Value) -> String {
+    let Some(items) = history.as_array() else {
+        return "{}".to_string();
+    };
+
+    for item in items.iter().rev() {
+        let Some(metadata_str) = item.get("metadata").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_str::<Value>(metadata_str) else {
+            continue;
+        };
+        if metadata.get("kind").and_then(Value::as_str) != Some("create_work_items_result") {
+            continue;
+        }
+
+        let handled_work_items = metadata
+            .get("handled_work_items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        if handled_work_items.is_empty() {
+            continue;
+        }
+
+        return serde_json::to_string_pretty(&json!({
+            "work_item_ids": handled_work_items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            "work_item_titles": handled_work_items
+                .iter()
+                .filter_map(|item| item.get("title").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            "work_items": handled_work_items,
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+    }
+
+    "{}".to_string()
+}
+
+fn build_duplicate_candidates(message: &str, work_items: &Value) -> String {
     let message_norm = normalize_text(message);
-    let Some(items) = tickets.as_array() else {
+    let Some(items) = work_items.as_array() else {
         return "[]".to_string();
     };
 
     let mut scored = items
         .iter()
-        .filter_map(|ticket| {
-            let title = ticket.get("title")?.as_str()?.to_string();
+        .filter_map(|item| {
+            let title = item.get("title")?.as_str()?.to_string();
             let title_norm = normalize_text(&title);
             if title_norm.is_empty() || message_norm.is_empty() {
                 return None;
@@ -266,11 +565,11 @@ fn build_duplicate_candidates(message: &str, tickets: &Value) -> String {
             }
 
             Some(json!({
-                "id": ticket.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "id": item.get("id").and_then(Value::as_str).unwrap_or_default(),
                 "title": title,
-                "status": ticket.get("status").and_then(Value::as_str).unwrap_or_default(),
-                "repo_path": ticket.get("repo_path").and_then(Value::as_str),
-                "assigned_agent": ticket.get("assigned_agent").and_then(Value::as_str),
+                "status": item.get("status").and_then(Value::as_str).unwrap_or_default(),
+                "repo_path": item.get("repo_path").and_then(Value::as_str),
+                "assigned_agent": item.get("assigned_agent").and_then(Value::as_str),
                 "score": score
             }))
         })
@@ -389,7 +688,7 @@ fn default_agent_weaknesses(id: &str) -> &'static str {
 fn default_agent_best_for(id: &str) -> &'static str {
     match id {
         "claude-code" => "cross-file changes, messy codebases, planning-heavy tasks",
-        "codex-cli" => "tight bugfixes, deterministic edits, implementation-heavy tickets",
+        "codex-cli" => "tight bugfixes, deterministic edits, implementation-heavy work items",
         "gemini-cli" => "initial scanning, lightweight changes, exploration",
         _ => "general tasks",
     }
@@ -480,7 +779,7 @@ async fn call_anthropic(api_key: &str, model: &str, prompt: &str) -> Result<Stri
         .header(CONTENT_TYPE, "application/json")
         .json(&json!({
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": 8192,
             "temperature": 0.2,
             "messages": [
                 { "role": "user", "content": prompt }
@@ -527,11 +826,12 @@ async fn call_anthropic(api_key: &str, model: &str, prompt: &str) -> Result<Stri
 async fn call_gemini(api_key: &str, model: &str, prompt: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     );
     let response = client
         .post(url)
         .header(CONTENT_TYPE, "application/json")
+        .header("x-goog-api-key", api_key)
         .json(&json!({
             "contents": [
                 {
@@ -601,245 +901,256 @@ fn clean_json_response(raw: &str) -> String {
     trimmed.to_string()
 }
 
-/// Extract JSON from CLI agent output. The agent may include preamble text
-/// before the actual JSON array/object. Find the first `[` or `{` and the
-/// matching closing bracket.
-fn extract_json_from_output(raw: &str) -> String {
+fn parse_orchestrator_plan_response(raw: &str) -> Result<OrchestratorPlan, String> {
     let cleaned = clean_json_response(raw);
 
-    // Try to find a JSON array first (most common for work items)
-    if let Some(start) = cleaned.find('[') {
-        if let Some(end) = cleaned.rfind(']') {
-            if end > start {
-                return cleaned[start..=end].to_string();
-            }
-        }
+    if let Ok(plan) = serde_json::from_str::<OrchestratorPlan>(&cleaned) {
+        return Ok(plan);
     }
 
-    // Fall back to JSON object
-    if let Some(start) = cleaned.find('{') {
-        if let Some(end) = cleaned.rfind('}') {
-            if end > start {
-                return cleaned[start..=end].to_string();
-            }
-        }
+    let mut stream = serde_json::Deserializer::from_str(&cleaned).into_iter::<OrchestratorPlan>();
+    if let Some(first) = stream.next() {
+        return first
+            .map_err(|err| format!("Failed to parse orchestrator response: {err}. Raw: {cleaned}"));
     }
 
-    cleaned
+    if let Some(json_object) = extract_first_json_object(&cleaned) {
+        return serde_json::from_str::<OrchestratorPlan>(&json_object)
+            .map_err(|err| format!("Failed to parse orchestrator response: {err}. Raw: {cleaned}"));
+    }
+
+    Err(format!(
+        "Failed to parse orchestrator response: no valid JSON object found. Raw: {cleaned}"
+    ))
 }
 
-// ─── CLI Agent Analysis ────────────────────────────────────────────────────────
+fn extract_first_json_object(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
 
-fn build_analysis_prompt(objective: &str, repo_paths: &[String]) -> String {
-    let repo_list = repo_paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| format!("  {}. {}", i + 1, p))
-        .collect::<Vec<_>>()
-        .join("\n");
+    for (offset, ch) in raw[start..].char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
 
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(raw[start..end].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+// ─── CLI Agent Exploration ─────────────────────────────────────────────────────
+
+fn build_exploration_prompt(user_prompt: &str) -> String {
     format!(
-        r#"You are a technical project manager performing codebase analysis.
+        r#"You are a codebase explorer. Your job is to gather information that enables parallel task decomposition.
 
-OBJECTIVE: {objective}
-
-REPOSITORIES TO ANALYZE:
-{repo_list}
+TASK: {user_prompt}
 
 INSTRUCTIONS:
-1. Explore the repository structure, key files, and architecture
-2. Understand what exists and what the objective requires
-3. Break the objective into 3-6 independent, parallelizable work items
-4. For each work item, identify which files/directories it will touch
-5. Ensure work items do NOT overlap on the same files — this is critical for parallel execution
-6. Write detailed execution context for each work item so a coding agent can start immediately
+1. Map the directory structure — identify top-level directories and their purposes.
+2. Identify the tech stack: framework, language, styling, state management, routing, build tools.
+3. Read key files: entry points, config files, main components, routing definitions.
+4. For the specific task requested, identify:
+   - Which files/directories would need to be created or modified.
+   - Which files are "shared" (imported by many others) vs "leaf" (standalone pages/components).
+   - Natural boundaries where work can be split without file conflicts.
+   - The minimum foundation/shared setup that must land before parallel work begins.
+   - The full first batch of medium-sized work items needed to fulfill the request.
+   - Which of those work items can run in parallel immediately after the foundation work merges.
+   - Existing patterns the new code should follow (naming conventions, component structure, imports).
+5. Note any existing related code that new work should integrate with or avoid duplicating.
+
+CRITICAL: Your output will be used to create parallel coding work items. Focus on information that
+helps partition work into non-overlapping file zones. Explicitly call out files that multiple
+features might need to touch — these are potential conflict points. If the repo is empty or only
+lightly scaffolded, explicitly say so and propose the likely bootstrap/foundation work item plus the
+next dependent work items that would make up the rest of the work.
 
 You are running in a non-interactive pipeline. Do not ask follow-up questions.
-Do not offer to do more work. Return ONLY the final JSON and nothing else.
-
-Return a JSON array of work items in this exact format:
-[
-  {{
-    "title": "Short descriptive title",
-    "description": "Detailed instructions for the coding agent. Include specific files to modify, what to change, and acceptance criteria.",
-    "files": ["list", "of", "files/dirs", "this", "touches"],
-    "depends_on": ["optional title of another work item this depends on"]
-  }}
-]
-
-Return ONLY the JSON array. No markdown fences, no commentary, no follow-up questions."#,
-        objective = objective.trim(),
-        repo_list = repo_list,
+Do not offer to do more work. Do not write or modify any code.
+Return your findings as a structured plain-text summary. No JSON, no markdown fences."#,
+        user_prompt = user_prompt.trim(),
     )
 }
 
-fn resolve_cli_agent() -> Vec<String> {
-    if cfg!(target_os = "windows") {
-        // On Windows, use cmd /C to run claude
-        vec!["cmd".to_string(), "/C".to_string(), "claude".to_string()]
-    } else {
-        vec!["claude".to_string()]
+/// Permission mode for CLI agent exploration.
+///   "full"      → no tool restrictions (agent auto-approves everything in -p mode)
+///   "read_only" → restrict to read-only tools via --allowedTools
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplorePermission {
+    Full,
+    ReadOnly,
+}
+
+impl ExplorePermission {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "full" => Self::Full,
+            _ => Self::ReadOnly,
+        }
+    }
+}
+
+struct ExploreCli {
+    program: &'static str,
+    base_args: Vec<String>,
+    json_output: bool,
+}
+
+fn build_explore_cli(agent_id: &str, max_turns: u32, permission: ExplorePermission) -> Result<ExploreCli, String> {
+    let read_only_tools = "Read,Glob,Grep,Bash(grep:*),Bash(find:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*)";
+
+    match agent_id {
+        "claude-code" => {
+            let mut args = vec![
+                "-p".to_string(),
+                "--output-format".to_string(), "json".to_string(),
+                "--max-turns".to_string(), max_turns.to_string(),
+            ];
+            if permission == ExplorePermission::ReadOnly {
+                args.push("--allowedTools".to_string());
+                args.push(read_only_tools.to_string());
+            }
+            Ok(ExploreCli { program: "claude", base_args: args, json_output: true })
+        }
+        "gemini-cli" => {
+            let mut args = vec!["-p".to_string()];
+            if permission == ExplorePermission::ReadOnly {
+                args.push("--sandbox".to_string());
+            }
+            Ok(ExploreCli { program: "gemini", base_args: args, json_output: false })
+        }
+        "codex-cli" => {
+            let mut args = vec!["--quiet".to_string()];
+            if permission == ExplorePermission::ReadOnly {
+                args.push("--approval-mode".to_string());
+                args.push("suggest".to_string());
+            }
+            Ok(ExploreCli { program: "codex", base_args: args, json_output: false })
+        }
+        other => Err(format!("Unknown agent '{other}' for exploration. Use claude-code, gemini-cli, or codex-cli.")),
     }
 }
 
 #[tauri::command]
-pub async fn analyze_and_plan(
+pub async fn explore_repo(
     app: tauri::AppHandle,
-    objective: String,
-    repo_paths: Vec<String>,
+    repo_path: String,
+    prompt: String,
+    agent_id: Option<String>,
+    permission_mode: Option<String>,
     max_turns: Option<u32>,
-) -> Result<Vec<OrchestratorTicketSpec>, String> {
-    if objective.trim().is_empty() {
-        return Err("Objective is required".to_string());
+) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("Exploration prompt is required".to_string());
     }
-    if repo_paths.is_empty() {
-        return Err("At least one repository path is required".to_string());
-    }
-
-    // Verify repo paths exist
-    for path in &repo_paths {
-        if !std::path::Path::new(path).exists() {
-            return Err(format!("Repository path does not exist: {path}"));
-        }
+    if !std::path::Path::new(&repo_path).exists() {
+        return Err(format!("Repository path does not exist: {repo_path}"));
     }
 
-    let prompt = build_analysis_prompt(&objective, &repo_paths);
+    let agent = agent_id.as_deref().unwrap_or("claude-code");
+    let permission = ExplorePermission::from_str(permission_mode.as_deref().unwrap_or("full"));
     let turns = max_turns.unwrap_or(25);
+    let exploration_prompt = build_exploration_prompt(&prompt);
+    let cli = build_explore_cli(agent, turns, permission)?;
 
-    // Use the first repo as the working directory
-    let cwd = &repo_paths[0];
-
-    let _ = app.emit("analysis:status", json!({
+    let _ = app.emit("explore:status", json!({
         "status": "running",
-        "message": "Analyzing codebase..."
+        "agent": agent,
+        "message": format!("{} is exploring the codebase...", agent)
     }));
 
-    // Build the command: claude -p "prompt" --allowedTools "..." --output-format json --max-turns N
-    let parts = resolve_cli_agent();
-    let mut command = if parts[0] == "cmd" {
-        let mut cmd = tokio::process::Command::new(&parts[0]);
-        // Build the full claude command as a single string for cmd /C
-        let claude_cmd = format!(
-            "claude -p {} --allowedTools \"Read,Glob,Grep,Bash(grep:*),Bash(find:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*)\" --output-format json --max-turns {}",
-            shell_escape(&prompt),
-            turns,
-        );
-        cmd.arg("/C").arg(&claude_cmd);
+    // Build command — stdin piped (prompt goes through stdin, not command line)
+    let mut command = if cfg!(target_os = "windows") {
+        let mut cmd = tokio::process::Command::new("cmd");
+        let full_cmd = format!("{} {}", cli.program, cli.base_args.join(" "));
+        cmd.arg("/C").arg(&full_cmd);
         cmd
     } else {
-        let mut cmd = tokio::process::Command::new(&parts[0]);
-        cmd.arg("-p")
-            .arg(&prompt)
-            .arg("--allowedTools")
-            .arg("Read,Glob,Grep,Bash(grep:*),Bash(find:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*)")
-            .arg("--output-format")
-            .arg("json")
-            .arg("--max-turns")
-            .arg(turns.to_string());
+        let mut cmd = tokio::process::Command::new(cli.program);
+        for arg in &cli.base_args {
+            cmd.arg(arg);
+        }
         cmd
     };
 
     command
-        .current_dir(cwd)
+        .current_dir(&repo_path)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let _ = app.emit("analysis:status", json!({
-        "status": "running",
-        "message": "CLI agent is exploring the codebase..."
-    }));
-
-    let child = command
+    let mut child = command
         .spawn()
-        .map_err(|err| format!("Failed to spawn CLI agent: {err}. Is 'claude' installed and in PATH?"))?;
+        .map_err(|err| format!("Failed to spawn {agent}: {err}. Is '{0}' installed and in PATH?", cli.program))?;
+
+    // Write the prompt to stdin, then close it to signal EOF
+    if let Some(mut stdin_handle) = child.stdin.take() {
+        stdin_handle
+            .write_all(exploration_prompt.as_bytes())
+            .await
+            .map_err(|err| format!("Failed to write prompt to {agent} stdin: {err}"))?;
+        // drop closes the handle → sends EOF
+    }
 
     let output = child
         .wait_with_output()
         .await
-        .map_err(|err| format!("CLI agent process failed: {err}"))?;
+        .map_err(|err| format!("{agent} process failed: {err}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = app.emit("analysis:status", json!({
+        let _ = app.emit("explore:status", json!({
             "status": "error",
-            "message": format!("CLI agent failed: {stderr}")
+            "message": format!("{agent} failed: {stderr}")
         }));
-        return Err(format!("CLI agent exited with status {}: {stderr}", output.status));
+        return Err(format!("{agent} exited with status {}: {stderr}", output.status));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    let _ = app.emit("analysis:status", json!({
-        "status": "parsing",
-        "message": "Parsing analysis results..."
-    }));
-
-    // Parse the JSON output — claude --output-format json wraps result in a JSON object
-    let work_items = parse_analysis_output(&stdout, &repo_paths)?;
-
-    let _ = app.emit("analysis:status", json!({
-        "status": "done",
-        "message": format!("Analysis complete: {} work items", work_items.len())
-    }));
-
-    Ok(work_items)
-}
-
-fn parse_analysis_output(raw: &str, repo_paths: &[String]) -> Result<Vec<OrchestratorTicketSpec>, String> {
-    let cleaned = clean_json_response(raw);
-
     // claude --output-format json wraps the result like: {"type":"result","result":"..."}
-    // Try to extract the inner result first
-    let inner = if let Ok(wrapper) = serde_json::from_str::<Value>(&cleaned) {
-        if let Some(result_str) = wrapper.get("result").and_then(Value::as_str) {
-            result_str.to_string()
+    let summary = if cli.json_output {
+        if let Ok(wrapper) = serde_json::from_str::<Value>(&stdout) {
+            wrapper
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or(&stdout)
+                .to_string()
         } else {
-            cleaned.clone()
+            stdout.to_string()
         }
     } else {
-        cleaned.clone()
+        stdout.trim().to_string()
     };
 
-    let json_str = extract_json_from_output(&inner);
+    let _ = app.emit("explore:status", json!({
+        "status": "done",
+        "message": format!("{agent} exploration complete.")
+    }));
 
-    // Try parsing as AnalysisWorkItem array
-    let items: Vec<AnalysisWorkItem> = serde_json::from_str(&json_str)
-        .map_err(|err| format!("Failed to parse analysis output as work items: {err}. Raw: {json_str}"))?;
-
-    if items.is_empty() {
-        return Err("CLI agent returned no work items".to_string());
-    }
-
-    // Convert AnalysisWorkItem -> OrchestratorTicketSpec
-    let primary_repo = repo_paths.first().map(|s| s.as_str());
-    let specs = items
-        .into_iter()
-        .map(|item| {
-            let files_note = item.files
-                .as_ref()
-                .map(|files| format!("\n\nFiles: {}", files.join(", ")))
-                .unwrap_or_default();
-
-            OrchestratorTicketSpec {
-                title: item.title,
-                context: item.description.chars().take(200).collect(),
-                execution_context: Some(format!("{}{}", item.description, files_note)),
-                orchestrator_note: Some("Generated by CLI agent analysis".to_string()),
-                repo_path: primary_repo.map(|s| s.to_string()),
-                assigned_agent: None,
-                depends_on_titles: item.depends_on,
-                duplicate_of_ticket_id: None,
-                duplicate_policy: None,
-                intent_type: Some("create_ticket".to_string()),
-            }
-        })
-        .collect();
-
-    Ok(specs)
-}
-
-fn shell_escape(s: &str) -> String {
-    // For Windows cmd /C, wrap in double quotes and escape inner double quotes
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    Ok(summary)
 }
