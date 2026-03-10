@@ -47,9 +47,10 @@ export interface WorkItemReviewState {
   push_summary: string;
 }
 
-/** A single streamed event item from an ACP run, stored as JSON in agent_logs.messages. */
+/** A single streamed event item from an ACP run. Persisted durably in agent_log_events. */
 export interface AcpEventItem {
   id: string;
+  seq: number;
   /** "text" | "text_delta" | "tool_call" | "tool_result" | "error" | "done" */
   kind: string;
   content: string | null;
@@ -64,7 +65,7 @@ export interface AgentLog {
   work_item_id: string;
   agent_id: string;
   run_id: string | null;
-  /** JSON-serialised AcpEventItem[] collected during the run. */
+  /** Legacy JSON transcript snapshot retained for compatibility and historical logs. */
   messages: string | null;
   summary: string | null;
   tokens_in: number | null;

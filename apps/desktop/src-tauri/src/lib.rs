@@ -73,6 +73,12 @@ pub fn run() {
             sql: include_str!("../migrations/011_sub_work_items.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 12,
+            description: "agent_log_events",
+            sql: include_str!("../migrations/012_agent_log_events.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -291,6 +297,11 @@ pub fn run() {
                 .execute(&pool)
                 .await;
 
+                // Create agent_log_events table for durable streamed ACP event persistence.
+                sqlx::raw_sql(include_str!("../migrations/012_agent_log_events.sql"))
+                    .execute(&pool)
+                    .await?;
+
                 // On every startup, reset work items that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
                 // restarts, so queued/running work items would be stuck indefinitely.
@@ -366,10 +377,12 @@ pub fn run() {
             commands::agents::respond_to_agent_permission,
             commands::agents::get_agent_logs,
             commands::agents::get_acp_messages,
+            commands::agents::get_work_item_acp_events,
             // Repos
             commands::repos::list_repos,
             commands::repos::add_repo,
             commands::repos::prepare_repo,
+            commands::repos::checkout_repo_branch,
             commands::repos::remove_repo,
             commands::repos::update_repo_last_used,
             // Workspaces

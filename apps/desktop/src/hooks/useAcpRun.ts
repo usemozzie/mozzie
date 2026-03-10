@@ -1,7 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { AcpEventItem } from '@mozzie/db';
 import type { AgentLogChangeEvent } from '../types/events';
+
+const WORK_ITEM_ACP_EVENTS_KEY = 'work_item_acp_events';
 
 interface AcpEventPayload {
   workItemId: string;
@@ -15,18 +19,24 @@ interface AcpEventPayload {
  * When `logId` is provided, also accepts seed items from a persisted log.
  */
 export function useAcpRun(workItemId: string | null) {
-  const [items, setItems] = useState<AcpEventItem[]>([]);
+  const queryClient = useQueryClient();
+  const [liveItems, setLiveItems] = useState<AcpEventItem[]>([]);
   const currentLogIdRef = useRef<string | null>(null);
   const unlistenRefs = useRef<Array<() => void>>([]);
+  const { data: persistedItems = [] } = useQuery<AcpEventItem[]>({
+    queryKey: [WORK_ITEM_ACP_EVENTS_KEY, workItemId],
+    queryFn: () => invoke('get_work_item_acp_events', { workItemId }),
+    enabled: !!workItemId,
+  });
 
   useEffect(() => {
     if (!workItemId) {
-      setItems([]);
+      setLiveItems([]);
       currentLogIdRef.current = null;
       return;
     }
 
-    setItems([]);
+    setLiveItems([]);
     currentLogIdRef.current = null;
 
     let cancelled = false;
@@ -38,10 +48,10 @@ export function useAcpRun(workItemId: string | null) {
       if (event.payload.workItemId !== workItemId) return;
       if (currentLogIdRef.current !== event.payload.logId) {
         currentLogIdRef.current = event.payload.logId;
-        setItems([event.payload.item]);
+        setLiveItems([event.payload.item]);
         return;
       }
-      setItems((prev) => [...prev, event.payload.item]);
+      setLiveItems((prev) => [...prev, event.payload.item]);
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -55,7 +65,8 @@ export function useAcpRun(workItemId: string | null) {
       if (cancelled) return;
       if (event.payload.workItemId !== workItemId) return;
       currentLogIdRef.current = null;
-      setItems([]);
+      setLiveItems([]);
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEM_ACP_EVENTS_KEY, workItemId] });
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -72,7 +83,18 @@ export function useAcpRun(workItemId: string | null) {
       }
       unlistenRefs.current = [];
     };
-  }, [workItemId]);
+  }, [queryClient, workItemId]);
 
-  return items;
+  return useMemo(() => {
+    const seenIds = new Set<string>();
+    const merged: AcpEventItem[] = [];
+    for (const item of [...persistedItems, ...liveItems]) {
+      if (seenIds.has(item.id)) {
+        continue;
+      }
+      seenIds.add(item.id);
+      merged.push(item);
+    }
+    return merged;
+  }, [liveItems, persistedItems]);
 }

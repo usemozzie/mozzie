@@ -27,6 +27,7 @@ import { getWorkItemTag } from '../../lib/workItemColors';
 import { StatusBadge } from '../ui/badge';
 import { ReviewPanel } from '../review/ReviewPanel';
 import { AtReferenceTextarea, type SlashCommandOption } from '../work-items/AtReferenceTextarea';
+import { WorkItemDescriptionEditor } from '../work-items/WorkItemDescriptionEditor';
 
 type PanelTab = 'agent' | 'changes' | 'description';
 
@@ -344,26 +345,7 @@ function WorkItemInteractionPanel({
   const { data: session } = useAgentSession(workItemId);
   const { data: logs } = useAgentLogs(workItemId);
   const latestLog = logs?.[0] ?? null;
-
-  const persistedItems = useMemo<AcpEventItem[]>(
-    () =>
-      [...(logs ?? [])]
-        .sort((left, right) => left.created_at.localeCompare(right.created_at))
-        .flatMap((log) => (log.messages ? tryParse<AcpEventItem[]>(log.messages, []) : [])),
-    [logs],
-  );
-  const mergedItems = useMemo(() => {
-    const seenIds = new Set<string>();
-    const merged: AcpEventItem[] = [];
-    for (const item of [...persistedItems, ...liveItems]) {
-      if (seenIds.has(item.id)) {
-        continue;
-      }
-      seenIds.add(item.id);
-      merged.push(item);
-    }
-    return merged;
-  }, [liveItems, persistedItems]);
+  const mergedItems = liveItems;
   const segments = useMemo(() => groupIntoSegments(mergedItems), [mergedItems]);
 
   const review = useReview(workItem, activeTab === 'changes' || workItem?.status === 'review');
@@ -635,6 +617,23 @@ function WorkItemInteractionPanel({
       setAgentError(String(error));
     } finally {
       setIsUpdatingAgent(false);
+    }
+  }
+
+  async function handleDescriptionSave(nextContext: string) {
+    if (!workItem) return;
+    setActionError(null);
+    setIsMutating(true);
+    try {
+      await updateWorkItem.mutateAsync({
+        id: workItem.id,
+        fields: { context: nextContext.trim() || null },
+      });
+    } catch (error) {
+      setActionError(String(error));
+      throw error;
+    } finally {
+      setIsMutating(false);
     }
   }
 
@@ -949,7 +948,11 @@ function WorkItemInteractionPanel({
           actionError={actionError}
         />
       ) : (
-        <DescriptionTab workItem={workItem} />
+        <DescriptionTab
+          workItem={workItem}
+          onSaveDescription={handleDescriptionSave}
+          isSaving={isMutating}
+        />
       )}
     </div>
   );
@@ -1088,7 +1091,35 @@ const AGENT_COLORS: Record<string, string> = {
 
 // ---- Description tab ----
 
-function DescriptionTab({ workItem }: { workItem: WorkItem }) {
+function DescriptionTab({
+  workItem,
+  onSaveDescription,
+  isSaving,
+}: {
+  workItem: WorkItem;
+  onSaveDescription: (nextContext: string) => Promise<void>;
+  isSaving: boolean;
+}) {
+  const canEdit = !workItem.started_at && (workItem.status === 'draft' || workItem.status === 'ready');
+  const repoPath = workItem.worktree_path ?? workItem.repo_path ?? '';
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftContext, setDraftContext] = useState(workItem.context ?? '');
+
+  useEffect(() => {
+    setDraftContext(workItem.context ?? '');
+    if (!canEdit) {
+      setIsEditing(false);
+    }
+  }, [canEdit, workItem.context, workItem.id]);
+
+  const hasChanges = draftContext !== (workItem.context ?? '');
+
+  async function handleSave() {
+    if (!hasChanges || isSaving) return;
+    await onSaveDescription(draftContext);
+    setIsEditing(false);
+  }
+
   return (
     <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
       {/* Dates */}
@@ -1099,13 +1130,98 @@ function DescriptionTab({ workItem }: { workItem: WorkItem }) {
         {workItem.completed_at && <TimestampInline label="Completed" date={workItem.completed_at} />}
       </div>
 
-      {/* Description */}
-      {workItem.context ? (
-        <div className="text-[13px] leading-[1.7] text-text-muted">
-          <MarkdownText content={workItem.context} />
+      {canEdit && isEditing ? (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-[11px] text-text-dim">
+              Edit the description before the first run.
+            </div>
+            {hasChanges && (
+              <div className="text-[11px] text-amber-300/90">
+                Unsaved changes
+              </div>
+            )}
+          </div>
+          <WorkItemDescriptionEditor
+            value={draftContext}
+            onChange={setDraftContext}
+            repoPath={repoPath}
+            rows={12}
+            autosize
+            maxRows={28}
+            placeholder={
+              repoPath
+                ? 'Describe what should be done. Use @path/to/file.tsx to include files.'
+                : 'Describe what should be done.'
+            }
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault();
+                void handleSave();
+              }
+            }}
+            helperText={
+              repoPath
+                ? 'Type @ to search files from the selected repository. Press Ctrl/Cmd+Enter to save.'
+                : 'Add a repository to this work item to enable @file references.'
+            }
+            editorClassName="min-h-[320px]"
+          />
+          <div className="flex items-center gap-3">
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setDraftContext(workItem.context ?? '');
+                  setIsEditing(false);
+                }}
+                disabled={isSaving}
+                className="px-2.5 py-1 rounded-md border border-border bg-bg text-[11px] text-text-dim hover:text-text hover:bg-white/[0.04] disabled:opacity-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSave()}
+                disabled={isSaving || !hasChanges}
+                className="px-2.5 py-1 rounded-md border border-border bg-surface text-[11px] text-text-dim hover:text-text hover:bg-surface-raised disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isSaving ? (
+                  <span className="flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Saving
+                  </span>
+                ) : (
+                  'Save'
+                )}
+              </button>
+            </div>
+          </div>
         </div>
       ) : (
-        <p className="text-[12px] text-text-dim italic">No description provided.</p>
+        <div className="space-y-3">
+          {canEdit && (
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[11px] text-text-dim">
+                View the description here. Click edit to update it before the first run.
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsEditing(true)}
+                className="px-2.5 py-1 rounded-md border border-border bg-surface text-[11px] text-text-dim hover:text-text hover:bg-surface-raised transition-colors"
+              >
+                Edit Description
+              </button>
+            </div>
+          )}
+          {workItem.context ? (
+            <div className="text-[13px] leading-[1.7] text-text-muted">
+              <MarkdownText content={workItem.context} />
+            </div>
+          ) : (
+            <p className="text-[12px] text-text-dim italic">No description provided.</p>
+          )}
+        </div>
       )}
     </div>
   );

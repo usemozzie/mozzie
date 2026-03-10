@@ -234,7 +234,7 @@ export function AtReferenceTextarea({
   }, [autosize, maxRows, rows, value]);
 
   return (
-    <div className="relative">
+    <div className="relative w-full">
       <textarea
         ref={textareaRef}
         value={value}

@@ -40,6 +40,19 @@ CREATE TABLE IF NOT EXISTS agent_logs (
 );
 `;
 
+export const CREATE_AGENT_LOG_EVENTS_TABLE = `
+CREATE TABLE IF NOT EXISTS agent_log_events (
+  id TEXT PRIMARY KEY,
+  log_id TEXT NOT NULL REFERENCES agent_logs(id),
+  seq INTEGER NOT NULL,
+  item_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_log_events_log_id ON agent_log_events(log_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_log_events_log_seq ON agent_log_events(log_id, seq);
+`;
+
 export const CREATE_AGENT_CONFIG_TABLE = `
 CREATE TABLE IF NOT EXISTS agent_config (
   id TEXT PRIMARY KEY,
@@ -69,6 +82,7 @@ VALUES
 export const ALL_MIGRATIONS = [
   CREATE_WORK_ITEMS_TABLE,
   CREATE_AGENT_LOGS_TABLE,
+  CREATE_AGENT_LOG_EVENTS_TABLE,
   CREATE_AGENT_CONFIG_TABLE,
   CREATE_INDEXES,
   INSERT_DEFAULT_AGENTS,

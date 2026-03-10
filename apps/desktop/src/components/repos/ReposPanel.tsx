@@ -1,9 +1,11 @@
-import { useState } from 'react';
-import { FolderOpen, GitBranch, Plus, Trash2, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { FolderOpen, GitBranch, Loader2, Plus, Trash2, X } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useRepos, useAddRepo, useRemoveRepo, usePrepareRepo } from '../../hooks/useRepos';
+import { useRepos, useAddRepo, useRemoveRepo, usePrepareRepo, useCheckoutRepoBranch } from '../../hooks/useRepos';
+import { useRepoBranch, useRepoBranches } from '../../hooks/useWorktree';
 import { saveRecentRepo } from '../../lib/recentRepos';
 import type { Repo } from '@mozzie/db';
+import { Select } from '../ui/select';
 
 interface ReposPanelProps {
   onClose: () => void;
@@ -14,6 +16,7 @@ export function ReposPanel({ onClose }: ReposPanelProps) {
   const addRepo = useAddRepo();
   const removeRepo = useRemoveRepo();
   const prepareRepo = usePrepareRepo();
+  const checkoutRepoBranch = useCheckoutRepoBranch();
   const [error, setError] = useState<string | null>(null);
 
   async function handleAddRepo() {
@@ -71,6 +74,21 @@ export function ReposPanel({ onClose }: ReposPanelProps) {
                   setError(e?.toString() ?? 'Failed to prepare repository');
                 }
               }}
+              onCheckout={async (branchName) => {
+                try {
+                  setError(null);
+                  await checkoutRepoBranch.mutateAsync({
+                    id: repo.id,
+                    repoPath: repo.path,
+                    branchName,
+                  });
+                } catch (e: any) {
+                  setError(e?.toString() ?? 'Failed to switch branch');
+                }
+              }}
+              isCheckoutPending={
+                checkoutRepoBranch.isPending && checkoutRepoBranch.variables?.id === repo.id
+              }
               onRemove={() => removeRepo.mutate(repo.id)}
             />
           ))
@@ -93,37 +111,100 @@ export function ReposPanel({ onClose }: ReposPanelProps) {
 function RepoRow({
   repo,
   onPrepare,
+  onCheckout,
+  isCheckoutPending,
   onRemove,
 }: {
   repo: Repo;
   onPrepare: () => void;
+  onCheckout: (branchName: string) => Promise<void>;
+  isCheckoutPending: boolean;
   onRemove: () => void;
 }) {
+  const repoBranch = useRepoBranch(repo.path);
+  const repoBranches = useRepoBranches(repo.path);
+  const currentBranch = repoBranch.data?.branch_name || repo.default_branch || '';
+  const [selectedBranch, setSelectedBranch] = useState(currentBranch);
+
+  useEffect(() => {
+    setSelectedBranch(currentBranch);
+  }, [currentBranch]);
+
+  const canCheckout =
+    !repo.needs_prepare &&
+    !!selectedBranch &&
+    selectedBranch !== currentBranch &&
+    !isCheckoutPending;
+
   return (
-    <div className="group flex items-center gap-2 px-2.5 py-2 rounded-lg hover:bg-white/[0.04] transition-colors">
-      <GitBranch className="w-3.5 h-3.5 text-text-dim shrink-0" />
-      <div className="flex-1 min-w-0">
-        <div className="text-[13px] text-text truncate">{repo.name}</div>
-        {repo.default_branch && (
-          <div className="text-[10px] text-text-dim truncate">{repo.default_branch}</div>
+    <div className="group rounded-lg px-2.5 py-2 hover:bg-white/[0.04] transition-colors">
+      <div className="flex items-start gap-2">
+        <GitBranch className="w-3.5 h-3.5 text-text-dim shrink-0 mt-0.5" />
+        <div className="flex-1 min-w-0">
+          <div className="text-[13px] text-text truncate">{repo.name}</div>
+          <div className="text-[10px] text-text-dim truncate" title={repo.path}>
+            {repo.path}
+          </div>
+          {currentBranch && (
+            <div className="pt-0.5 text-[10px] text-text-dim truncate">
+              checked out: <span className="text-text">{currentBranch}</span>
+            </div>
+          )}
+        </div>
+        {repo.needs_prepare && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onPrepare(); }}
+            className="opacity-0 group-hover:opacity-100 px-2 h-5 flex items-center justify-center rounded text-[10px] text-text-dim hover:text-text hover:bg-white/[0.06] transition-all"
+            title="Prepare repository by creating an initial commit if needed"
+          >
+            Prepare
+          </button>
         )}
-      </div>
-      {repo.needs_prepare && (
         <button
-          onClick={(e) => { e.stopPropagation(); onPrepare(); }}
-          className="opacity-0 group-hover:opacity-100 px-2 h-5 flex items-center justify-center rounded text-[10px] text-text-dim hover:text-text hover:bg-white/[0.06] transition-all"
-          title="Prepare repository by creating an initial commit if needed"
+          onClick={(e) => { e.stopPropagation(); onRemove(); }}
+          className="opacity-0 group-hover:opacity-100 w-5 h-5 flex items-center justify-center rounded text-text-dim hover:text-state-danger transition-all"
+          title="Remove"
         >
-          Prepare
+          <Trash2 className="w-3 h-3" />
         </button>
+      </div>
+
+      {!repo.needs_prepare && (
+        <div className="pl-[22px] pt-2 space-y-1.5">
+          {repoBranches.isLoading ? (
+            <div className="text-[11px] text-text-dim">Loading branches…</div>
+          ) : repoBranches.data && repoBranches.data.length > 0 ? (
+            <div className="flex items-center gap-2">
+              <Select
+                className="h-8 text-[12px]"
+                value={selectedBranch}
+                options={repoBranches.data.map((branch) => ({
+                  value: branch,
+                  label: branch + (branch === currentBranch ? ' (checked out)' : ''),
+                }))}
+                onChange={(e) => setSelectedBranch(e.target.value)}
+              />
+              <button
+                onClick={() => void onCheckout(selectedBranch)}
+                disabled={!canCheckout}
+                className="shrink-0 h-8 px-3 rounded-md border border-border bg-surface text-[11px] text-text-dim hover:text-text hover:bg-surface-raised disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isCheckoutPending ? (
+                  <span className="flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Switching
+                  </span>
+                ) : selectedBranch === currentBranch ? 'Checked Out' : 'Check Out'}
+              </button>
+            </div>
+          ) : (
+            <div className="text-[11px] text-text-dim">No local branches found.</div>
+          )}
+          {repoBranch.error && (
+            <div className="text-[11px] text-state-danger">Could not read the current branch.</div>
+          )}
+        </div>
       )}
-      <button
-        onClick={(e) => { e.stopPropagation(); onRemove(); }}
-        className="opacity-0 group-hover:opacity-100 w-5 h-5 flex items-center justify-center rounded text-text-dim hover:text-state-danger transition-all"
-        title="Remove"
-      >
-        <Trash2 className="w-3 h-3" />
-      </button>
     </div>
   );
 }

@@ -106,6 +106,8 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for AgentLog {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AcpEventItem {
     pub id: String,
+    #[serde(default)]
+    pub seq: i64,
     /// "text" | "text_delta" | "tool_call" | "tool_result" | "error" | "done"
     pub kind: String,
     pub content: Option<String>,
@@ -163,11 +165,13 @@ struct PendingPermissionDecision {
 #[derive(Clone)]
 struct SessionShared {
     app: AppHandle,
+    pool: SqlitePool,
     work_item_id: String,
     agent_id: String,
     worktree_root: PathBuf,
     snapshot: Arc<Mutex<AgentSessionState>>,
     current_log_id: Arc<Mutex<Option<String>>>,
+    current_log_seq: Arc<Mutex<i64>>,
     turn_events: Arc<Mutex<Vec<AcpEventItem>>>,
     pending_permission: Arc<Mutex<Option<PendingPermissionDecision>>>,
 }
@@ -228,6 +232,9 @@ impl SessionShared {
         if let Ok(mut value) = self.current_log_id.lock() {
             *value = log_id;
         }
+        if let Ok(mut seq) = self.current_log_seq.lock() {
+            *seq = 0;
+        }
     }
 
     fn clear_turn_events(&self) {
@@ -243,11 +250,25 @@ impl SessionShared {
             .unwrap_or_default()
     }
 
-    fn push_turn_event(&self, item: AcpEventItem) {
+    fn next_turn_seq(&self) -> i64 {
+        self.current_log_seq
+            .lock()
+            .map(|mut seq| {
+                *seq += 1;
+                *seq
+            })
+            .unwrap_or(0)
+    }
+
+    async fn push_turn_event(&self, mut item: AcpEventItem) {
+        if item.seq <= 0 {
+            item.seq = self.next_turn_seq();
+        }
         if let Ok(mut events) = self.turn_events.lock() {
             events.push(item.clone());
         }
         if let Some(log_id) = self.current_log_id() {
+            let _ = persist_agent_log_event(&self.pool, &log_id, &item).await;
             emit_acp_event(&self.app, &self.work_item_id, &log_id, &item);
         }
     }
@@ -347,8 +368,8 @@ struct AcpClientHandler {
 }
 
 impl AcpClientHandler {
-    fn push_item(&self, item: AcpEventItem) {
-        self.shared.push_turn_event(item);
+    async fn push_item(&self, item: AcpEventItem) {
+        self.shared.push_turn_event(item).await;
     }
 
     fn validate_path(&self, path: &Path) -> AcpResult<()> {
@@ -468,7 +489,7 @@ impl Client for AcpClientHandler {
 
     async fn session_notification(&self, args: SessionNotification) -> AcpResult<()> {
         if let Some(item) = map_session_update(&args.update) {
-            self.push_item(item);
+            self.push_item(item).await;
         }
         Ok(())
     }
@@ -483,13 +504,14 @@ impl Client for AcpClientHandler {
         std::fs::write(&args.path, args.content).map_err(AcpError::into_internal_error)?;
         self.push_item(AcpEventItem {
             id: Ulid::new().to_string(),
+            seq: 0,
             kind: "tool_result".to_string(),
             content: Some(format!("Wrote {}", args.path.display())),
             tool_name: Some("fs.write_text_file".to_string()),
             tool_input: None,
             tool_call_id: None,
             ts: now_iso(),
-        });
+        }).await;
 
         Ok(WriteTextFileResponse::new())
     }
@@ -568,6 +590,7 @@ fn map_session_update(update: &SessionUpdate) -> Option<AcpEventItem> {
 
     Some(AcpEventItem {
         id: Ulid::new().to_string(),
+        seq: 0,
         kind: kind.to_string(),
         content,
         tool_name,
@@ -720,6 +743,17 @@ fn builtin_command(alias: &str) -> Result<String, String> {
     }
 }
 
+fn resolve_command_cwd(command_line: &str, worktree_cwd: &str) -> PathBuf {
+    let uses_npx_wrapper = command_line.contains("@zed-industries/claude-code-acp")
+        || command_line.contains("@zed-industries/codex-acp");
+
+    if uses_npx_wrapper {
+        return std::env::temp_dir();
+    }
+
+    PathBuf::from(worktree_cwd)
+}
+
 fn build_command(command_line: &str, cwd: &str, api_key_ref: Option<&str>, api_key: Option<&str>) -> Result<Command, String> {
     let mut command = if cfg!(target_os = "windows") {
         let mut cmd = Command::new("cmd");
@@ -738,8 +772,9 @@ fn build_command(command_line: &str, cwd: &str, api_key_ref: Option<&str>, api_k
         cmd
     };
 
+    let launch_cwd = resolve_command_cwd(command_line, cwd);
     command
-        .current_dir(cwd)
+        .current_dir(launch_cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -749,6 +784,79 @@ fn build_command(command_line: &str, cwd: &str, api_key_ref: Option<&str>, api_k
     }
 
     Ok(command)
+}
+
+fn format_acp_startup_error(message: String, stderr: String) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return message;
+    }
+
+    format!("{message}. stderr: {stderr}")
+}
+
+async fn next_log_event_seq(pool: &SqlitePool, log_id: &str) -> Result<i64, String> {
+    let row = sqlx::query("SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM agent_log_events WHERE log_id = ?")
+        .bind(log_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(row.try_get::<i64, _>("next_seq").unwrap_or(1))
+}
+
+async fn persist_agent_log_event(pool: &SqlitePool, log_id: &str, item: &AcpEventItem) -> Result<(), String> {
+    let item_json = serde_json::to_string(item).map_err(|e| e.to_string())?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO agent_log_events (id, log_id, seq, item_json, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&item.id)
+    .bind(log_id)
+    .bind(item.seq)
+    .bind(item_json)
+    .bind(&item.ts)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn append_agent_log_event(
+    pool: &SqlitePool,
+    log_id: &str,
+    mut item: AcpEventItem,
+) -> Result<AcpEventItem, String> {
+    if item.seq <= 0 {
+        item.seq = next_log_event_seq(pool, log_id).await?;
+    }
+    persist_agent_log_event(pool, log_id, &item).await?;
+    Ok(item)
+}
+
+fn normalize_legacy_events(mut events: Vec<AcpEventItem>) -> Vec<AcpEventItem> {
+    for (index, item) in events.iter_mut().enumerate() {
+        if item.seq <= 0 {
+            item.seq = (index + 1) as i64;
+        }
+    }
+    events
+}
+
+async fn get_log_events(pool: &SqlitePool, log_id: &str) -> Result<Vec<AcpEventItem>, String> {
+    let rows = sqlx::query("SELECT item_json FROM agent_log_events WHERE log_id = ? ORDER BY seq ASC")
+        .bind(log_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let item_json: String = row.try_get("item_json").map_err(|e| e.to_string())?;
+        let item: AcpEventItem = serde_json::from_str(&item_json).map_err(|e| e.to_string())?;
+        items.push(item);
+    }
+
+    Ok(items)
 }
 
 // ─── Attempt History Injection ─────────────────────────────────────────────────
@@ -1015,7 +1123,7 @@ async fn finalize_start_failure(
     log_id: &str,
     message: String,
 ) {
-    emit_error_event(&app, &work_item_id, log_id, &message);
+    append_error_event(&app, pool, &work_item_id, log_id, &message).await;
     finalize(
         &app,
         pool,
@@ -1231,6 +1339,7 @@ async fn get_or_create_session_handle(
     let permission_policy = initial_policy.unwrap_or(AgentPermissionPolicy::AllowOnce);
     let shared = SessionShared {
         app: app.clone(),
+        pool: pool.clone(),
         work_item_id: request.work_item_id.clone(),
         agent_id: request.agent_id.clone(),
         worktree_root: PathBuf::from(&request.worktree_path),
@@ -1246,6 +1355,7 @@ async fn get_or_create_session_handle(
             pending_permission: None,
         })),
         current_log_id: Arc::new(Mutex::new(None)),
+        current_log_seq: Arc::new(Mutex::new(0)),
         turn_events: Arc::new(Mutex::new(Vec::new())),
         pending_permission: Arc::new(Mutex::new(None)),
     };
@@ -1426,9 +1536,16 @@ async fn run_session_worker(
                 .await;
 
             if let Err(err) = init {
-                let _ = ready_tx.send(Err(format!("ACP initialize failed: {}", err.message)));
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                let stderr = {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    stderr_task.await.unwrap_or_default()
+                };
+                let message = format_acp_startup_error(
+                    format!("ACP initialize failed: {}", err.message),
+                    stderr,
+                );
+                let _ = ready_tx.send(Err(message));
                 return;
             }
 
@@ -1438,9 +1555,16 @@ async fn run_session_worker(
             {
                 Ok(session) => session,
                 Err(err) => {
-                    let _ = ready_tx.send(Err(format!("ACP session creation failed: {}", err.message)));
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    let stderr = {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        stderr_task.await.unwrap_or_default()
+                    };
+                    let message = format_acp_startup_error(
+                        format!("ACP session creation failed: {}", err.message),
+                        stderr,
+                    );
+                    let _ = ready_tx.send(Err(message));
                     return;
                 }
             };
@@ -1494,9 +1618,9 @@ async fn run_session_worker(
 
                                 let events = shared.take_turn_events();
                                 if turn.exit_code == 0 && events.is_empty() {
-                                    emit_error_event(&app, &request.work_item_id, &log_id, "ACP run completed without output");
+                                    append_error_event(&app, &pool, &request.work_item_id, &log_id, "ACP run completed without output").await;
                                 } else if let Some(message) = turn.error_summary.as_deref() {
-                                    emit_error_event(&app, &request.work_item_id, &log_id, message);
+                                    append_error_event(&app, &pool, &request.work_item_id, &log_id, message).await;
                                 }
 
                                 finalize(
@@ -1755,9 +1879,16 @@ async fn shutdown_all_sessions(active_sessions: &ActiveSessions) -> Result<(), S
     Ok(())
 }
 
-fn emit_error_event(app: &AppHandle, work_item_id: &str, log_id: &str, message: &str) {
+async fn append_error_event(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    work_item_id: &str,
+    log_id: &str,
+    message: &str,
+) {
     let item = AcpEventItem {
         id: Ulid::new().to_string(),
+        seq: 0,
         kind: "error".to_string(),
         content: Some(message.to_string()),
         tool_name: None,
@@ -1765,6 +1896,8 @@ fn emit_error_event(app: &AppHandle, work_item_id: &str, log_id: &str, message: 
         tool_call_id: None,
         ts: now_iso(),
     };
+    let fallback = item.clone();
+    let item = append_agent_log_event(pool, log_id, item).await.unwrap_or(fallback);
     emit_acp_event(app, work_item_id, log_id, &item);
 }
 
@@ -1895,6 +2028,11 @@ pub async fn get_acp_messages(
     db: State<'_, SqlitePool>,
     log_id: String,
 ) -> Result<Vec<AcpEventItem>, String> {
+    let persisted_events = get_log_events(db.inner(), &log_id).await?;
+    if !persisted_events.is_empty() {
+        return Ok(persisted_events);
+    }
+
     let row = sqlx::query("SELECT messages FROM agent_logs WHERE id = ?")
         .bind(&log_id)
         .fetch_optional(db.inner())
@@ -1906,7 +2044,41 @@ pub async fn get_acp_messages(
         .and_then(|r| r.try_get::<Option<String>, _>("messages").ok().flatten());
 
     match messages_json {
-        Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string()),
+        Some(json) => serde_json::from_str(&json)
+            .map(normalize_legacy_events)
+            .map_err(|e| e.to_string()),
         None => Ok(vec![]),
     }
+}
+
+#[tauri::command]
+pub async fn get_work_item_acp_events(
+    db: State<'_, SqlitePool>,
+    work_item_id: String,
+) -> Result<Vec<AcpEventItem>, String> {
+    let rows = sqlx::query(
+        "SELECT id, messages FROM agent_logs WHERE work_item_id = ? ORDER BY created_at ASC",
+    )
+    .bind(&work_item_id)
+    .fetch_all(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        let log_id: String = row.try_get("id").map_err(|e| e.to_string())?;
+        let event_rows = get_log_events(db.inner(), &log_id).await?;
+        if !event_rows.is_empty() {
+            items.extend(event_rows);
+            continue;
+        }
+
+        let messages_json: Option<String> = row.try_get("messages").ok().flatten();
+        if let Some(json) = messages_json {
+            let legacy: Vec<AcpEventItem> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            items.extend(normalize_legacy_events(legacy));
+        }
+    }
+
+    Ok(items)
 }

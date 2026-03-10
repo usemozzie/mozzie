@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{sqlite::SqliteArguments, Arguments, Row, SqlitePool};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 use ulid::Ulid;
 
@@ -123,6 +126,15 @@ fn should_skip_dir(name: &str) -> bool {
     )
 }
 
+struct RepoFileCacheEntry {
+    files: Vec<String>,
+    cached_at: Instant,
+}
+
+static REPO_FILE_CACHE: LazyLock<Mutex<HashMap<String, RepoFileCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const REPO_FILE_CACHE_TTL: Duration = Duration::from_secs(5);
+
 fn score_path(path: &str, query: &str) -> i32 {
     if query.is_empty() {
         return path.matches('/').count() as i32;
@@ -154,7 +166,6 @@ fn score_path(path: &str, query: &str) -> i32 {
 fn collect_repo_files(
     root: &Path,
     current: &Path,
-    query: &str,
     matches: &mut Vec<String>,
     visited: &mut usize,
     max_visited: usize,
@@ -186,7 +197,7 @@ fn collect_repo_files(
             if should_skip_dir(&name) {
                 continue;
             }
-            collect_repo_files(root, &path, query, matches, visited, max_visited);
+            collect_repo_files(root, &path, matches, visited, max_visited);
             continue;
         }
 
@@ -202,10 +213,113 @@ fn collect_repo_files(
         };
 
         let rel = rel.to_string_lossy().replace('\\', "/");
-        if query.is_empty() || rel.to_lowercase().contains(&query.to_lowercase()) {
-            matches.push(rel);
+        matches.push(rel);
+    }
+}
+
+fn list_rg_repo_files(root: &Path) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("rg")
+        .current_dir(root)
+        .args([
+            "--files",
+            "--hidden",
+            "--glob",
+            "!.git",
+            "--glob",
+            "!node_modules",
+            "--glob",
+            "!target",
+            "--glob",
+            "!dist",
+            "--glob",
+            "!build",
+            "--glob",
+            "!.next",
+            "--glob",
+            "!.turbo",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to list repo files with rg: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("rg error: {stderr}"));
+    }
+
+    let files = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.replace('\\', "/"))
+        .collect();
+
+    Ok(files)
+}
+
+fn list_git_repo_files(root: &Path) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .output()
+        .map_err(|e| format!("Failed to list repo files: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git error: {stderr}"));
+    }
+
+    let files = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            if entry.is_empty() {
+                return None;
+            }
+            Some(String::from_utf8_lossy(entry).replace('\\', "/"))
+        })
+        .collect();
+
+    Ok(files)
+}
+
+fn list_repo_files(root: &Path) -> Vec<String> {
+    if let Ok(files) = list_rg_repo_files(root) {
+        return files;
+    }
+
+    if let Ok(files) = list_git_repo_files(root) {
+        return files;
+    }
+
+    let mut matches = Vec::new();
+    let mut visited = 0usize;
+    collect_repo_files(root, root, &mut matches, &mut visited, 20_000);
+    matches
+}
+
+fn load_repo_files(root: &Path) -> Vec<String> {
+    let cache_key = root.to_string_lossy().to_string();
+
+    if let Ok(cache) = REPO_FILE_CACHE.lock() {
+        if let Some(entry) = cache.get(&cache_key) {
+            if entry.cached_at.elapsed() <= REPO_FILE_CACHE_TTL {
+                return entry.files.clone();
+            }
         }
     }
+
+    let files = list_repo_files(root);
+
+    if let Ok(mut cache) = REPO_FILE_CACHE.lock() {
+        cache.insert(
+            cache_key,
+            RepoFileCacheEntry {
+                files: files.clone(),
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    files
 }
 
 const SELECT_COLS: &str = r#"
@@ -262,6 +376,11 @@ pub async fn create_work_item(
     let parent_id = parent_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let initial_status = if repo_path.is_some() && assigned_agent.is_some() {
+        "ready"
+    } else {
+        "draft"
+    };
 
     // Validate parent: must exist and must not itself be a child (single-level nesting only).
     if let Some(ref pid) = parent_id {
@@ -294,7 +413,7 @@ pub async fn create_work_item(
         r#"INSERT INTO work_items (
             id, title, context, execution_context, orchestrator_note, duplicate_of_work_item_id, duplicate_policy, intent_type, status, repo_path, source_branch, branch_name, worktree_path,
             assigned_agent, terminal_slot, parent_id, workspace_id, created_at, updated_at, started_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL)"#,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL)"#,
     )
     .bind(&id)
     .bind(&title)
@@ -304,6 +423,7 @@ pub async fn create_work_item(
     .bind(&duplicate_of_work_item_id)
     .bind(&duplicate_policy)
     .bind(&intent_type)
+    .bind(&initial_status)
     .bind(&repo_path)
     .bind(&source_branch)
     .bind(&branch_name)
@@ -837,6 +957,12 @@ pub async fn delete_work_item(
         ) {
             let _ = remove_worktree_internal(wp, rp, bn);
         }
+        let _ = sqlx::query(
+            "DELETE FROM agent_log_events WHERE log_id IN (SELECT id FROM agent_logs WHERE work_item_id = ?)"
+        )
+        .bind(&child.id)
+        .execute(db.inner())
+        .await;
         let _ = sqlx::query("DELETE FROM agent_logs WHERE work_item_id = ?").bind(&child.id).execute(db.inner()).await;
         let _ = sqlx::query("DELETE FROM work_item_attempts WHERE work_item_id = ?").bind(&child.id).execute(db.inner()).await;
         let _ = sqlx::query("DELETE FROM work_item_dependencies WHERE work_item_id = ? OR depends_on_id = ?").bind(&child.id).bind(&child.id).execute(db.inner()).await;
@@ -858,6 +984,12 @@ pub async fn delete_work_item(
                 .map_err(|e| format!("Failed to remove worktree directory: {e}"))?;
         }
     }
+
+    sqlx::query("DELETE FROM agent_log_events WHERE log_id IN (SELECT id FROM agent_logs WHERE work_item_id = ?)")
+        .bind(&id)
+        .execute(db.inner())
+        .await
+        .map_err(|e| e.to_string())?;
 
     sqlx::query("DELETE FROM agent_logs WHERE work_item_id = ?")
         .bind(&id)
@@ -917,9 +1049,11 @@ pub async fn search_repo_files(
     let root = std::fs::canonicalize(root)
         .map_err(|e| format!("Failed to access selected repo: {e}"))?;
 
-    let mut matches = Vec::new();
-    let mut visited = 0usize;
-    collect_repo_files(&root, &root, &query, &mut matches, &mut visited, 5000);
+    let query_lc = query.to_lowercase();
+    let mut matches: Vec<String> = load_repo_files(&root)
+        .into_iter()
+        .filter(|path| query_lc.is_empty() || path.to_lowercase().contains(&query_lc))
+        .collect();
 
     matches.sort_by(|a, b| {
         let sa = score_path(a, &query);

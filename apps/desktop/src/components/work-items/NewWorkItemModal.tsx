@@ -9,7 +9,7 @@ import { useWorkItemStore } from '../../stores/workItemStore';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Select } from '../ui/select';
-import { AtReferenceTextarea } from './AtReferenceTextarea';
+import { WorkItemDescriptionEditor } from './WorkItemDescriptionEditor';
 
 interface NewWorkItemModalProps {
   onClose: () => void;
@@ -247,12 +247,14 @@ export function NewWorkItemModal({ onClose, initialContext }: NewWorkItemModalPr
 
           <div className="space-y-1">
             <label className="text-xs text-text-muted font-medium">What Should Be Done</label>
-            <AtReferenceTextarea
+            <WorkItemDescriptionEditor
               value={context}
               onChange={setContext}
               repoPath={repoPath}
               placeholder="Describe what should be done. Use @path/to/file.tsx to include files from the selected repo."
-              rows={5}
+              rows={8}
+              maxRows={14}
+              editorClassName="min-h-[180px]"
             />
           </div>
         </div>

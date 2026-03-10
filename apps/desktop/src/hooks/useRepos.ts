@@ -36,3 +36,22 @@ export function usePrepareRepo() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['repos'] }),
   });
 }
+
+export function useCheckoutRepoBranch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      branchName,
+    }: {
+      id: string;
+      repoPath: string;
+      branchName: string;
+    }) => invoke<Repo>('checkout_repo_branch', { id, branchName }),
+    onSuccess: (_repo, variables) => {
+      qc.invalidateQueries({ queryKey: ['repos'] });
+      qc.invalidateQueries({ queryKey: ['repo_branch', variables.repoPath] });
+      qc.invalidateQueries({ queryKey: ['repo_branches', variables.repoPath] });
+    },
+  });
+}

@@ -61,6 +61,14 @@ fn current_branch_name(path: &str) -> Result<String, String> {
     run_git(path, &["symbolic-ref", "--short", "HEAD"])
 }
 
+fn resolve_active_branch(path: &str, stored_branch: Option<String>) -> Option<String> {
+    current_branch_name(path)
+        .ok()
+        .filter(|branch| !branch.is_empty() && branch != "HEAD")
+        .or(stored_branch)
+        .or_else(|| detect_default_branch(path))
+}
+
 fn initialize_empty_repo(path: &str) -> Result<(), String> {
     if repo_has_commits(path) {
         return Ok(());
@@ -104,6 +112,7 @@ async fn fetch_repo_by_id(pool: &SqlitePool, id: &str) -> Result<Repo, String> {
         .await
         .map_err(|e| e.to_string())?;
     repo.needs_prepare = !repo_has_commits(&repo.path);
+    repo.default_branch = resolve_active_branch(&repo.path, repo.default_branch.clone());
     Ok(repo)
 }
 
@@ -135,6 +144,7 @@ pub async fn list_repos(
 
     for repo in &mut repos {
         repo.needs_prepare = !repo_has_commits(&repo.path);
+        repo.default_branch = resolve_active_branch(&repo.path, repo.default_branch.clone());
     }
 
     Ok(repos)
@@ -188,6 +198,34 @@ pub async fn prepare_repo(id: String, pool: State<'_, SqlitePool>) -> Result<Rep
 
     sqlx::query("UPDATE repos SET default_branch = ? WHERE id = ?")
         .bind(&default_branch)
+        .bind(&id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    fetch_repo_by_id(pool.inner(), &id).await
+}
+
+#[tauri::command]
+pub async fn checkout_repo_branch(
+    id: String,
+    branch_name: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<Repo, String> {
+    let repo = fetch_repo_by_id(pool.inner(), &id).await?;
+    if repo.needs_prepare {
+        return Err("Prepare the repository before switching branches.".to_string());
+    }
+
+    let branch_name = branch_name.trim().to_string();
+    if branch_name.is_empty() {
+        return Err("Branch name cannot be empty.".to_string());
+    }
+
+    run_git(&repo.path, &["checkout", &branch_name])?;
+
+    sqlx::query("UPDATE repos SET default_branch = ?, last_used_at = datetime('now') WHERE id = ?")
+        .bind(&branch_name)
         .bind(&id)
         .execute(pool.inner())
         .await
