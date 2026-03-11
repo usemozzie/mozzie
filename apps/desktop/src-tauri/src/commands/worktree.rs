@@ -475,12 +475,31 @@ fn compute_review_state(work_item: &WorkItemGitInfo) -> WorkItemReviewState {
         }
         _ => (0, 0),
     };
-    let needs_push = branch_present && (!remote_branch_exists || ahead_count > 0);
+    // Check for uncommitted changes in the worktree — these will become a
+    // commit before push, so the branch effectively "needs push" even when
+    // ahead_count is currently 0.
+    let has_uncommitted = worktree_present && worktree_path
+        .map(|path| {
+            run_git(&["-C", path, "status", "--porcelain"])
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let needs_push = branch_present && (!remote_branch_exists || ahead_count > 0 || has_uncommitted);
     let can_push = branch_present && (!remote_branch_exists || behind_count == 0);
     let push_summary = if !branch_present {
         "The work item branch is missing.".to_string()
     } else if !remote_branch_exists {
         "This branch has not been pushed to GitHub yet.".to_string()
+    } else if has_uncommitted {
+        format!(
+            "Uncommitted changes will be committed and pushed{}.",
+            if ahead_count > 0 {
+                format!(" (plus {ahead_count} existing commit(s))")
+            } else {
+                String::new()
+            }
+        )
     } else if ahead_count > 0 && behind_count > 0 {
         format!(
             "This branch has diverged from origin (ahead {ahead_count}, behind {behind_count})."
