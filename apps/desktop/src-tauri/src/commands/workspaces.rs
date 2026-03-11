@@ -7,6 +7,8 @@ use ulid::Ulid;
 pub struct Workspace {
     pub id: String,
     pub name: String,
+    pub git_user_name: Option<String>,
+    pub git_user_email: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -20,7 +22,7 @@ fn now_iso() -> String {
 #[tauri::command]
 pub async fn list_workspaces(pool: State<'_, SqlitePool>) -> Result<Vec<Workspace>, String> {
     sqlx::query_as::<_, Workspace>(
-        "SELECT id, name, created_at, updated_at FROM workspaces ORDER BY created_at ASC",
+        "SELECT id, name, git_user_name, git_user_email, created_at, updated_at FROM workspaces ORDER BY created_at ASC",
     )
     .fetch_all(pool.inner())
     .await
@@ -49,7 +51,7 @@ pub async fn create_workspace(
         .await
         .map_err(|e| e.to_string())?;
 
-    sqlx::query_as::<_, Workspace>("SELECT id, name, created_at, updated_at FROM workspaces WHERE id = ?")
+    sqlx::query_as::<_, Workspace>("SELECT id, name, git_user_name, git_user_email, created_at, updated_at FROM workspaces WHERE id = ?")
         .bind(&id)
         .fetch_one(pool.inner())
         .await
@@ -80,11 +82,78 @@ pub async fn rename_workspace(
         return Err(format!("Workspace '{}' not found", id));
     }
 
-    sqlx::query_as::<_, Workspace>("SELECT id, name, created_at, updated_at FROM workspaces WHERE id = ?")
+    sqlx::query_as::<_, Workspace>("SELECT id, name, git_user_name, git_user_email, created_at, updated_at FROM workspaces WHERE id = ?")
         .bind(&id)
         .fetch_one(pool.inner())
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn update_workspace_git_identity(
+    pool: State<'_, SqlitePool>,
+    id: String,
+    git_user_name: Option<String>,
+    git_user_email: Option<String>,
+) -> Result<Workspace, String> {
+    let name = git_user_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let email = git_user_email
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let now = now_iso();
+
+    let result = sqlx::query(
+        "UPDATE workspaces SET git_user_name = ?, git_user_email = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&name)
+    .bind(&email)
+    .bind(&now)
+    .bind(&id)
+    .execute(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if result.rows_affected() == 0 {
+        return Err(format!("Workspace '{}' not found", id));
+    }
+
+    sqlx::query_as::<_, Workspace>(
+        "SELECT id, name, git_user_name, git_user_email, created_at, updated_at FROM workspaces WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(pool.inner())
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Fetch git identity configs for a workspace. Returns configs suitable for
+/// `run_git_with_configs`. If no workspace identity is set, returns empty vec
+/// so git falls through to the repo's own config.
+pub(crate) async fn get_workspace_git_configs(
+    pool: &SqlitePool,
+    workspace_id: &str,
+) -> Vec<String> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT git_user_name, git_user_email FROM workspaces WHERE id = ?",
+    )
+    .bind(workspace_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let mut configs = Vec::new();
+    if let Some((name, email)) = row {
+        if let Some(n) = name.filter(|s| !s.is_empty()) {
+            configs.push(format!("user.name={n}"));
+        }
+        if let Some(e) = email.filter(|s| !s.is_empty()) {
+            configs.push(format!("user.email={e}"));
+        }
+    }
+    configs
 }
 
 #[tauri::command]

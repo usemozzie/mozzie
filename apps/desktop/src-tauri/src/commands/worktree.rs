@@ -53,6 +53,7 @@ pub(crate) struct WorkItemGitInfo {
     branch_name: Option<String>,
     worktree_path: Option<String>,
     parent_id: Option<String>,
+    workspace_id: String,
 }
 
 fn worktrees_base() -> PathBuf {
@@ -338,16 +339,17 @@ fn normalize_no_index_diff_paths(diff: &str, relative_path: &str) -> String {
         .join("\n")
 }
 
-fn commit_pending_changes(worktree_path: &str, branch_name: &str) -> Result<bool, String> {
+fn commit_pending_changes(worktree_path: &str, branch_name: &str, git_configs: &[String]) -> Result<bool, String> {
     let status = run_git(&["-C", worktree_path, "status", "--porcelain"])?;
     if status.is_empty() {
         return Ok(false);
     }
 
     run_git(&["-C", worktree_path, "add", "-A"])?;
+    let config_refs: Vec<&str> = git_configs.iter().map(|s| s.as_str()).collect();
     run_git_with_configs(
         worktree_path,
-        &["user.name=Mozzie", "user.email=mozzie@local"],
+        &config_refs,
         &["commit", "--no-verify", "-m", &format!("Mozzie: checkpoint {branch_name}")],
     )?;
     Ok(true)
@@ -368,10 +370,11 @@ fn merge_branch_internal(
     worktree_path: &str,
     source_branch: &str,
     branch_name: &str,
+    git_configs: &[String],
 ) -> Result<(), String> {
     // Commit pending changes BEFORE checking merge status — otherwise
     // uncommitted work causes is_branch_merged to return a false positive.
-    let _ = commit_pending_changes(worktree_path, branch_name);
+    let _ = commit_pending_changes(worktree_path, branch_name, git_configs);
 
     if is_branch_merged(repo_path, branch_name, source_branch)? {
         return Ok(());
@@ -413,7 +416,7 @@ fn merge_branch_internal(
 
 async fn fetch_work_item_git_info(pool: &SqlitePool, work_item_id: &str) -> Result<WorkItemGitInfo, String> {
     sqlx::query(
-        "SELECT id, status, repo_path, source_branch, branch_name, worktree_path, parent_id FROM work_items WHERE id = ?",
+        "SELECT id, status, repo_path, source_branch, branch_name, worktree_path, parent_id, workspace_id FROM work_items WHERE id = ?",
     )
     .bind(work_item_id)
     .fetch_optional(pool)
@@ -427,6 +430,7 @@ async fn fetch_work_item_git_info(pool: &SqlitePool, work_item_id: &str) -> Resu
         branch_name: row.try_get("branch_name").ok().flatten(),
         worktree_path: row.try_get("worktree_path").ok().flatten(),
         parent_id: row.try_get("parent_id").ok().flatten(),
+        workspace_id: row.try_get::<String, _>("workspace_id").unwrap_or_else(|_| "default".to_string()),
     })
     .ok_or_else(|| format!("Work item {work_item_id} not found"))
 }
@@ -656,12 +660,16 @@ pub async fn get_diff(
 
 #[tauri::command]
 pub async fn merge_branch(
+    db: State<'_, SqlitePool>,
     repo_path: String,
     worktree_path: String,
     source_branch: String,
     branch_name: String,
+    workspace_id: Option<String>,
 ) -> Result<(), String> {
-    merge_branch_internal(&repo_path, &worktree_path, &source_branch, &branch_name)
+    let ws = workspace_id.unwrap_or_else(|| "default".to_string());
+    let git_configs = crate::commands::workspaces::get_workspace_git_configs(db.inner(), &ws).await;
+    merge_branch_internal(&repo_path, &worktree_path, &source_branch, &branch_name, &git_configs)
 }
 
 pub(crate) async fn ensure_top_level_worktree(
@@ -755,9 +763,15 @@ pub async fn approve_work_item_review(
         ));
     }
 
+    let git_configs = crate::commands::workspaces::get_workspace_git_configs(
+        db.inner(),
+        &work_item.workspace_id,
+    )
+    .await;
+
     // Commit any uncommitted work so the merge/push includes everything the agent produced.
     if let Some(worktree_path) = worktree_path.filter(|path| has_valid_worktree(path)) {
-        let _ = commit_pending_changes(worktree_path, branch_name);
+        let _ = commit_pending_changes(worktree_path, branch_name, &git_configs);
     }
 
     if let Some(ref parent_id) = work_item.parent_id {
@@ -771,7 +785,7 @@ pub async fn approve_work_item_review(
             .ok_or("Child work item has no worktree_path")?;
 
         // Merge child branch into parent branch
-        merge_branch_internal(repo_path, child_worktree_path, parent_branch, branch_name)?;
+        merge_branch_internal(repo_path, child_worktree_path, parent_branch, branch_name, &git_configs)?;
 
         // Clean up the child's worktree
         let _ = remove_worktree_internal(child_worktree_path, repo_path, branch_name);

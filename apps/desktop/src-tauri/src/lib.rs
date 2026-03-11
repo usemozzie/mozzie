@@ -243,6 +243,18 @@ pub fn run() {
                     .execute(&pool)
                     .await?;
 
+                // Add git identity columns to workspaces (idempotent).
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE workspaces ADD COLUMN git_user_name TEXT;"
+                )
+                .execute(&pool)
+                .await;
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE workspaces ADD COLUMN git_user_email TEXT;"
+                )
+                .execute(&pool)
+                .await;
+
                 // On every startup, reset work items that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
                 // restarts, so queued/running work items would be stuck indefinitely.
@@ -330,6 +342,7 @@ pub fn run() {
             commands::workspaces::list_workspaces,
             commands::workspaces::create_workspace,
             commands::workspaces::rename_workspace,
+            commands::workspaces::update_workspace_git_identity,
             commands::workspaces::delete_workspace,
             // Notes
             commands::notes::get_workspace_notes,

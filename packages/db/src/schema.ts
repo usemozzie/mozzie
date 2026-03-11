@@ -92,6 +92,8 @@ export interface Repo {
 export interface Workspace {
   id: string;
   name: string;
+  git_user_name: string | null;
+  git_user_email: string | null;
   created_at: string;
   updated_at: string;
 }

@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { X, Key, Bot, Info } from 'lucide-react';
+import { X, Key, Bot, GitBranch, Info } from 'lucide-react';
 import { AgentConfigSection } from './AgentConfigForm';
 import { OrchestratorConfigSection } from './OrchestratorConfigSection';
+import { GitIdentitySection } from './GitIdentitySection';
 
 interface SettingsPanelProps {
   onClose: () => void;
@@ -10,6 +11,7 @@ interface SettingsPanelProps {
 const TABS = [
   { id: 'api-keys', label: 'API Keys', icon: Key },
   { id: 'agents', label: 'Agents', icon: Bot },
+  { id: 'git', label: 'Git', icon: GitBranch },
   { id: 'about', label: 'About', icon: Info },
 ] as const;
 
@@ -82,6 +84,8 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
             <AgentConfigSection />
           </div>
         )}
+
+        {activeTab === 'git' && <GitIdentitySection />}
 
         {activeTab === 'about' && (
           <div className="space-y-3">

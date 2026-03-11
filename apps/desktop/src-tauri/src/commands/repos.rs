@@ -69,25 +69,19 @@ fn resolve_active_branch(path: &str, stored_branch: Option<String>) -> Option<St
         .or_else(|| detect_default_branch(path))
 }
 
-fn initialize_empty_repo(path: &str) -> Result<(), String> {
+fn initialize_empty_repo(path: &str, git_configs: &[String]) -> Result<(), String> {
     if repo_has_commits(path) {
         return Ok(());
     }
 
     let _branch_name = current_branch_name(path)?;
-    run_git(
-        path,
-        &[
-            "-c",
-            "user.name=Mozzie",
-            "-c",
-            "user.email=mozzie@local",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "Initial commit",
-        ],
-    )?;
+    let mut args: Vec<&str> = Vec::new();
+    for config in git_configs {
+        args.push("-c");
+        args.push(config.as_str());
+    }
+    args.extend_from_slice(&["commit", "--allow-empty", "-m", "Initial commit"]);
+    run_git(path, &args)?;
 
     Ok(())
 }
@@ -167,11 +161,12 @@ pub async fn add_repo(
         return Err(format!("Not a git repository: {}", path));
     }
 
-    initialize_empty_repo(&path)?;
+    let ws = workspace_id.unwrap_or_else(|| "default".to_string());
+    let git_configs = crate::commands::workspaces::get_workspace_git_configs(pool.inner(), &ws).await;
+    initialize_empty_repo(&path, &git_configs)?;
 
     // Detect default branch
     let default_branch = detect_default_branch(&path);
-    let ws = workspace_id.unwrap_or_else(|| "default".to_string());
 
     let id = ulid::Ulid::new().to_string();
     sqlx::query(
@@ -193,7 +188,8 @@ pub async fn add_repo(
 pub async fn prepare_repo(id: String, pool: State<'_, SqlitePool>) -> Result<Repo, String> {
     let repo = fetch_repo_by_id(pool.inner(), &id).await?;
 
-    initialize_empty_repo(&repo.path)?;
+    let git_configs = crate::commands::workspaces::get_workspace_git_configs(pool.inner(), &repo.workspace_id).await;
+    initialize_empty_repo(&repo.path, &git_configs)?;
     let default_branch = detect_default_branch(&repo.path);
 
     sqlx::query("UPDATE repos SET default_branch = ? WHERE id = ?")

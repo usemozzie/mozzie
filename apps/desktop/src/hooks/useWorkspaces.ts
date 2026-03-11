@@ -28,6 +28,22 @@ export function useRenameWorkspace() {
   });
 }
 
+export function useUpdateWorkspaceGitIdentity() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      gitUserName,
+      gitUserEmail,
+    }: {
+      id: string;
+      gitUserName: string | null;
+      gitUserEmail: string | null;
+    }) => invoke<Workspace>('update_workspace_git_identity', { id, gitUserName, gitUserEmail }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [WORKSPACES_KEY] }),
+  });
+}
+
 export function useDeleteWorkspace() {
   const qc = useQueryClient();
   return useMutation({
