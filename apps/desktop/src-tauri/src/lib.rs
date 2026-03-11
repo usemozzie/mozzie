@@ -3,92 +3,12 @@ mod commands;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::SqlitePool;
 use tauri::Manager;
-use tauri_plugin_sql::{Migration, MigrationKind};
 
 pub fn run() {
-    let migrations = vec![
-        Migration {
-            version: 1,
-            description: "create_work_items_table",
-            sql: include_str!("../migrations/001_tickets.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 2,
-            description: "create_agent_logs_table",
-            sql: include_str!("../migrations/002_agent_logs.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 3,
-            description: "create_agent_config_table",
-            sql: include_str!("../migrations/003_agent_config.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 4,
-            description: "create_repos_table",
-            sql: include_str!("../migrations/004_repos.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 5,
-            description: "create_workspaces",
-            sql: include_str!("../migrations/005_workspaces.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 6,
-            description: "create_work_item_dependencies",
-            sql: include_str!("../migrations/006_ticket_dependencies.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 7,
-            description: "orchestrator_v3_metadata",
-            sql: include_str!("../migrations/007_orchestrator_v3.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 8,
-            description: "create_work_item_attempts",
-            sql: include_str!("../migrations/008_attempt_history.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 9,
-            description: "create_conversations",
-            sql: include_str!("../migrations/009_conversations.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 10,
-            description: "rename_ticket_to_work_item",
-            sql: include_str!("../migrations/010_rename_ticket_to_work_item.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 11,
-            description: "sub_work_items",
-            sql: include_str!("../migrations/011_sub_work_items.sql"),
-            kind: MigrationKind::Up,
-        },
-        Migration {
-            version: 12,
-            description: "agent_log_events",
-            sql: include_str!("../migrations/012_agent_log_events.sql"),
-            kind: MigrationKind::Up,
-        },
-    ];
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .plugin(
-            tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:mozzie.db", migrations)
-                .build(),
-        )
+        .plugin(tauri_plugin_sql::Builder::default().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
@@ -101,34 +21,55 @@ pub fn run() {
                 let pool = SqlitePool::connect_with(opts).await?;
 
                 // Run migrations eagerly so tables exist before any Rust command fires.
-                // tauri-plugin-sql only runs migrations when the frontend calls
-                // Database.load(), which may happen after the first invoke.
+                // Keep SQLx as the single migration path; registering the same SQL with
+                // tauri-plugin-sql causes legacy ticket -> work_item upgrades to race with
+                // fresh-table creation and fail during startup.
 
-                // If upgrading from a pre-v10 database, rename ticket → work_item tables/columns
-                // BEFORE running any other migrations (which now reference the new names).
-                // A previous failed startup may have created an empty `work_items` table via
-                // CREATE TABLE IF NOT EXISTS while `tickets` still existed — drop it first.
+                // Handle legacy "tickets" table from older app versions.
                 let has_tickets_table: i32 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tickets'"
                 )
                 .fetch_one(&pool)
                 .await
                 .unwrap_or(0);
-                if has_tickets_table > 0 {
-                    // Drop accidental empty work_items table if it exists alongside tickets
-                    let _ = sqlx::raw_sql("DROP TABLE IF EXISTS work_items")
+                let has_work_items_table: i32 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='work_items'"
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+
+                if has_tickets_table > 0 && has_work_items_table > 0 {
+                    // Both tables exist — the old installed app created a stale `tickets`
+                    // table alongside the real `work_items`. Just drop the stale one.
+                    let _ = sqlx::raw_sql("DROP TABLE IF EXISTS tickets")
                         .execute(&pool)
                         .await;
-                    // Same for dependency/attempt tables that may have been created with new names
+                    let _ = sqlx::raw_sql("DROP TABLE IF EXISTS ticket_dependencies")
+                        .execute(&pool)
+                        .await;
+                    let _ = sqlx::raw_sql("DROP TABLE IF EXISTS ticket_attempts")
+                        .execute(&pool)
+                        .await;
+                } else if has_tickets_table > 0 {
+                    // Only `tickets` exists (genuine pre-rename database) — rename in place.
                     let _ = sqlx::raw_sql("DROP TABLE IF EXISTS work_item_dependencies")
                         .execute(&pool)
                         .await;
                     let _ = sqlx::raw_sql("DROP TABLE IF EXISTS work_item_attempts")
                         .execute(&pool)
                         .await;
-                    sqlx::raw_sql(include_str!("../migrations/010_rename_ticket_to_work_item.sql"))
-                        .execute(&pool)
-                        .await?;
+                    sqlx::raw_sql(
+                        "ALTER TABLE tickets RENAME TO work_items;\
+                         ALTER TABLE work_items RENAME COLUMN duplicate_of_ticket_id TO duplicate_of_work_item_id;\
+                         ALTER TABLE agent_logs RENAME COLUMN ticket_id TO work_item_id;\
+                         ALTER TABLE ticket_dependencies RENAME TO work_item_dependencies;\
+                         ALTER TABLE work_item_dependencies RENAME COLUMN ticket_id TO work_item_id;\
+                         ALTER TABLE ticket_attempts RENAME TO work_item_attempts;\
+                         ALTER TABLE work_item_attempts RENAME COLUMN ticket_id TO work_item_id;"
+                    )
+                    .execute(&pool)
+                    .await?;
                 }
 
                 sqlx::raw_sql(include_str!("../migrations/001_tickets.sql"))
