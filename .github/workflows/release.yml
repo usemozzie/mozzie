@@ -109,7 +109,7 @@ jobs:
       # ── Step 1: Build the .app (without Tauri signing — we sign manually) ──
       - name: Build Tauri app
         working-directory: apps/desktop
-        run: pnpm tauri build --target ${{ matrix.target }}
+        run: pnpm tauri build --target ${{ matrix.target }} --bundles app
 
       # ── Step 2: Deep-sign the .app with hardened runtime ──
       - name: Codesign .app
