@@ -6,6 +6,13 @@ Mozzie is a local-first desktop app that turns AI coding agents into a managed w
 
 If you want a personal build team that runs on your machine with zero cloud dependency, this is it.
 
+<div align="center">
+  <a href="https://youtu.be/RIr4572P3Ys">
+    <img src="https://img.youtube.com/vi/RIr4572P3Ys/maxresdefault.jpg" alt="Mozzie Demo" width="720" />
+  </a>
+  <p><em>Watch Mozzie in action</em></p>
+</div>
+
 [Getting Started](#quick-start) · [How It Works](#how-it-works) · [Features](#everything-we-built-so-far) · [Architecture](#architecture) · [Development](#development)
 
 ## Quick start
