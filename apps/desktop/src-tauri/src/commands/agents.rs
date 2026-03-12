@@ -108,7 +108,7 @@ pub struct AcpEventItem {
     pub id: String,
     #[serde(default)]
     pub seq: i64,
-    /// "text" | "text_delta" | "tool_call" | "tool_result" | "error" | "done"
+    /// "text" | "text_delta" | "tool_call" | "tool_result" | "error" | "done" | "user_message"
     pub kind: String,
     pub content: Option<String>,
     pub tool_name: Option<String>,
@@ -155,6 +155,16 @@ pub struct AgentSessionState {
     pub idle_deadline_at: String,
     pub permission_policy: AgentPermissionPolicy,
     pub pending_permission: Option<AgentPermissionRequestState>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct WorkItemChatMessage {
+    id: String,
+    work_item_id: String,
+    role: String,
+    content: String,
+    agent_log_id: Option<String>,
+    created_at: String,
 }
 
 struct PendingPermissionDecision {
@@ -1031,13 +1041,12 @@ struct AgentTurnRequest {
     model: Option<String>,
 }
 
-async fn build_turn_request(
+async fn build_agent_turn_request_base(
     pool: &SqlitePool,
     work_item_id: &str,
-    extra_instruction: Option<String>,
 ) -> Result<AgentTurnRequest, String> {
     let row = sqlx::query(
-        "SELECT context, execution_context, worktree_path, assigned_agent FROM work_items WHERE id = ?",
+        "SELECT worktree_path, assigned_agent FROM work_items WHERE id = ?",
     )
     .bind(work_item_id)
     .fetch_optional(pool)
@@ -1045,8 +1054,6 @@ async fn build_turn_request(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| format!("Work item {} not found", work_item_id))?;
 
-    let context: Option<String> = row.try_get("context").ok().flatten();
-    let execution_context: Option<String> = row.try_get("execution_context").ok().flatten();
     let worktree_path: Option<String> = row.try_get("worktree_path").ok().flatten();
     let assigned_agent: Option<String> = row.try_get("assigned_agent").ok().flatten();
 
@@ -1063,29 +1070,6 @@ async fn build_turn_request(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| format!("Agent config '{}' not found", agent_id))?;
 
-    let base_prompt = execution_context
-        .filter(|s| !s.trim().is_empty())
-        .or(context.filter(|s| !s.trim().is_empty()))
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| "Work item is missing executable context".to_string())?;
-
-    // Inject attempt history so agents learn from prior rejections.
-    let attempt_history = build_attempt_history_section(pool, &work_item_id).await;
-    let base_prompt = if attempt_history.is_empty() {
-        base_prompt
-    } else {
-        format!("{base_prompt}\n\n{attempt_history}")
-    };
-
-    let full_prompt = match extra_instruction {
-        Some(message) if !message.trim().is_empty() => format!(
-            "{base_prompt}\n\nContinue from the current worktree state.\n\nFollow-up user message:\n{}",
-            message.trim()
-        ),
-        _ => base_prompt,
-    };
-    let full_prompt = expand_prompt_with_file_refs(&full_prompt, &worktree_path)?;
-
     let api_key = agent
         .api_key_ref
         .as_deref()
@@ -1095,12 +1079,322 @@ async fn build_turn_request(
         work_item_id: work_item_id.to_string(),
         agent_id,
         acp_target: agent.acp_url,
-        prompt: full_prompt,
+        prompt: String::new(),
         worktree_path,
         api_key_ref: agent.api_key_ref.clone(),
         api_key,
         model: agent.model,
     })
+}
+
+async fn build_work_item_base_prompt(
+    pool: &SqlitePool,
+    work_item_id: &str,
+) -> Result<String, String> {
+    let row = sqlx::query(
+        "SELECT context, execution_context FROM work_items WHERE id = ?",
+    )
+    .bind(work_item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("Work item {} not found", work_item_id))?;
+
+    let context: Option<String> = row.try_get("context").ok().flatten();
+    let execution_context: Option<String> = row.try_get("execution_context").ok().flatten();
+
+    let base_prompt = execution_context
+        .filter(|s| !s.trim().is_empty())
+        .or(context.filter(|s| !s.trim().is_empty()))
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "Work item is missing executable context".to_string())?;
+
+    let attempt_history = build_attempt_history_section(pool, &work_item_id).await;
+    Ok(if attempt_history.is_empty() {
+        base_prompt
+    } else {
+        format!("{base_prompt}\n\n{attempt_history}")
+    })
+}
+
+async fn build_turn_request(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    extra_instruction: Option<String>,
+) -> Result<AgentTurnRequest, String> {
+    let mut request = build_agent_turn_request_base(pool, work_item_id).await?;
+    let base_prompt = build_work_item_base_prompt(pool, work_item_id).await?;
+
+    let full_prompt = match extra_instruction {
+        Some(message) if !message.trim().is_empty() => format!(
+            "{base_prompt}\n\nContinue from the current worktree state.\n\nFollow-up user message:\n{}",
+            message.trim()
+        ),
+        _ => base_prompt,
+    };
+    request.prompt = expand_prompt_with_file_refs(&full_prompt, &request.worktree_path)?;
+    Ok(request)
+}
+
+async fn list_work_item_chat_messages(
+    pool: &SqlitePool,
+    work_item_id: &str,
+) -> Result<Vec<WorkItemChatMessage>, String> {
+    sqlx::query_as::<_, WorkItemChatMessage>(
+        "SELECT id, work_item_id, role, content, agent_log_id, created_at \
+         FROM work_item_chat_messages WHERE work_item_id = ? ORDER BY created_at ASC",
+    )
+    .bind(work_item_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn insert_work_item_chat_message(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    role: &str,
+    content: &str,
+    agent_log_id: Option<&str>,
+    created_at: Option<&str>,
+) -> Result<Option<WorkItemChatMessage>, String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let record = WorkItemChatMessage {
+        id: Ulid::new().to_string(),
+        work_item_id: work_item_id.to_string(),
+        role: role.to_string(),
+        content: trimmed.to_string(),
+        agent_log_id: agent_log_id.map(str::to_string),
+        created_at: created_at
+            .map(str::to_string)
+            .unwrap_or_else(now_iso),
+    };
+
+    sqlx::query(
+        "INSERT INTO work_item_chat_messages (id, work_item_id, role, content, agent_log_id, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&record.id)
+    .bind(&record.work_item_id)
+    .bind(&record.role)
+    .bind(&record.content)
+    .bind(&record.agent_log_id)
+    .bind(&record.created_at)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(Some(record))
+}
+
+async fn work_item_has_chat_messages(pool: &SqlitePool, work_item_id: &str) -> Result<bool, String> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM work_item_chat_messages WHERE work_item_id = ?",
+    )
+    .bind(work_item_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(count > 0)
+}
+
+async fn work_item_has_resume_history(pool: &SqlitePool, work_item_id: &str) -> Result<bool, String> {
+    if work_item_has_chat_messages(pool, work_item_id).await? {
+        return Ok(true);
+    }
+
+    let log_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM agent_logs WHERE work_item_id = ?",
+    )
+    .bind(work_item_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if log_count > 0 {
+        return Ok(true);
+    }
+
+    let started_at = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT started_at FROM work_items WHERE id = ?",
+    )
+    .bind(work_item_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .flatten();
+
+    Ok(started_at
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false))
+}
+
+async fn ensure_work_item_chat_bootstrap(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    if work_item_has_chat_messages(pool, work_item_id).await? {
+        return Ok(());
+    }
+
+    insert_work_item_chat_message(pool, work_item_id, "system", prompt, None, None)
+        .await
+        .map(|_| ())
+}
+
+async fn ensure_work_item_chat_bootstrap_from_work_item(
+    pool: &SqlitePool,
+    work_item_id: &str,
+) -> Result<(), String> {
+    if work_item_has_chat_messages(pool, work_item_id).await? {
+        return Ok(());
+    }
+
+    let prompt = build_work_item_base_prompt(pool, work_item_id).await?;
+    ensure_work_item_chat_bootstrap(pool, work_item_id, &prompt).await
+}
+
+fn extract_assistant_chat_text(events: &[AcpEventItem]) -> String {
+    let prose = events
+        .iter()
+        .filter(|item| matches!(item.kind.as_str(), "text" | "text_delta"))
+        .filter_map(|item| item.content.as_deref())
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    if !prose.is_empty() {
+        return prose;
+    }
+
+    events
+        .iter()
+        .filter(|item| item.kind == "error")
+        .filter_map(|item| item.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn work_item_chat_message_to_event(message: &WorkItemChatMessage) -> AcpEventItem {
+    AcpEventItem {
+        id: message.id.clone(),
+        seq: 0,
+        kind: "user_message".to_string(),
+        content: Some(message.content.clone()),
+        tool_name: None,
+        tool_input: None,
+        tool_call_id: None,
+        ts: message.created_at.clone(),
+    }
+}
+
+async fn persist_assistant_chat_message(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    log_id: &str,
+    events: &[AcpEventItem],
+) -> Result<(), String> {
+    let content = extract_assistant_chat_text(events);
+    if content.is_empty() {
+        return Ok(());
+    }
+
+    insert_work_item_chat_message(pool, work_item_id, "assistant", &content, Some(log_id), None)
+        .await
+        .map(|_| ())
+}
+
+async fn persist_user_chat_message(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    work_item_id: &str,
+    log_id: &str,
+    content: &str,
+    created_at: &str,
+) -> Result<(), String> {
+    if let Some(message) = insert_work_item_chat_message(
+        pool,
+        work_item_id,
+        "user",
+        content,
+        Some(log_id),
+        Some(created_at),
+    )
+    .await?
+    {
+        let item = work_item_chat_message_to_event(&message);
+        emit_acp_event(app, work_item_id, log_id, &item);
+    }
+
+    Ok(())
+}
+
+fn render_resume_history(messages: &[WorkItemChatMessage]) -> String {
+    const MAX_MESSAGES: usize = 24;
+    const MAX_BYTES: usize = 20_000;
+
+    let mut selected: Vec<&WorkItemChatMessage> = Vec::new();
+    let mut total_bytes = 0usize;
+
+    for message in messages.iter().rev() {
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        let estimated = content.len() + message.role.len() + 8;
+        if !selected.is_empty() && (selected.len() >= MAX_MESSAGES || total_bytes + estimated > MAX_BYTES) {
+            break;
+        }
+
+        selected.push(message);
+        total_bytes += estimated;
+    }
+
+    selected.reverse();
+
+    let mut out = String::from("Persisted conversation transcript:\n\n");
+    for message in selected {
+        let label = match message.role.as_str() {
+            "system" => "System",
+            "assistant" => "Assistant",
+            _ => "User",
+        };
+        out.push_str(label);
+        out.push_str(":\n");
+        out.push_str(message.content.trim());
+        out.push_str("\n\n");
+    }
+
+    out.trim_end().to_string()
+}
+
+async fn build_resume_turn_request(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    message: &str,
+) -> Result<AgentTurnRequest, String> {
+    let history = list_work_item_chat_messages(pool, work_item_id).await?;
+    if history.is_empty() {
+        return build_turn_request(pool, work_item_id, Some(message.to_string())).await;
+    }
+
+    let mut request = build_agent_turn_request_base(pool, work_item_id).await?;
+    let history_block = render_resume_history(&history);
+    request.prompt = format!(
+        "Resume the existing work item conversation. The prior live session is unavailable, so continue this same conversation from the persisted transcript below and the current worktree state. Do not restart from scratch.\n\n{history_block}\n\nContinue from the current worktree state.\n\nNew user message:\n{}",
+        message.trim()
+    );
+
+    Ok(request)
 }
 
 async fn insert_agent_log(pool: &SqlitePool, work_item_id: &str, agent_id: &str) -> Result<String, String> {
@@ -1114,6 +1408,21 @@ async fn insert_agent_log(pool: &SqlitePool, work_item_id: &str, agent_id: &str)
         .await
         .map_err(|e| e.to_string())?;
     Ok(log_id)
+}
+
+async fn apply_session_policy(
+    handle: &ActiveSessionHandle,
+    permission_policy: Option<AgentPermissionPolicy>,
+) {
+    if let Some(policy) = permission_policy {
+        let _ = handle.shared.update_snapshot(|state| {
+            state.permission_policy = policy.clone();
+            state.last_activity_at = now_iso();
+            state.idle_deadline_at = idle_deadline_iso();
+        });
+        handle.shared.emit_state();
+        let _ = touch_session(handle).await;
+    }
 }
 
 async fn finalize_start_failure(
@@ -1142,17 +1451,17 @@ async fn finalize_start_failure(
     .await;
 }
 
-async fn start_agent_run(
+async fn start_agent_run_from_request(
     app: AppHandle,
     pool: &SqlitePool,
-    work_item_id: String,
+    request: AgentTurnRequest,
     slot: u8,
     active_sessions: State<'_, ActiveSessions>,
-    extra_instruction: Option<String>,
     permission_policy: Option<AgentPermissionPolicy>,
+    bootstrap_prompt: Option<String>,
 ) -> Result<String, String> {
-    let request = build_turn_request(pool, &work_item_id, extra_instruction).await?;
     let log_id = insert_agent_log(pool, &request.work_item_id, &request.agent_id).await?;
+    let work_item_id = request.work_item_id.clone();
 
     let handle = match get_or_create_session_handle(
         &app,
@@ -1176,7 +1485,39 @@ async fn start_agent_run(
         return Err(err);
     }
 
+    if let Some(prompt) = bootstrap_prompt {
+        let _ = ensure_work_item_chat_bootstrap(pool, &work_item_id, &prompt).await;
+    }
+
     Ok(log_id)
+}
+
+async fn start_agent_run(
+    app: AppHandle,
+    pool: &SqlitePool,
+    work_item_id: String,
+    slot: u8,
+    active_sessions: State<'_, ActiveSessions>,
+    extra_instruction: Option<String>,
+    permission_policy: Option<AgentPermissionPolicy>,
+) -> Result<String, String> {
+    let request = build_turn_request(pool, &work_item_id, extra_instruction.clone()).await?;
+    let bootstrap_prompt = if extra_instruction.is_none() {
+        Some(request.prompt.clone())
+    } else {
+        None
+    };
+
+    start_agent_run_from_request(
+        app,
+        pool,
+        request,
+        slot,
+        active_sessions,
+        permission_policy,
+        bootstrap_prompt,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1210,23 +1551,63 @@ pub async fn continue_agent(
     message: String,
     permission_policy: Option<AgentPermissionPolicy>,
 ) -> Result<String, String> {
+    let trimmed_message = message.trim();
+    if trimmed_message.is_empty() {
+        return Err("Follow-up message is empty".to_string());
+    }
+
     if let Some(handle) = get_session_handle(active_sessions.inner(), &work_item_id)? {
         handle.set_slot(slot);
+        apply_session_policy(&handle, permission_policy).await;
+
         if handle.shared.snapshot().is_running {
             cancel_turn(&handle).await?;
         }
+
+        let _ = ensure_work_item_chat_bootstrap_from_work_item(db.inner(), &work_item_id).await;
+        let log_id = insert_agent_log(db.inner(), &work_item_id, &handle.shared.agent_id).await?;
+        let message_ts = now_iso();
+        start_turn(&handle, log_id.clone(), trimmed_message.to_string()).await?;
+        let _ = persist_user_chat_message(
+            &app,
+            db.inner(),
+            &work_item_id,
+            &log_id,
+            trimmed_message,
+            &message_ts,
+        )
+        .await;
+        return Ok(log_id);
     }
 
-    start_agent_run(
-        app,
+    if !work_item_has_resume_history(db.inner(), &work_item_id).await? {
+        return Err("Start the work item first to open the initial agent conversation.".to_string());
+    }
+
+    let request = build_resume_turn_request(db.inner(), &work_item_id, trimmed_message).await?;
+    let message_ts = now_iso();
+    let log_id = start_agent_run_from_request(
+        app.clone(),
         db.inner(),
-        work_item_id,
+        request,
         slot,
         active_sessions,
-        Some(message),
         permission_policy,
+        None,
     )
-    .await
+    .await?;
+
+    let _ = ensure_work_item_chat_bootstrap_from_work_item(db.inner(), &work_item_id).await;
+    let _ = persist_user_chat_message(
+        &app,
+        db.inner(),
+        &work_item_id,
+        &log_id,
+        trimmed_message,
+        &message_ts,
+    )
+    .await;
+    Ok(log_id)
 }
 
 #[tauri::command]
@@ -1950,6 +2331,7 @@ async fn finalize(
     let messages_json = serde_json::to_string(events).unwrap_or_else(|_| "[]".to_string());
     let to_status = "ready";
     let now = now_iso();
+    let _ = persist_assistant_chat_message(pool, work_item_id, log_id, events).await;
 
     let _ = sqlx::query(
         "UPDATE agent_logs \
@@ -2079,6 +2461,34 @@ pub async fn get_work_item_acp_events(
             items.extend(normalize_legacy_events(legacy));
         }
     }
+
+    let chat_messages = sqlx::query_as::<_, WorkItemChatMessage>(
+        "SELECT id, work_item_id, role, content, agent_log_id, created_at \
+         FROM work_item_chat_messages WHERE work_item_id = ? AND role = 'user' ORDER BY created_at ASC",
+    )
+    .bind(&work_item_id)
+    .fetch_all(db.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    items.extend(chat_messages.iter().map(work_item_chat_message_to_event));
+    items.sort_by(|a, b| {
+        a.ts.cmp(&b.ts)
+            .then_with(|| {
+                let rank = |kind: &str| match kind {
+                    "user_message" => 0,
+                    "tool_call" => 1,
+                    "tool_result" => 2,
+                    "text" | "text_delta" => 3,
+                    "error" => 4,
+                    "done" => 5,
+                    _ => 6,
+                };
+                rank(&a.kind).cmp(&rank(&b.kind))
+            })
+            .then_with(|| a.seq.cmp(&b.seq))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     Ok(items)
 }

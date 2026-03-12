@@ -355,6 +355,7 @@ function WorkItemInteractionPanel({
   const accent = tag.color;
   const sessionIsRunning = session?.is_running ?? workItem?.status === 'running';
   const hasOpenSession = !!session;
+  const hasConversationHistory = !!(workItem && ((logs?.length ?? 0) > 0 || !!workItem.started_at));
   const pendingPermission = session?.pending_permission ?? null;
   const slashCommands = useMemo(
     () => getAgentCliCommands(workItem?.assigned_agent),
@@ -370,7 +371,7 @@ function WorkItemInteractionPanel({
   const canChat = !!(
     workItem &&
     workItem.assigned_agent &&
-    workItem.worktree_path &&
+    (hasOpenSession || hasConversationHistory) &&
     workItem.status !== 'done' &&
     workItem.status !== 'archived'
   );
@@ -552,8 +553,8 @@ function WorkItemInteractionPanel({
       return;
     }
 
-    if (!workItem.worktree_path) {
-      setChatError('Create a worktree before continuing this work item.');
+    if (!session && !hasConversationHistory) {
+      setChatError('Start this work item once before using agent chat.');
       return;
     }
 
@@ -606,6 +607,10 @@ function WorkItemInteractionPanel({
 
   async function handleAgentChange(nextAgent: string) {
     if (!workItem) return;
+    if (session || hasConversationHistory) {
+      setAgentError('This work item already has agent chat history. Start a new work item to switch agents cleanly.');
+      return;
+    }
     setAgentError(null);
     setIsUpdatingAgent(true);
     try {
@@ -765,11 +770,15 @@ function WorkItemInteractionPanel({
                 {sessionIsRunning ? 'Waiting for agent response...' : 'No output recorded.'}
               </div>
             ) : (
-              segments.map((seg) =>
-                seg.kind === 'tools'
-                  ? <ToolGroupRow key={seg.id} items={seg.items} />
-                  : <TextSegmentRow key={seg.id} items={seg.items} />
-              )
+              segments.map((seg) => {
+                if (seg.kind === 'tools') {
+                  return <ToolGroupRow key={seg.id} items={seg.items} />;
+                }
+                if (seg.kind === 'user') {
+                  return <UserMessageRow key={seg.id} items={seg.items} />;
+                }
+                return <TextSegmentRow key={seg.id} items={seg.items} />;
+              })
             )}
             {sessionIsRunning && mergedItems.length > 0 && (
               <span className="text-text-dim cursor-blink ml-0.5">|</span>
@@ -862,9 +871,11 @@ function WorkItemInteractionPanel({
                       ? 'Resolve the permission request to continue...'
                       : sessionIsRunning
                         ? 'Reply...'
-                        : canChat
+                        : hasOpenSession
                           ? 'Reply...'
-                          : 'Assign an agent and create a worktree to continue...'
+                          : hasConversationHistory
+                            ? 'Reply to resume this chat...'
+                            : 'Start this work item once to open the initial agent chat...'
                   }
                   disabled={composerDisabled}
                   rows={2}
@@ -890,12 +901,12 @@ function WorkItemInteractionPanel({
                     <PermissionPolicyDropdown
                       currentPolicy={permissionPolicy}
                       onPolicyChange={handlePermissionPolicyChange}
-                      disabled={isMutating}
+                      disabled={isMutating || !hasOpenSession}
                     />
                     <AgentSelectorDropdown
                       currentAgent={workItem.assigned_agent ?? ''}
                       onAgentChange={handleAgentChange}
-                      disabled={isUpdatingAgent}
+                      disabled={isUpdatingAgent || hasOpenSession || hasConversationHistory}
                     />
                   </div>
 
@@ -1241,7 +1252,8 @@ function TimestampInline({ label, date }: { label: string; date: string }) {
 
 type TextSegment = { kind: 'text'; id: string; items: AcpEventItem[] };
 type ToolSegment = { kind: 'tools'; id: string; items: AcpEventItem[] };
-type Segment = TextSegment | ToolSegment;
+type UserSegment = { kind: 'user'; id: string; items: AcpEventItem[] };
+type Segment = TextSegment | ToolSegment | UserSegment;
 
 function groupIntoSegments(items: AcpEventItem[]): Segment[] {
   const segments: Segment[] = [];
@@ -1262,7 +1274,11 @@ function groupIntoSegments(items: AcpEventItem[]): Segment[] {
   }
 
   for (const item of items) {
-    if (item.kind === 'tool_call' || item.kind === 'tool_result') {
+    if (item.kind === 'user_message') {
+      flushTools();
+      flushText();
+      segments.push({ kind: 'user', id: item.id, items: [item] });
+    } else if (item.kind === 'tool_call' || item.kind === 'tool_result') {
       flushText();
       toolBuf.push(item);
     } else {
@@ -1323,6 +1339,30 @@ function TextSegmentRow({ items }: { items: AcpEventItem[] }) {
         return null;
       })}
     </>
+  );
+}
+
+function UserMessageRow({ items }: { items: AcpEventItem[] }) {
+  const content = items
+    .map((item) => item.content ?? '')
+    .join('\n')
+    .trim();
+
+  if (!content) {
+    return null;
+  }
+
+  return (
+    <div className="my-2 flex justify-end">
+      <div className="max-w-[85%] rounded-2xl border border-[#5aa9ff]/20 bg-[#5aa9ff]/10 px-3 py-2 text-left">
+        <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#8bc2ff]">
+          You
+        </div>
+        <div className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-text">
+          {content}
+        </div>
+      </div>
+    </div>
   );
 }
 

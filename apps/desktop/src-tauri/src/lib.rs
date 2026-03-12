@@ -262,6 +262,12 @@ pub fn run() {
                 .execute(&pool)
                 .await;
 
+                // Create durable work-item chat history used to resume agent conversations
+                // after the live ACP session has expired or the app has restarted.
+                sqlx::raw_sql(include_str!("../migrations/015_work_item_chat_messages.sql"))
+                    .execute(&pool)
+                    .await?;
+
                 // On every startup, reset work items that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
                 // restarts, so queued/running work items would be stuck indefinitely.

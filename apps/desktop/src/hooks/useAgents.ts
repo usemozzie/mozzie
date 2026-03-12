@@ -10,6 +10,7 @@ import type {
   AgentSessionState,
 } from '@mozzie/db';
 import { useTerminalStore } from '../stores/terminalStore';
+import { WORK_ITEM_ACP_EVENTS_KEY } from './useAcpRun';
 import type { AgentLogChangeEvent, AgentSessionStateEvent } from '../types/events';
 
 const AGENT_CONFIGS_KEY = 'agent_configs';
@@ -78,6 +79,7 @@ export function useLaunchAgent() {
       assignSlot(slot, workItemId);
       queryClient.invalidateQueries({ queryKey: [AGENT_SESSION_KEY, workItemId] });
       queryClient.invalidateQueries({ queryKey: [AGENT_LOGS_KEY, workItemId] });
+      queryClient.invalidateQueries({ queryKey: [WORK_ITEM_ACP_EVENTS_KEY, workItemId] });
     },
   });
 }

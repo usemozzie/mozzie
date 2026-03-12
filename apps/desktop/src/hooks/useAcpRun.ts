@@ -5,7 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import type { AcpEventItem } from '@mozzie/db';
 import type { AgentLogChangeEvent } from '../types/events';
 
-const WORK_ITEM_ACP_EVENTS_KEY = 'work_item_acp_events';
+export const WORK_ITEM_ACP_EVENTS_KEY = 'work_item_acp_events';
 
 interface AcpEventPayload {
   workItemId: string;

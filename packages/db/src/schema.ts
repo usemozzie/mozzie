@@ -52,7 +52,7 @@ export interface WorkItemReviewState {
 export interface AcpEventItem {
   id: string;
   seq: number;
-  /** "text" | "text_delta" | "tool_call" | "tool_result" | "error" | "done" */
+  /** "text" | "text_delta" | "tool_call" | "tool_result" | "error" | "done" | "user_message" */
   kind: string;
   content: string | null;
   tool_name: string | null;

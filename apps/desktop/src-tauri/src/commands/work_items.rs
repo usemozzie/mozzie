@@ -966,6 +966,7 @@ pub async fn delete_work_item(
         .execute(db.inner())
         .await;
         let _ = sqlx::query("DELETE FROM agent_logs WHERE work_item_id = ?").bind(&child.id).execute(db.inner()).await;
+        let _ = sqlx::query("DELETE FROM work_item_chat_messages WHERE work_item_id = ?").bind(&child.id).execute(db.inner()).await;
         let _ = sqlx::query("DELETE FROM work_item_attempts WHERE work_item_id = ?").bind(&child.id).execute(db.inner()).await;
         let _ = sqlx::query("DELETE FROM work_item_dependencies WHERE work_item_id = ? OR depends_on_id = ?").bind(&child.id).bind(&child.id).execute(db.inner()).await;
         let _ = sqlx::query("DELETE FROM work_items WHERE id = ?").bind(&child.id).execute(db.inner()).await;
@@ -994,6 +995,12 @@ pub async fn delete_work_item(
         .map_err(|e| e.to_string())?;
 
     sqlx::query("DELETE FROM agent_logs WHERE work_item_id = ?")
+        .bind(&id)
+        .execute(db.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    sqlx::query("DELETE FROM work_item_chat_messages WHERE work_item_id = ?")
         .bind(&id)
         .execute(db.inner())
         .await
