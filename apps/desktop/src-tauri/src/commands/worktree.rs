@@ -886,7 +886,8 @@ pub async fn approve_work_item_review(
         run_git(&["-C", push_target, "push", "-u", "origin", branch_name])?;
 
         let now = now_iso();
-        sqlx::query("UPDATE work_items SET updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE work_items SET pushed_at = ?, updated_at = ? WHERE id = ?")
+        .bind(&now)
         .bind(&now)
         .bind(&work_item_id)
         .execute(db.inner())

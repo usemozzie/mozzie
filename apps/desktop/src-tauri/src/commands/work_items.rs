@@ -34,6 +34,7 @@ pub struct WorkItem {
     pub updated_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub pushed_at: Option<String>,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for WorkItem {
@@ -60,6 +61,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for WorkItem {
             updated_at: row.try_get("updated_at")?,
             started_at: row.try_get("started_at")?,
             completed_at: row.try_get("completed_at")?,
+            pushed_at: row.try_get("pushed_at").ok().flatten(),
         })
     }
 }
@@ -325,7 +327,7 @@ fn load_repo_files(root: &Path) -> Vec<String> {
 const SELECT_COLS: &str = r#"
     SELECT id, title, context, execution_context, orchestrator_note, duplicate_of_work_item_id, duplicate_policy, intent_type, status,
            repo_path, source_branch, branch_name, worktree_path, assigned_agent, terminal_slot,
-           parent_id, workspace_id, created_at, updated_at, started_at, completed_at
+           parent_id, workspace_id, created_at, updated_at, started_at, completed_at, pushed_at
     FROM work_items
 "#;
 

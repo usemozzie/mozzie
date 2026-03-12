@@ -1,4 +1,4 @@
-import { Play, Loader2, GitBranch } from 'lucide-react';
+import { Play, Loader2, GitBranch, GitPullRequestArrow } from 'lucide-react';
 import type { WorkItem, WorkItemStatus } from '@mozzie/db';
 import { formatDistanceToNow } from '../../lib/time';
 import { useStartAgent } from '../../hooks/useStartAgent';
@@ -64,6 +64,11 @@ export function WorkItemCard({ workItem, isSelected, selectedIndex, onClick, can
 
         {/* Right meta — 60% Neutral: smaller, dimmer */}
         <div className="flex items-center gap-2 shrink-0">
+          {workItem.pushed_at && (
+            <span className="text-emerald-400/70" title={`Pushed ${formatDistanceToNow(workItem.pushed_at)} ago`}>
+              <GitPullRequestArrow className="w-3 h-3" />
+            </span>
+          )}
           {hasDeps && (
             <span className="flex items-center gap-0.5 text-[10px] text-amber-400 opacity-70" title={`${deps.length} dep${deps.length > 1 ? 's' : ''}`}>
               <GitBranch className="w-2.5 h-2.5" />

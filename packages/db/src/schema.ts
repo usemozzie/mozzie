@@ -22,6 +22,7 @@ export interface WorkItem {
   updated_at: string;
   started_at: string | null;
   completed_at: string | null;
+  pushed_at: string | null;
 }
 
 export interface WorkItemReviewState {

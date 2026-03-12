@@ -255,6 +255,13 @@ pub fn run() {
                 .execute(&pool)
                 .await;
 
+                // Track when a work item's branch was last pushed (idempotent).
+                let _ = sqlx::raw_sql(
+                    "ALTER TABLE work_items ADD COLUMN pushed_at TEXT;"
+                )
+                .execute(&pool)
+                .await;
+
                 // On every startup, reset work items that were left mid-flight from a previous
                 // session. ACP streams and terminal store state are not persisted across
                 // restarts, so queued/running work items would be stuck indefinitely.
